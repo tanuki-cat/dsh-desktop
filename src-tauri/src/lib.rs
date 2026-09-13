@@ -3,10 +3,12 @@
 pub mod harness;
 pub mod locator;
 pub mod process;
+pub mod shellenv;
 pub mod update;
 pub mod window;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -39,6 +41,17 @@ pub struct Config {
     /// Measured cost of a query is ~1.9s, so caching keeps the common launch fast.
     #[serde(default = "default_update_interval")]
     pub update_check_interval_minutes: u64,
+    /// Import the login shell's exported environment before spawning the CLI: a GUI app
+    /// inherits launchd's environment, so DEEPSEEK_API_KEY and similar would be missing.
+    #[serde(default = "default_import_shell_env")]
+    pub import_shell_env: bool,
+    /// Explicit child-environment entries, applied after the shell import.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+fn default_import_shell_env() -> bool {
+    true
 }
 
 fn default_take_over() -> bool {
@@ -74,6 +87,8 @@ impl Config {
             auto_update: true,
             update_tags: default_update_tags(),
             update_check_interval_minutes: default_update_interval(),
+            import_shell_env: true,
+            env: BTreeMap::new(),
         };
         let _ = std::fs::create_dir_all(data_dir);
         let _ = std::fs::write(&path, serde_json::to_vec_pretty(&cfg).unwrap_or_default());
@@ -260,12 +275,58 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     .map_err(|e| format!("写入 overlay 失败: {e}"))?;
 
     let log_path = data_dir.join("logs").join("harness.log");
+
+    // 3d) A GUI-launched app inherits launchd's environment, not the login shell's, so the
+    //     supervised CLI would miss DEEPSEEK_API_KEY and friends. Import them here.
+    let mut child_env: Vec<(String, String)> = Vec::new();
+    let mut shell_path: Option<String> = None;
+    if config.import_shell_env {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        match shellenv::import(Path::new(&shell)) {
+            Some((flag, imported)) => {
+                let names: Vec<String> = imported.keys().cloned().collect();
+                // Names only: values may be credentials.
+                harness::app_log(&format!(
+                    "imported {} env vars via {shell} {flag}: {}",
+                    names.len(),
+                    names.join(", ")
+                ));
+                shell_path = imported.get("PATH").cloned();
+                child_env.extend(imported.into_iter().filter(|(key, _)| key != "PATH"));
+            }
+            None => harness::app_log(&format!(
+                "login shell env import failed ({shell}); using the app environment"
+            )),
+        }
+    }
+
+    let mut prefix: Vec<String> = Vec::new();
+    if let Some(dir) = location.node.parent() {
+        prefix.push(dir.to_string_lossy().to_string());
+    }
+    prefix.push("/opt/homebrew/bin".to_string());
+    prefix.push("/usr/local/bin".to_string());
+    let merged = shellenv::merge_path(
+        &prefix,
+        shell_path.as_deref(),
+        std::env::var("PATH").ok().as_deref(),
+    );
+    child_env.retain(|(key, _)| key != "PATH");
+    child_env.push(("PATH".to_string(), merged));
+    for (key, value) in &config.env {
+        child_env.retain(|(existing, _)| existing != key);
+        child_env.push((key.clone(), value.clone()));
+    }
+    if let Some((_, path)) = child_env.iter().find(|(key, _)| key == "PATH") {
+        harness::app_log(&format!("child PATH = {path}"));
+    }
     let options = harness::SpawnOptions {
         workspace: &config.workspace,
         overlay: &overlay,
         dsh_home: config.dsh_home.as_deref(),
         port,
         log_path: &log_path,
+        env: &child_env,
     };
 
     window::set_status(app, "正在启动 Harness…", &format!("dsh {version} · 端口 {port}"));

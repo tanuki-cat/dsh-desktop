@@ -448,3 +448,25 @@ npm registry**。实测各环节：
 
 验证：`cargo test` **16 passed**（新增 judge 判定、缓存新鲜度、缓存落盘往返）；
 联网集成测试新增"冷/热对比"，实测 **cold = 1168 ms（真实查询）→ warm = 0 ms（缓存）**，且两次结论一致。
+
+### 13.7 修复：GUI 启动读不到登录 shell 的环境变量（2026-09-13）
+
+**现象**：桌面壳启动后，GUI 报 `llm-deepseek: no API key for provider route "deepseek-official"`。
+
+**根因**：macOS 的 GUI 应用继承 launchd 的环境，不读取 `.zshrc`/`.zprofile`；用户在终端 export 的
+`DEEPSEEK_API_KEY` 不会出现在子进程环境里。这与本项目早先"GUI 没有 Homebrew PATH"是同一类问题。
+
+**实测**（决定方案）：`/bin/zsh -lic env` → **164 ms**、46 个变量、**0 行噪音**，且**包含 `DEEPSEEK_API_KEY`**；
+`-lc`（非交互）少一个变量，故按 `-lic` → `-lc` 的顺序回退。
+
+**实现**：
+
+- 新增 `src-tauri/src/shellenv.rs`：`import()`（带 8 s 超时，超时即 kill）、`parse_env()`（丢弃非 KEY=VALUE 噪音行、
+  拒绝保留名、重复取后者）、`merge_path()`（只保留绝对路径并去重）；
+- `SpawnOptions` 增加 `env`，`spawn` 用 `Command::envs` 注入；
+- `lib.rs` 在 spawn 前导入，且**只记录变量名**；`PATH` 合并顺序：
+  自带 node 目录 → `/opt/homebrew/bin` → `/usr/local/bin` → shell PATH → App PATH；
+- 配置新增 `import_shell_env`（默认 true）与 `env`（显式覆盖，最后应用）。
+
+**验证**：`cargo test` **20 passed**（新增 4 个：噪音行/保留名/重复键/PATH 合并去重）；
+真机变量的捕获能力由上面的 164 ms 实测佐证。

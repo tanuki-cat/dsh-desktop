@@ -3,6 +3,8 @@
 DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用系统 WebView 承载 UI、退出时回收子进程，
 并在每次启动前检查/安装 dsh 核心的新版本。
 
+> 许可证：MIT（见 `LICENSE`）。
+>
 > 当前版本仍**要求系统已装 `node` 与 `dsh`**。让目标机器无需预装这两者的发行方案
 > （自带 Node + dsh 核心）已规划完成，见 [后续实施计划](#后续实施计划自带运行时无需预装-nodedsh)。
 
@@ -28,7 +30,7 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 
 - 实机（2026-09-13，macOS）：接管外部 Harness → 自启并拿到 token URL → WebView 内 token→cookie 成功，
   会话列表/文件卡片/输入框正常渲染；`state.json` 与端口监听者一致；日志 0 行明文 token。
-- 离线测试：`cargo test` **16 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析、
+- 离线测试：`cargo test` **20 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析、
   6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、缓存落盘往返）。
 - 联网测试：`DSH_DESKTOP_LIVE_TESTS=1 cargo test --test update_live` →
   registry head = 0.1.5-rc.2 且不降级；**冷查询 1168 ms → 缓存命中 0 ms**。
@@ -48,7 +50,7 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 | `make doctor` | 检查工具链与平台依赖 | Linux 用 `pkg-config` 查 `webkit2gtk-4.1` / `gtk+-3.0` / `libsoup-3.0` 并给出 Debian/Fedora/Arch 安装命令；macOS 提示装 Xcode CLT |
 | `make check` | `cargo check --all-targets` | 与 CI 口径一致 |
 | `make fmt` / `make clippy` | 格式化 / lint（`clippy -D warnings`） | |
-| `make test` | 离线单元测试（当前 **16** 个） | 不联网 |
+| `make test` | 离线单元测试（当前 **20** 个） | 不联网 |
 | `make test-live` | 联网集成测试 | 自动设 `DSH_DESKTOP_LIVE_TESTS=1`，查真实 registry 并对比冷/热缓存耗时 |
 | `make dev` | 运行 debug 版 | 等价 `cargo run --manifest-path src-tauri/Cargo.toml` |
 | `make build` | 编译 release 可执行文件 | 产物 `src-tauri/target/release/dsh-desktop` |
@@ -94,9 +96,29 @@ Node + dsh 树 + pnpm + 许可文件）、`runtime-clean`（回收约 475 MB sta
 | `auto_update` | `true` | 启动时检查并安装 dsh 新版本 |
 | `update_tags` | `["latest","next"]` | 取其中最高版本；只跟正式版就写 `["latest"]` |
 | `update_check_interval_minutes` | `60` | 一次成功的查询结果缓存多久（0 = 每次启动都查）。查询实测约 1.2–1.9 s，缓存命中 0 ms |
+| `import_shell_env` | `true` | 启动时导入登录 shell 的环境变量（见下节）。`false` 则只用 App 自身环境 |
+| `env` | `{}` | 显式追加/覆盖传给 harness 的环境变量，优先级最高，如 `{"DEEPSEEK_API_KEY": "sk-…"}` |
 
 状态与日志：`<app-data>/state.json`（0600）、`<app-data>/logs/harness.log`（脱敏，5MB 轮转）。
 macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.desktop/`。
+
+## 环境变量（API Key 等）
+
+**问题**：macOS 的 GUI 应用继承的是 launchd 的环境，**不会读取 `.zshrc`/`.zprofile`**。
+所以在终端里 `export DEEPSEEK_API_KEY=…` 对双击启动的 `.app` 无效，harness 会报
+`no API key for provider "deepseek-official"`。
+
+**做法**：启动时执行一次登录 shell 的环境导入（`$SHELL -lic env`，超时 8 s，失败则回退 `-lc` 或跳过），
+把结果合并进 harness 子进程的环境：
+
+- 实测开销 **约 160 ms**，取到约 46 个变量，输出 0 行噪音；
+- **只把变量名写进日志**（值可能是密钥，永不落盘）；
+- 保留 App 自己管理的变量：`HOME`/`TMPDIR`/`SHELL`/`SHLVL`/`PWD`/`_`/`DSH_*` 等不导入；
+- `PATH` 走合并策略：**自带 node 目录 → `/opt/homebrew/bin` → `/usr/local/bin` → shell 的 PATH → App 的 PATH**（去重、只保留绝对路径），
+  这样 agent 执行的 `git`/`node`/`python` 与你的终端一致，而壳自己用的 node 仍优先。
+
+想关掉：`config.json` 里设 `"import_shell_env": false`；想强制某几个值：用 `env` 字段（最后应用，优先级最高）。
+另一种等价做法是在 Web GUI 的 Models 页面里填写 API Key —— 那会写进 `~/.dsh` 的凭证服务，与 shell 环境无关。
 
 ## 行为
 

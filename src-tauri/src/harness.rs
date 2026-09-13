@@ -186,6 +186,8 @@ pub struct SpawnOptions<'a> {
     pub dsh_home: Option<&'a Path>,
     pub port: u16,
     pub log_path: &'a Path,
+    /// Extra environment for the child: imported login-shell vars, merged PATH, config overrides.
+    pub env: &'a [(String, String)],
 }
 
 /// Launch `<node> <dsh.js> --profile web --patch <overlay> --no-open --port N`.
@@ -207,6 +209,7 @@ pub fn spawn(loc: &DshLocation, opts: &SpawnOptions<'_>) -> std::io::Result<Spaw
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command.envs(opts.env.iter().cloned());
     if let Some(home) = opts.dsh_home {
         command.env("DSH_HOME", home);
     }
