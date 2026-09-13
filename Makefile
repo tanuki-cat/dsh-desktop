@@ -10,14 +10,16 @@
 #   make bundle     打包安装包（macOS: .app；Linux: .deb）
 #   make run        构建后启动
 #   make icons      从 icon.png 重新生成 icon.icns（仅 macOS）
+#   make icon-art   从 make_icon.py 重新绘制 icon.png（需 python3 + Pillow）
 #   make clean      清理构建产物
 #   make distclean  清理产物 + 依赖缓存
 #
-# 可覆盖变量：CARGO= / PNPM= / CARGO_HOME= / PNPM_STORE= / BUNDLE_TARGETS=
+# 可覆盖变量：CARGO= / PNPM= / PYTHON= / CARGO_HOME= / PNPM_STORE= / BUNDLE_TARGETS=
 
 SHELL := /bin/sh
-CARGO ?= cargo
-PNPM  ?= pnpm
+CARGO  ?= cargo
+PNPM   ?= pnpm
+PYTHON ?= python3
 
 TAURI_DIR   := src-tauri
 MANIFEST    := $(TAURI_DIR)/Cargo.toml
@@ -58,9 +60,10 @@ help:
 	@echo "  make bundle      打包（$(BUNDLE_TARGETS)）"
 	@echo "  make run         构建后启动"
 	@echo "  make icons       重新生成 icon.icns（仅 macOS）"
+	@echo "  make icon-art    重新绘制 icon.png（需 python3 + Pillow）"
 	@echo "  make clean / distclean"
 	@echo ''
-	@echo "变量：CARGO_HOME= PNPM_STORE= BUNDLE_TARGETS= CARGO= PNPM="
+	@echo "变量：CARGO_HOME= PNPM_STORE= BUNDLE_TARGETS= CARGO= PNPM= PYTHON="
 
 doctor:
 	@echo "平台  : $(UNAME_S) ($(PLATFORM))"
@@ -132,6 +135,11 @@ run: build
 icons:
 	@echo "icon.icns 仅 macOS 需要；Linux 打包直接使用 icons/icon.png"
 endif
+
+# 图标源：src-tauri/icons/make_icon.py（自绘矢量路径）。改设计改脚本，不要手改 png。
+icon-art:
+	$(PYTHON) $(TAURI_DIR)/icons/make_icon.py $(TAURI_DIR)/icons/icon.png 1024
+	@$(MAKE) --no-print-directory icons
 
 clean:
 	$(CARGO_ENV) $(CARGO) clean --manifest-path $(MANIFEST)
