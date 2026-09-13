@@ -690,7 +690,8 @@ make runtime-clean     # 清理 staging（约 475MB）
 - **构建期磁盘**：实测 tauri 会把整份 `runtime/` 复制到 `target/<profile>/runtime`（debug 下 **584 MB**），
   加上 staging 与 bundle 各一份 ⇒ 峰值约 1.7 GB，比 §6 原先估的 1.5 GB 更高；
 - **Windows 侧**：交叉编译已能出 exe（见 shell 方案相关提交）；自带运行时改为在 CI 的 Windows runner 上原生 staging
-  （koffi 的 postinstall 在 macOS 上跨平台 staging 会因缺 CMake 失败），已落地为 `.github/workflows/windows-portable.yml`，见 §20.6。
+  （koffi 的 postinstall 在 macOS 上跨平台 staging 会因缺 CMake 失败），已落地为 `.github/workflows/windows-portable.yml`，
+  并已在实机验证通过（见 §20.6）；仍未做的是给 `release.yml` 加 Windows 任务、以及代码签名。
 
 ### 20.5 复现命令
 
@@ -706,6 +707,11 @@ make runtime-clean                              # 回收
 `.github/workflows/windows-portable.yml`（`workflow_dispatch`）在 `windows-latest` 上原生 staging 并打包，
 输入 `dsh_version` / `node_version` / `build_ref`（默认 `feat/bundled-runtime`）/ `attach_to_release`。
 产物 `dsh-desktop-windows-x64-portable`（zip 182–326 MB，约 3.3 万个文件，包内最长路径 205–223 字符）。
+
+**实机验证通过（2026-09-13，run 34752267176 的产物）**：Windows 11 上解压到 `D:\dsh` 后双击即可启动，
+自带 node 22.23.2 + dsh 0.1.5-rc.2 正常拉起 Web GUI，首启播种的插件市场可用，会话内 `glob` / `write` /
+`read` / `grep` / `edit` / `patch` / `todo_write` / `present` 全部正常（一次任务 14 s / 81K tokens）。
+Windows runner 上的 `cargo test --lib` 为 40 passed（Unix-only 的三个用例在那里被 cfg 掉）。
 
 本机无法执行 PE，Windows 侧行为只能由用户实测，因此每个失败回合都在缩小假设面：
 
