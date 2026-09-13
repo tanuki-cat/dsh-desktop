@@ -3,6 +3,9 @@
 > 目标：在**没有预装 Node.js 和 DeepSeek Harness** 的机器上，双击即用。
 > 上游设计：[`design-task-feat-dsh-tauri-desktop-shell.md`](./design-task-feat-dsh-tauri-desktop-shell.md)（其 §22 已把本方案列为 V2）。
 >
+> **v3.2（与壳方案做兼容性对齐后）**：两个硬冲突（`install_prefix` 会把更新写进只读 bundle、
+> `minimumSystemVersion` 低于 Node 的实际门槛）与两处语义冲突（环境变量覆盖顺序、PATH 语义），见 §18。
+>
 > **v3.1（第三轮 review 后）**：补上"更新时不能动正在服务的树"（node 懒加载，实测 MODULE_NOT_FOUND）、
 > 子进程全局安装落点、staging 的垃圾/xattr 闸门、npm cache 回收等 9 项，见 §17。
 >
@@ -83,7 +86,7 @@ DSH Desktop.app/Contents/Resources/runtime/
 | 目标 | 顺序 |
 |---|---|
 | node | `DSH_DESKTOP_NODE` → `Resources/runtime/node/bin/node` → 系统 PATH → login shell |
-| dsh | `app-data/runtime/prefix/…` 与 `Resources/runtime/dsh-prefix/…` **取版本更高者** → `DSH_DESKTOP_DSH` → 系统 PATH → login shell |
+| dsh | `DSH_DESKTOP_DSH` → （`app-data/runtime/prefix/…` 与 `Resources/runtime/dsh-prefix/…` **取版本更高者**）→ 系统 PATH → login shell |
 
 规则细化（review 后补，避免三类失效）：
 
@@ -94,6 +97,10 @@ DSH Desktop.app/Contents/Resources/runtime/
 3. **last-known-good**：每次成功启动后记录所用树与版本，供下次诊断与回退参考。
 
 即：**自带优先，系统兜底**；开发机上仍可用系统安装（配置可强制 `runtime: system`）。
+
+排序原则（与壳方案对齐，v3.2 明确）：**显式覆盖永远第一**。壳方案 §3 与 README 都承诺
+`DSH_DESKTOP_DSH` / `DSH_DESKTOP_NODE` 是"指定用哪一个"的排障开关；
+若自带候选排在它前面，这个开关就会静默失效。
 
 ### 2.4 混合运行时：系统只装了一半怎么办（v3 补充，含实测）
 
@@ -214,9 +221,15 @@ make runtime-clean     # 清理 staging（约 475MB）
 - **staging 必须按平台各自执行**：树里含 12 个平台相关的原生模块（`pty`/`conpty`/`koffi`/`sharp-darwin-*`/`system`），
   macOS 上 stage 的树不能用于 Linux，反之亦然；CI 需 per-platform runner（macOS arm64/x64、Linux x64/arm64），
   不建议依赖 `npm install --os/--cpu` 跨平台产原生二进制；
-- **子进程 PATH 策略**（review 后补）：启动 harness 时把 `app-data/runtime/tools/bin`、`Resources/runtime/tools/bin`、`Resources/runtime/node/bin` 与
+- **子进程 PATH 策略**（review 后补，v3.2 按来源细化）：启动 harness 时把 `app-data/runtime/tools/bin`、
+  `Resources/runtime/tools/bin`、`Resources/runtime/node/bin` 与
   `app-data/runtime/prefix/bin` 前置进 PATH，使插件安装、MCP server、agent 执行的 `node`/`npm`/`pnpm`
   与壳内运行时一致；该决策要写进日志与诊断页，避免"为什么我的命令用的不是登录 shell 的 node"变成暗坑；
+  **但语义要按运行时来源区分（v3.2，与壳方案对齐）**：壳方案与 README 的承诺是"agent 执行的
+  `git`/`node`/`python` 与你的终端一致"。自带运行时下必然要打破它（否则自带 node 形同虚设），所以：
+  选到**自带**运行时 → 自带 `node`/`npm`/`pnpm` 前置（并如实写日志"runtime: bundled"）；
+  选到**系统**运行时（auto 且门槛通过，或配置强制）→ 保持用户 PATH 优先，只把工具目录追加在后面，
+  **不要**改变用户终端里 `node` 的解析结果。
 - `tauri.conf.json` 已加 `"resources": ["runtime/**/*"]`，且 `src-tauri/runtime/README.md` 作为**非空保证**存在
   （glob 匹配为空会导致 `tauri build` 失败，已实测）；
 - **staging 必须校验符号链接**（实测教训）：`tauri build` 遇到**悬空链接直接失败** ——
@@ -308,8 +321,8 @@ make runtime-clean     # 清理 staging（约 475MB）
 
 | 平台 | Node 发行版 | 产物 | 备注 |
 |---|---|---|---|
-| macOS arm64 | `darwin-arm64`（48 MB） | `.app` / dmg | 先做 |
-| macOS x64 | `darwin-x64`（49 MB） | 同上 | 与 arm64 分别发布，或做 universal（两套 node + 按 `uname -m` 选） |
+| macOS arm64 | `darwin-arm64`（48 MB） | `.app` / dmg | 先做；**最低系统版本 11.0**（实测 node 22.23.2 的 `LC_BUILD_VERSION minos = 11.0`） |
+| macOS x64 | `darwin-x64`（49 MB） | 同上 | 同上，x64 也是 `minos 11.0`；与 arm64 分别发布，或做 universal（两套 node + 按 `uname -m` 选） |
 | Linux x64 | `linux-x64`（30 MB, tar.xz） | `.deb` / AppImage | AppImage 适合"免安装"，但仍依赖系统 WebKitGTK |
 | Linux arm64 | `linux-arm64`（29 MB） | 同上 | — |
 | Windows | `win-x64` | msi/nsis | 后续；需另做 Job Object 与 `taskkill` 之外的清理路径 |
@@ -487,3 +500,63 @@ make runtime-clean     # 清理 staging（约 475MB）
 - xattr：源文件写 `com.apple.quarantine` → `make bundle` → bundle 内同名文件仍带 `com.apple.quarantine`；
   同批未标记的文件只带系统自动加的 `com.apple.provenance`；
 - staging 污染：放入 20,000 个文件（78 MB）后 `make bundle` 正常成功，产物直接变大 —— 无任何告警。
+
+## 18. 修订记录（v3.2：与 desktop-shell 方案的兼容性审查）
+
+问题：用本方案构建出来的应用，和现有壳（`design-task-feat-dsh-tauri-desktop-shell.md`）是否兼容？
+
+**结论：架构兼容，但有 2 个硬冲突必须先改，另有 2 处语义冲突要对齐。**
+兼容的基础是：自带运行时只改变"用哪个 node 和哪个 dsh.js"，壳与 CLI 之间的接口（固定参数、启动 URL 行、
+进程组、探针、窗口、日志）完全不变。
+
+### 18.1 硬冲突（不改就会失败或写坏签名包）
+
+**H1：`install_prefix()` 会把更新写进只读的签名 bundle**
+
+- 现状：`lib.rs` 用 `location.dsh_js` 推导安装前缀（`update.rs` 的规则是取 `/lib/node_modules/` 之前的部分）。
+  自带 seed 的路径是 `Contents/Resources/runtime/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/lib/bin.js`，
+  推导结果就在 `.app` 里；
+- 另一个坑：**自带 npm 的全局前缀指向 node 树自身**（实测：对官方发行版跑 `npm prefix -g` 得到那份 node 目录），
+  所以"不传 `--prefix`"同样会写进 bundle；
+- 修法：自带运行时下**强制** `--prefix <app-data>/runtime/prefix`，不再走现有推导。
+  这条是实现自带运行时的**前置条件**，不是可选优化；
+
+**H2：`minimumSystemVersion = 10.15` 低于 Node 的实际门槛**
+
+- 实测：官方 node v22.23.2 的 darwin-arm64 与 darwin-x64 都是 `LC_BUILD_VERSION minos 11.0`；
+- 声明 10.15 的结果是"能装、能打开壳、一启动 harness 就崩"，比直接拒绝更难排查；
+- 修法：打包自带运行时的构建把 `bundle.macOS.minimumSystemVersion` 提到 `11.0`（Linux 侧不变）。
+
+### 18.2 语义冲突（文档层面，必须对齐）
+
+| 项 | 壳方案的说法 | 本方案原说法 | 对齐结果 |
+|---|---|---|---|
+| 环境变量覆盖 | §3 与 README：`DSH_DESKTOP_DSH` / `DSH_DESKTOP_NODE` 优先 | §2.3 把 `DSH_DESKTOP_DSH` 排在自带候选之后 | §2.3 改为**显式覆盖永远第一**（排障开关不能被静默忽略） |
+| 子进程 PATH | "agent 执行的 `node` 与你的终端一致" | §5 把自带 `node/bin` 前置 | §5 按来源区分：**自带运行时**才前置自带 node；**系统运行时**保持用户 PATH 优先 |
+| 启动时序 | §4 的表里没有"解析运行时"这一步，且示例仍写 `--port 0`（实现是固定端口，见 README） | §3 定义了运行时解析 | 壳方案 §4 增加一行"解析运行时（§本方案 2.3）+ 记录来源与版本"，并修掉陈旧端口示例 |
+| 体积/平台 | §10 与 README 写壳 `.app` ≈ 11 MB、"macOS 10.15+" | 自带后 ≈ 490 MB、要求 11.0+ | 两处交叉引用并注明"自带运行时版本"与"精简版本"的区别 |
+
+### 18.3 已确认兼容、无需改动的部分
+
+- **进程与生命周期**：自带/影子前缀只是换了可执行文件路径；独立进程组、SIGTERM → 轮询 → SIGKILL、
+  僵尸识别、崩溃看护、退出清理全部不变；
+- **更新链路的其余部分**：`npm_command` 的 PATH 修复让自带 npm（解引用后的 `#!/usr/bin/env node` 脚本）能直接跑；
+  `version_from_package()` 对 seed 路径同样有效；缓存以版本字符串为 key，与来源无关；
+  "安装后回读版本"能识别"装到了别处"，正好覆盖 H1 修好之前的异常情形；
+- **上一轮的"更新前先停实例"**：自带运行时的更新流程正需要这个前置条件，两者方向一致（§4 的三步替换建立在其之上）；
+- **app-data 与只读 bundle 的分工**：overlay、logs、state.json、update-check.json、npm cache 都在 app-data，
+  与"不写签名包"的原则一致；
+- **平台范围**：两份文档都是 macOS/Linux 优先、Windows 不支持，无冲突。
+
+### 18.4 建议的落地顺序
+
+1. 壳方案 §4 补"解析运行时"一行 + 修掉陈旧端口示例（文档，零风险）；
+2. 实现运行时解析时，把 `install_prefix` 改成"可被运行时来源覆盖"，并加单测（对应 H1）；
+3. 打包配置按 H2 调整 `minimumSystemVersion`；
+4. 两份文档互相加交叉引用，避免读者只看一份时得出错误结论。
+
+**实测明细**（可复现）：
+
+- `otool -l <node>/bin/node | grep -A4 LC_BUILD_VERSION` → `minos 11.0`（arm64 与 x64 都是）；
+- `PATH=<seed>/bin:$PATH <seed>/bin/npm prefix -g` → 输出那份 node 目录本身；
+- 现有代码路径：`lib.rs` 调 `update::install_prefix(&location.dsh_js)`，规则见 `update.rs` 的 `install_prefix`。

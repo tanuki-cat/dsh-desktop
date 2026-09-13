@@ -251,6 +251,7 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
 代价与做法（摘要）：
 
 - 解压后约 **490 MB**（Node 187 + dsh 树 289 + 壳 11），分发包约 150–250 MB；
+  自带运行时版本的最低系统版本要提到 **macOS 11.0**（实测 node 22.23.2 的 `minos 11.0`，当前壳声明的是 10.15）；
 - **只读 seed + 可写影子前缀**：seed 放在 `Contents/Resources/runtime/`，dsh 核心更新落到
   `app-data/runtime/prefix`（不写签名的 bundle）；
 - 实施前必须先落 4 项 P0：**回退/last-known-good、seed 与前缀的版本仲裁、pnpm 随包分发（否则离线装不了插件）、

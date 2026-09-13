@@ -93,12 +93,17 @@ DSH Desktop (Tauri 2)
 | 2 | 读状态文件，若上次的 pid 仍存活且命令行匹配 → SIGTERM 清理（自愈） | 清理失败则记日志继续 |
 | 3 | locator：`DSH_DESKTOP_DSH` 环境变量 → 记忆路径 → PATH → 常见目录 → login shell（`/bin/zsh -lc 'command -v dsh'`，**实测可用**） | 找不到 → 错误页 + “选择 dsh 路径…” |
 | 4 | `realpath` 解析 symlink 得 `dsh.js`；定位 node：`dsh` 同目录优先 → PATH → login shell（**实测** 两条路径都拿到 `/opt/homebrew/bin/node`） | 找不到 node → 错误页明确提示“缺 node” |
+| 4b | **解析运行时**（自带运行时启用时）：按自带方案 §2.3 的顺序选 node 与 dsh 树（显式环境变量 → 自带/影子前缀取版本更高者 → 系统），记录来源与版本；架构/能力门槛不过则回退 | 无可用运行时 → 错误页 |
 | 5 | 确定 workspace：记忆值 → 用户选择 → `$HOME` | — |
 | 6 | 写 overlay 文件（强制 `printUrl: true`），启动进程（独立进程组） | spawn 失败 → 错误页 |
 | 7 | 持续读 stdout/stderr；解析 URL 行 | 超时（首启 90s / 常态 30s）→ 错误页 + 最近 200 行日志 |
 | 8 | 创建主窗口加载 token URL | 加载失败 → 允许**重试同一 URL**（token 非一次性，实测） |
 | 9 | 不依赖重新播报：窗口加载失败就重试同一 token URL（**实测可重复使用**） | 连续失败 → 重启 harness 取新 URL |
 | 10 | 退出/崩溃 → 清理状态文件 | — |
+
+> 自带运行时（打包 Node + dsh）下的运行时解析、门槛与 PATH 语义见
+> [`design-task-feat-dsh-bundled-runtime.md`](./design-task-feat-dsh-bundled-runtime.md) §2.3 / §5 / §18；
+> 两者的接口完全一致：只换 `node` 与 `dsh.js` 的来源，启动参数、URL 解析、进程组与退出回收不变。
 
 **启动命令（关键修正）**
 
@@ -108,7 +113,8 @@ let child = Command::new(&node_path)                 // 不用 dsh 的 shebang
     .arg(&dsh_js_path)                               // realpath 后的 lib/bin.js
     .args(["--profile", "web"])
     .arg("--patch").arg(&overlay_path)               // 强制 printUrl
-    .args(["--no-open", "--port", "0"])
+    .args(["--no-open"])                              // 端口用固定值（config.port，默认 3080）
+    .arg("--port").arg(port.to_string())              // authority 稳定才能复用 cookie / 接管上次实例
     .current_dir(&workspace)                          // 必须显式指定
     .env("DSH_HOME", &dsh_home)                       // 见 §6 实例策略
     .stdout(Stdio::piped())
