@@ -238,6 +238,22 @@ pub struct SpawnOptions<'a> {
 /// Launcher flags must precede app flags; the child gets its own process group so the
 /// whole tree can be terminated together.
 pub fn spawn(node: &Path, dsh_js: &Path, opts: &SpawnOptions<'_>) -> std::io::Result<Spawned> {
+    // A relative path here is resolved against the child's working directory, not ours, which
+    // turns a bad PATH entry into an error from inside node (`EISDIR: lstat 'D:'`). Refuse it
+    // with a message that names the culprit instead.
+    for (label, path) in [
+        ("node", node),
+        ("dsh", dsh_js),
+        ("workspace", opts.workspace),
+    ] {
+        if !path.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{label} 必须是绝对路径: {}", path.display()),
+            ));
+        }
+    }
+
     let mut command = Command::new(node);
     command
         .arg(dsh_js)
@@ -266,6 +282,21 @@ pub fn spawn(node: &Path, dsh_js: &Path, opts: &SpawnOptions<'_>) -> std::io::Re
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    app_log(&format!(
+        "spawn: {} | cwd: {} | DSH_HOME: {}",
+        describe(&command),
+        opts.workspace.display(),
+        opts.dsh_home
+            .map(|home| home.display().to_string())
+            .unwrap_or_else(|| "<default>".to_string()),
+    ));
+    if !opts.workspace.is_dir() {
+        app_log(&format!(
+            "警告: workspace {} 不是已存在的目录",
+            opts.workspace.display()
+        ));
     }
 
     let mut child = command.spawn()?;
@@ -327,6 +358,20 @@ static APP_LOGGER: Mutex<Option<Logger>> = Mutex::new(None);
 /// Point the shared app logger at the Harness log file (called once during startup).
 pub fn init_app_log(path: &Path) {
     *APP_LOGGER.lock().unwrap() = Some(Logger::open(path));
+}
+
+/// The exact command line, so a failed start can be reproduced from the log alone.
+fn describe(command: &Command) -> String {
+    let mut parts = vec![command.get_program().to_string_lossy().to_string()];
+    parts.extend(command.get_args().map(|arg| {
+        let arg = arg.to_string_lossy();
+        if arg.contains(' ') {
+            format!("\"{arg}\"")
+        } else {
+            arg.to_string()
+        }
+    }));
+    parts.join(" ")
 }
 
 /// Append a shell-side line (navigation blocks, downloads) to the same log, redacted.

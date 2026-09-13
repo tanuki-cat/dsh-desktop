@@ -69,7 +69,7 @@ fn default_port() -> u16 {
 }
 
 fn default_workspace() -> PathBuf {
-    home_dir().unwrap_or_else(|| PathBuf::from("/"))
+    home_dir().unwrap_or_else(std::env::temp_dir)
 }
 
 /// The user's home directory, on every platform we build for.
@@ -78,10 +78,17 @@ fn default_workspace() -> PathBuf {
 /// (sometimes `HOMEDRIVE` + `HOMEPATH`), so looking for `HOME` alone left the workspace and
 /// the profile check pointing at a drive root.
 pub fn home_dir() -> Option<PathBuf> {
-    for key in ["HOME", "USERPROFILE"] {
+    // Git Bash exports a POSIX-style `HOME` (`/c/Users/me`) and other setups use a bare drive
+    // (`D:`); both are unusable as a process working directory, so validate what we return.
+    #[cfg(windows)]
+    let keys = ["USERPROFILE", "HOME"];
+    #[cfg(not(windows))]
+    let keys = ["HOME", "USERPROFILE"];
+    for key in keys {
         if let Some(value) = std::env::var_os(key) {
-            if !value.is_empty() {
-                return Some(PathBuf::from(value));
+            let candidate = PathBuf::from(value);
+            if usable_directory(&candidate) {
+                return Some(candidate);
             }
         }
     }
@@ -89,7 +96,30 @@ pub fn home_dir() -> Option<PathBuf> {
     let path = std::env::var_os("HOMEPATH")?;
     let mut combined = PathBuf::from(drive);
     combined.push(path);
-    Some(combined)
+    usable_directory(&combined).then_some(combined)
+}
+
+/// Whether a path may be handed to a child process as its working directory.
+///
+/// Absolute and named. Rejects the empty string and, on Windows, `D:` — drive-relative, meaning
+/// "the current directory on D:" — plus MSYS-style `/c/Users/me`, which is not absolute there.
+pub fn usable_directory(path: &Path) -> bool {
+    path.is_absolute() && !path.as_os_str().is_empty() && path.parent().is_some()
+}
+
+/// Resolve a path against the app's own working directory.
+///
+/// Every path we hand to the Harness must be absolute: it becomes either the child's working
+/// directory or an argv entry, and Windows resolves a relative one (a bare `PATH` entry, a
+/// drive-relative `D:tools`) against the *child's* directory instead. That mismatch is how
+/// node ended up resolving its own main module to `D:` (`EISDIR: lstat 'D:'`).
+fn absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn default_import_shell_env() -> bool {
@@ -117,9 +147,10 @@ impl Config {
         let path = data_dir.join("config.json");
         if let Ok(raw) = std::fs::read_to_string(&path) {
             match serde_json::from_str::<Config>(&raw) {
-                Ok(config) => {
+                Ok(mut config) => {
                     // The `env` map may hold credentials, and older versions wrote 0644.
                     process::restrict(&path);
+                    config.repair();
                     return config;
                 }
                 // Never rewrite a file the user owns: fall back for this run and say why.
@@ -152,6 +183,37 @@ impl Config {
             }
         }
         config
+    }
+
+    /// Replace values that would send the Harness somewhere it cannot start.
+    ///
+    /// A workspace becomes the child's working directory, so a drive-relative or POSIX-style
+    /// path (`D:`, `/c/Users/me` written into config.json by an earlier build) makes node resolve
+    /// its own main module against the wrong root and fail with `EISDIR: lstat 'D:'`. We repair
+    /// the value in memory instead of rewriting the user's file, and log what we ignored.
+    fn repair(&mut self) {
+        if usable_directory(&self.workspace) {
+            self.workspace = absolute(&self.workspace);
+        } else {
+            let fallback = default_workspace();
+            harness::app_log(&format!(
+                "config.json 中的 workspace 不可用，已改用 {}: {}",
+                fallback.display(),
+                self.workspace.display()
+            ));
+            self.workspace = fallback;
+        }
+        if let Some(home) = self.dsh_home.clone() {
+            if usable_directory(&home) {
+                self.dsh_home = Some(absolute(&home));
+            } else {
+                harness::app_log(&format!(
+                    "config.json 中的 dsh_home 不可用，已忽略: {}",
+                    home.display()
+                ));
+                self.dsh_home = None;
+            }
+        }
     }
 }
 
@@ -397,8 +459,14 @@ fn resolve_runtime(
             .ok()
             .and_then(|value| runtime::Preference::parse(&value))
             .unwrap_or(config.runtime),
-        env_node: std::env::var("DSH_DESKTOP_NODE").ok().map(PathBuf::from).filter(|path| path.is_file()),
-        env_dsh: std::env::var("DSH_DESKTOP_DSH").ok().map(PathBuf::from).filter(|path| path.is_file()),
+        env_node: std::env::var("DSH_DESKTOP_NODE")
+            .ok()
+            .map(|value| absolute(Path::new(&value)))
+            .filter(|path| path.is_file()),
+        env_dsh: std::env::var("DSH_DESKTOP_DSH")
+            .ok()
+            .map(|value| absolute(Path::new(&value)))
+            .filter(|path| path.is_file()),
         system_node,
         system_dsh,
         seed_node: seed_node.as_deref(),
@@ -416,8 +484,8 @@ fn resolve_runtime(
     harness::app_log(&describe);
     let version = locator::version_of(&decision.dsh.path).unwrap_or_else(|| "未知".into());
     Ok(ResolvedRuntime {
-        node: decision.node.path,
-        dsh_js: decision.dsh.path,
+        node: absolute(&decision.node.path),
+        dsh_js: absolute(&decision.dsh.path),
         version,
         updates: decision.updates,
         seed,
@@ -1005,6 +1073,45 @@ mod tests {
             std::fs::read_to_string(dir.join("config.json")).unwrap(),
             broken
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_workspace_that_is_not_a_usable_directory_is_repaired() {
+        let dir = std::env::temp_dir().join("dsh-desktop-workspace-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A drive-relative workspace (the reported `EISDIR: lstat 'D:'`) falls back to home.
+        std::fs::write(dir.join("config.json"), "{\"workspace\": \"D:\"}").unwrap();
+        let repaired = Config::load(&dir);
+        assert_eq!(repaired.workspace, default_workspace());
+        assert!(repaired.workspace.is_absolute());
+
+        // An unusable dsh_home is dropped, so the Harness uses the default profile.
+        std::fs::write(dir.join("config.json"), "{\"dsh_home\": \"\"}").unwrap();
+        assert_eq!(Config::load(&dir).dsh_home, None);
+
+        // A usable pair survives untouched.
+        let workspace = dir.join("work");
+        let home = dir.join("profiles");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            format!(
+                "{{\"workspace\": {:?}, \"dsh_home\": {:?}}}",
+                workspace.to_string_lossy(),
+                home.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let kept = Config::load(&dir);
+        assert_eq!(kept.workspace, workspace);
+        assert_eq!(kept.dsh_home, Some(home));
+
+        // A relative path is resolved against the app cwd: never handed to the child as-is.
+        assert!(absolute(Path::new("runtime/node")).is_absolute());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

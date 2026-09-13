@@ -134,9 +134,11 @@ fn find_node(launcher: &Path) -> Result<PathBuf, String> {
         }
     }
     if let Some(dir) = launcher.parent() {
-        let c = dir.join("node");
-        if c.is_file() {
-            return Ok(c);
+        for name in ["node", "node.exe"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
         }
     }
     if let Some(p) = path_lookup("node") {
@@ -153,9 +155,24 @@ fn find_node(launcher: &Path) -> Result<PathBuf, String> {
 
 fn path_lookup(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|d| d.join(name))
-        .find(|c| c.is_file())
+    // Windows resolves `node` to `node.exe` and `dsh` to `dsh.cmd`; a bare name would never
+    // match there, which made the system runtime look "not installed".
+    #[cfg(windows)]
+    let names: Vec<String> = ["", ".exe", ".cmd", ".bat"]
+        .iter()
+        .map(|extension| format!("{name}{extension}"))
+        .collect();
+    #[cfg(not(windows))]
+    let names: Vec<String> = vec![name.to_string()];
+    for dir in std::env::split_paths(&paths) {
+        for candidate in &names {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 fn login_shell_lookup(name: &str) -> Option<PathBuf> {
