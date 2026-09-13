@@ -157,10 +157,9 @@ jobs:
             echo "提示：未找到 7z.sfx，跳过自解压包"
           fi
 
-          # 诊断：包内最长路径（Windows MAX_PATH 是 260，解压目录会额外占用一截）
-          longest=$(7z l -slt "dist/dsh-desktop_${VERSION}_windows-x64-portable.zip" 2>/dev/null | awk -F" = " "/^Path = /{print length($2)" "$2}" | sort -rn | head -1)
-          echo "包内最长路径: ${longest}"
-          echo "提醒：解压到 D:\\dsh 这类短路径，或使用自解压 exe / tar / 7-Zip"
+          # 最长路径由 scripts/check-runtime-stage.sh 在 staging 阶段报告（Windows MAX_PATH 260，
+          # 解压目录还会再占一截）；这里只提醒用户怎么解压。
+          echo "提醒：解压到 D:\dsh 这类短路径，或使用自解压 exe / tar / 7-Zip"
           ls -lh dist
 
       - uses: actions/upload-artifact@v4

@@ -61,6 +61,16 @@ if command -v xattr >/dev/null 2>&1; then
   fi
 fi
 
+# Windows 的 MAX_PATH 是 260：包内路径越长，解压时越容易被资源管理器拒绝（0x80010135）
+longest=$(cd "$root" && find . -type f | awk '{ print length($0), $0 }' | sort -rn | head -1)
+longest_len=${longest%% *}
+echo "最长路径   : $longest_len 字符（Windows MAX_PATH 260；解压目录还会再占一截）"
+if [ "${longest_len:-0}" -gt 240 ]; then
+  echo "  [警告] 超过 240：必须解压到短路径（如 D:\\dsh）或用 7-Zip / tar 解压" >&2
+elif [ "${longest_len:-0}" -gt 200 ]; then
+  echo "  [提示] 超过 200：解压目录请尽量短"
+fi
+
 if [ "$fail" = "0" ]; then
   echo "自带 node : $("$node_bin" --version)"
   echo "自带 dsh  : $("$node_bin" "$dsh_js" --version 2>/dev/null || echo "未知（当前平台无法执行该平台的 node）")"
