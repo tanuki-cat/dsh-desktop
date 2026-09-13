@@ -3,6 +3,9 @@
 > 目标：在**没有预装 Node.js 和 DeepSeek Harness** 的机器上，双击即用。
 > 上游设计：[`design-task-feat-dsh-tauri-desktop-shell.md`](./design-task-feat-dsh-tauri-desktop-shell.md)（其 §22 已把本方案列为 V2）。
 >
+> **v3.1（第三轮 review 后）**：补上"更新时不能动正在服务的树"（node 懒加载，实测 MODULE_NOT_FOUND）、
+> 子进程全局安装落点、staging 的垃圾/xattr 闸门、npm cache 回收等 9 项，见 §17。
+>
 > **v3（第二轮 review 后修订）**：把纸面风险改成实测结论 —— 签名必须保留 Node 的 JIT entitlements（否则 node 直接崩溃）、
 > 资源复制会解引用符号链接、悬空链接会让构建失败、`rename` 无法覆盖非空目录、pnpm 不能装在被整体替换的前缀里等 12 项
 > （§16）。"离线首启"仍是**待断网实测**的目标，不是已验证结论。
@@ -165,7 +168,13 @@ DSH Desktop.app/Contents/Resources/runtime/
   **`rename` 不能覆盖非空目录**（实测 `ENOTEMPTY: Directory not empty`），所以是三步：
   `rename(prefix → prefix.old)` → `rename(prefix.new → prefix)` → 删除 `prefix.old`。
   两步之间崩溃会短暂没有前缀，正好由 §2.3 的回退路径兜底（这是回退必须存在的原因之一）；
-  旧前缀保留到删除前，运行中的实例不会因为文件被换走而立刻失效；
+- **顺序必须是"先停实例、再动目录"**（v3.1 修正，实测）：node 按需懒加载模块，
+  树一旦被 rename 走，运行中的 harness 下一次 `require()` 就会 `MODULE_NOT_FOUND`
+  （实测：进程启动后删掉树，1.5 s 后的 `require` 直接失败）。所以正确顺序是
+  **装到 `prefix.new` → 停掉正在跑该树的实例 → 两次 rename → 启动新实例 → 确认起来后再删 `prefix.old`**；
+  反过来（先换后停）会让活跃会话在更新中途崩掉，正是"更新期间损坏会话"的来源。
+  这条同样适用于今天的实现：现存代码在更新检查之后才处理实例，若端口上有正在跑的实例（外部 CLI，或强杀后残留），
+  npm 会一边重写它的树一边让它继续服务；实施时要把"停实例"提到 `npm install` 之前。
 - 若替换后启动失败 → 依 §2.3 的"回退"用 seed 启动，并保留坏掉的前缀供诊断；
 - 记录 `last-known-good`（树 + 版本 + 时间），提供"恢复上次可用版本"的路径。
 
@@ -177,6 +186,10 @@ DSH Desktop.app/Contents/Resources/runtime/
 - `app-data/runtime/tools` 只作为**可选更新落点**：解析时优先它、没有就用 seed；
 - **不能装进 `prefix`**：该前缀在每次 dsh 更新时被整体替换（见上），pnpm 会在第一次核心更新后消失；
 - PATH 注入顺序：`app-data/runtime/tools/bin` → `Resources/runtime/tools/bin` → `Resources/runtime/node/bin`；
+- **同时要把全局安装落点指到可写目录**：把只读的 `Resources/runtime/node/bin` 前置进 PATH 后，agent 或用户在 harness 里跑
+  `npm i -g <pkg>` 会试图写进 .app（只读）而失败。实测 npm 尊重 `npm_config_prefix`（`npm_config_prefix=/tmp/x npm prefix -g` → `/tmp/x`），
+  所以子进程要带 `npm_config_prefix=app-data/runtime/tools`（同 `PNPM_HOME`），
+  让全局安装落在应用数据目录里 —— 可写、可清理、也不污染用户的全局前缀；
 - 同时把 pnpm 的 store/config 也钉在 app-data（`pnpm_config_store_dir`、`PNPM_HOME`），
   避免它往 `~/Library/pnpm` 或用户主目录乱写，"卸载"时能一次清干净；
 - 不这样做时，自带发行版的 marketplace 插件将无法安装 —— 必须在文档里显式声明。
@@ -219,6 +232,16 @@ make runtime-clean     # 清理 staging（约 475MB）
   建议 staging 时用 `license-checker --json`（或等价工具）汇总，并把 Node/npm 自带的 LICENSE 一并收集；
 - **构建耗时不是问题**（实测）：20,000 个文件的资源复制 + 打包共 **3.8 s**（sys 3.2 s），
   折算 25,412 文件的 dsh 树约 4–5 s；瓶颈仍是磁盘占用（§6）而不是时间；
+- **staging 目标目录必须先清空**（v3.1）：`src-tauri/runtime/` 里任何残留都会被静默打包 —— 实测放进 20,000 个文件的探针，
+  `make bundle` 全程没有任何提示，产物直接多了 78 MB。`runtime-stage` 开头 `rm -rf` 目标（保留 marker 语义即可），
+  并在 `bundle` 前加一道闸门：文件数/体积落在预期区间（如 25k±10%、解压 ≤ 550 MB）否则报错；
+- **必须清掉扩展属性**（v3.1，实测）：Tauri 的资源复制会**保留 xattr**，带 `com.apple.quarantine` 的源文件在 bundle 里
+  依旧是 quarantine 状态。构建机上的下载物（node tarball、npm 缓存里的包）一旦带上隔离属性，就会被打进 .app 并触发 Gatekeeper。
+  所以 staging 结尾要 `xattr -cr <stage>`，并断言 `xattr -r <stage> | grep -c quarantine` 为 0；
+- **staging 的 dsh 树必须用 npm 装，不能用 pnpm 复制**（v3.1）：pnpm 的 `node_modules` 是指向全局 store 的硬链接/相对链接，
+  直接 stage 会得到悬空链接（构建直接失败）或不自包含的树；
+- **校验值应钉在仓库里**（v3.1）：只校验下载来的 `SHASUMS256.txt` 意味着信任链条止于 TLS —— 分发服务器被替换时，校验值会被一起替换。
+  建议把期望的 Node SHA256 写进仓库（如 `src-tauri/runtime.lock`），`runtime-fetch` 与它比对，而不是只信下载到的清单；
 - `make clean` 不动 staging，`make runtime-clean` 才删（避免每次改代码都重下 48MB）。
 
 ---
@@ -231,6 +254,10 @@ make runtime-clean     # 清理 staging（约 475MB）
 | dsh 树（含 12 个原生模块） | 289 MB | 数十 MB（tarball 本身很小，依赖树按需下载） |
 | Tauri 壳 | 11 MB | 5 MB |
 | **合计** | **≈ 490 MB** | **≈ 150–250 MB** |
+
+**运行期磁盘还会长**（v3.1）：`app-data/runtime/npm-cache` 随每次核心更新累积（数百 MB～GB 级），
+方案原先没写回收策略。建议：更新成功后按阈值清理（或 `npm cache verify`），并提供"重置运行时"入口
+（删 `runtime/` 即回到 seed 状态）。
 
 **构建期磁盘**（review 后补）：staging 475 MB + `target/…/bundle` 内再复制一份 ≈ 475 MB，
 再加 debug/release 构建产物 ⇒ 峰值约 **1.5 GB**；CI 需要相应磁盘配额，`make runtime-clean` 用于回收。
@@ -316,6 +343,7 @@ make runtime-clean     # 清理 staging（约 475MB）
 | `locator.rs` | 接受 `BundledRoots`，按 §2.3 顺序解析，记录来源 | ~40 行 |
 | `update.rs` | `install_prefix` 支持 app-data 目标；追加 `--cache`；**装到 `prefix.new` 后三步替换**；安装后回读版本核对（已实现） | ~50 行 |
 | `lib.rs` | 取 `app.path().resource_dir()` 并注入；splash 文案区分自带/系统 | ~25 行 |
+| `lib.rs` + `update.rs` | **更新前先停掉正在使用目标树的实例**（顺序修正，§4）；子环境注入 `npm_config_prefix` / `PNPM_HOME` | ~30 行 |
 | `tauri.conf.json` | `bundle.resources`（已完成）；签名配置 | 少量 |
 | `Makefile` | `runtime-fetch / runtime-stage / runtime-clean`，`bundle` 依赖 chain；**staging 结尾做悬空链接校验**；自动生成 `THIRD-PARTY-NOTICES.md` | ~80 行 |
 | staging 签名脚本 | 逐个 Mach-O 重签，**带 `--preserve-metadata=entitlements`**；签名后跑 `node -e` 冒烟 | ~25 行 |
@@ -342,7 +370,11 @@ make runtime-clean     # 清理 staging（约 475MB）
 - [ ] **pnpm 存活**：完成一次 dsh 核心更新（整棵前缀被替换）后，marketplace 插件仍能安装；
 - [ ] **悬空链接**：staging 里人为放一个悬空链接 → `runtime-stage` 必须报错退出，而不是等到 `tauri build` 才失败；
 - [ ] **首启流量**：干净机器首启的网络流量符合策略（默认不应静默下载整棵依赖树）；
-- [ ] **App Translocation**：从"下载的 DMG"直接双击运行（不拖进 /Applications）也能正常启动。
+- [ ] **App Translocation**：从"下载的 DMG"直接双击运行（不拖进 /Applications）也能正常启动；
+- [ ] **带实例更新演练**：端口上有正在跑的实例时触发更新 → 先停实例再安装，活跃回合不被中途打断、会话文件不损坏；
+- [ ] **xattr 门禁**：staging 后 `xattr -r` 无 quarantine；打包后抽验 bundle 内 node 的 xattr；
+- [ ] **staging 闸门**：故意多放一个文件、或删掉一个平台原生模块 → 构建必须报错而不是照发；
+- [ ] **工具落点**：在 harness 里执行 `npm i -g` → 落在 `app-data/runtime/tools`，既不写 .app，也不动用户全局前缀。
 
 ---
 
@@ -430,3 +462,28 @@ make runtime-clean     # 清理 staging（约 475MB）
   悬空链接 → `tauri build` 失败；ad-hoc 签名的 Mach-O → 复制后 `codesign --verify` 仍 valid；
 - 20,000 文件（78 MB）资源复制 + 打包：3.845 s（sys 3.185 s）；
 - `rename(dir_a, dir_b)`（b 非空）→ `OSError: Directory not empty`。
+
+## 17. 修订记录（v3.1，第三轮 review 后）
+
+这轮专门找"方案没写到、但真机上会咬人"的运行期/构建期陷阱，9 项里 3 项已验证：
+
+| # | 级别 | 问题 | 处理 |
+|---|---|---|---|
+| 1 | P1 | **更新时动了正在服务的树**：node 懒加载，树被 rename 走后运行中的 harness 下一次 `require()` 即 `MODULE_NOT_FOUND`（实测） | §4 明确顺序「装 .new → 停实例 → 两次 rename → 起新实例 → 删旧树」，并指出今天实现的同类问题 |
+| 2 | P1 | 子进程 PATH 前置只读的 bundled node/bin 后，harness 里 `npm i -g` 会写 .app 而失败 | §4 要求注入 `npm_config_prefix` / `PNPM_HOME` 指向可写前缀（实测 npm 尊重该变量），§12 加验收 |
+| 3 | P1 | 构建机下载物的 **quarantine xattr 会被带进包**（实测资源复制保留 xattr） | §5 要求 `xattr -cr` + 断言无 quarantine，§12 加门禁 |
+| 4 | P1 | staging 目录里的残留会被静默打包（实测 20k 文件探针直接进了 .app，无任何提示） | §5 要求 staging 先清空，并在 bundle 前做文件数/体积闸门 |
+| 5 | P2 | 运行期 npm cache 无上限增长 | §6 增加回收策略与"重置运行时"入口 |
+| 6 | P2 | 只信下载来的 `SHASUMS256.txt`，校验链条止于 TLS | §5 建议把期望 SHA256 钉进仓库（`runtime.lock`） |
+| 7 | P3 | 用 pnpm 树做 staging 会引入 store 链接 | §5 明确必须 npm 安装，禁 pnpm 复制 |
+| 8 | P3 | 首启体验/时间预算未定义（490 MB 的应用首次启动会被深扫） | §12 增首启时间与 splash 文案要求 |
+| 9 | P3 | CI 签名凭据与 updater 密钥管理未写 | §14 备注，实施 P2/P4 时补 |
+
+**本轮实测明细**（可复现）：
+
+- 懒加载：`node -e "setTimeout(() => require('/tmp/tree-demo/mod.js'), 1500)"` 期间删掉 `/tmp/tree-demo` → 
+  `lazy require FAILED: MODULE_NOT_FOUND`；证明"先换目录后停实例"会打断活跃会话；
+- 全局落点：`npm_config_prefix=/tmp/npm-prefix-probe npm prefix -g` → `/tmp/npm-prefix-probe`（默认是 `/opt/homebrew`）；
+- xattr：源文件写 `com.apple.quarantine` → `make bundle` → bundle 内同名文件仍带 `com.apple.quarantine`；
+  同批未标记的文件只带系统自动加的 `com.apple.provenance`；
+- staging 污染：放入 20,000 个文件（78 MB）后 `make bundle` 正常成功，产物直接变大 —— 无任何告警。
