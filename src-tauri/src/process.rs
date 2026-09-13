@@ -137,7 +137,12 @@ mod tests {
     fn state_round_trip() {
         let dir = std::env::temp_dir().join("dsh-desktop-state-test");
         let _ = std::fs::remove_dir_all(&dir);
-        let state = HarnessState { pid: 4242, port: 3080, cwd: "/tmp".into(), started_at: 7 };
+        let state = HarnessState {
+            pid: 4242,
+            port: 3080,
+            cwd: "/tmp".into(),
+            started_at: 7,
+        };
         write_state(&dir, &state).unwrap();
         let back = read_state(&dir).unwrap();
         assert_eq!(back.pid, 4242);

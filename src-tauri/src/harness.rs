@@ -20,6 +20,12 @@ const LOG_LIMIT_BYTES: u64 = 5 * 1024 * 1024;
 #[derive(Clone)]
 pub struct Ring(Arc<Mutex<VecDeque<String>>>);
 
+impl Default for Ring {
+    fn default() -> Self {
+        Ring::new()
+    }
+}
+
 impl Ring {
     pub fn new() -> Self {
         Ring(Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAPACITY))))
@@ -32,7 +38,13 @@ impl Ring {
         q.push_back(redact(line));
     }
     pub fn tail(&self) -> String {
-        self.0.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n")
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -74,16 +86,24 @@ pub enum Probe {
     Closed,
 }
 
+/// Bound every network touch: a peer that accepts the connection and then stays silent
+/// must not be able to park the startup thread forever.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(600);
+
 /// Dependency-free HTTP probe over loopback: the auth fence identifies a Harness.
 pub fn probe(port: u16) -> Probe {
     let addr = match format!("127.0.0.1:{port}").parse() {
         Ok(a) => a,
         Err(_) => return Probe::Other,
     };
-    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(600)) {
+    let mut stream = match TcpStream::connect_timeout(&addr, PROBE_TIMEOUT) {
         Ok(s) => s,
         Err(_) => return Probe::Closed,
     };
+    // Connect timeouts do not cover the exchange: without these the read below can block
+    // until the peer decides to answer, which it may never do.
+    let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(PROBE_TIMEOUT));
     let request = format!(
         "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: dsh-desktop\r\nConnection: close\r\n\r\n"
     );
@@ -127,7 +147,10 @@ pub fn listener_pid(port: u16) -> Option<u32> {
     }
     #[cfg(windows)]
     {
-        let out = std::process::Command::new("netstat").args(["-ano"]).output().ok()?;
+        let out = std::process::Command::new("netstat")
+            .args(["-ano"])
+            .output()
+            .ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
         let needle = format!(":{port} ");
         for line in text.lines() {
@@ -170,8 +193,15 @@ fn listener_pid_ss(port: u16) -> Option<u32> {
 #[allow(dead_code)]
 pub fn parse_ss_pid(output: &str) -> Option<u32> {
     let index = output.find("pid=")?;
-    let digits: String = output[index + 4..].chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() { None } else { digits.parse().ok() }
+    let digits: String = output[index + 4..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
 
 pub struct Spawned {
@@ -235,7 +265,11 @@ pub fn spawn(loc: &DshLocation, opts: &SpawnOptions<'_>) -> std::io::Result<Spaw
     if let Some(stderr) = child.stderr.take() {
         forward_lines(stderr, tx, ring.clone(), log);
     }
-    Ok(Spawned { child, urls: rx, ring })
+    Ok(Spawned {
+        child,
+        urls: rx,
+        ring,
+    })
 }
 
 impl Spawned {
@@ -252,7 +286,12 @@ impl Spawned {
     }
 }
 
-fn forward_lines<R: Read + Send + 'static>(reader: R, tx: mpsc::Sender<Url>, ring: Ring, log: Logger) {
+fn forward_lines<R: Read + Send + 'static>(
+    reader: R,
+    tx: mpsc::Sender<Url>,
+    ring: Ring,
+    log: Logger,
+) {
     std::thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
             ring.push(&line);
@@ -289,18 +328,28 @@ impl Logger {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if std::fs::metadata(path).map(|m| m.len() > LOG_LIMIT_BYTES).unwrap_or(false) {
+        if std::fs::metadata(path)
+            .map(|m| m.len() > LOG_LIMIT_BYTES)
+            .unwrap_or(false)
+        {
             let rotated = path.with_extension("log.1");
             let _ = std::fs::rename(path, rotated);
         }
         let file = OpenOptions::new().create(true).append(true).open(path).ok();
-        Logger { path: path.to_path_buf(), file: Arc::new(Mutex::new(file)) }
+        Logger {
+            path: path.to_path_buf(),
+            file: Arc::new(Mutex::new(file)),
+        }
     }
 
     pub fn write(&self, line: &str) {
         let mut guard = self.file.lock().unwrap();
         if guard.is_none() {
-            *guard = OpenOptions::new().create(true).append(true).open(&self.path).ok();
+            *guard = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .ok();
         }
         if let Some(file) = guard.as_mut() {
             let _ = writeln!(file, "{line}");
@@ -320,7 +369,8 @@ mod tests {
 
     #[test]
     fn ignores_lan_suffix() {
-        let line = "dsh web: http://127.0.0.1:59753/?token=abc (LAN: http://10.0.0.5:59753/?token=abc)";
+        let line =
+            "dsh web: http://127.0.0.1:59753/?token=abc (LAN: http://10.0.0.5:59753/?token=abc)";
         let url = parse_dsh_url(line).unwrap();
         assert_eq!(url.host_str(), Some("127.0.0.1"));
         assert_eq!(url.port(), Some(59753));
@@ -339,6 +389,26 @@ mod tests {
         assert_eq!(parse_ss_pid(line), Some(73596));
         assert_eq!(parse_ss_pid("LISTEN 0 511 127.0.0.1:3080 0.0.0.0:*"), None);
         assert_eq!(parse_ss_pid("users:((\"node\",pid=,fd=1))"), None);
+    }
+
+    #[test]
+    fn probe_gives_up_on_a_silent_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = std::thread::spawn(move || {
+            // Accept and stay silent: without an IO timeout the probe would wait here.
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_millis(1_200));
+                drop(stream);
+            }
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(probe(port), Probe::Other);
+        assert!(
+            started.elapsed() < Duration::from_millis(1_000),
+            "probe waited for a silent peer"
+        );
+        let _ = silent.join();
     }
 
     #[test]

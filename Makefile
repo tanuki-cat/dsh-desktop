@@ -95,7 +95,7 @@ test:
 	$(CARGO_ENV) $(CARGO) test --manifest-path $(MANIFEST)
 
 test-live:
-	DSH_DESKTOP_LIVE_TESTS=1 $(CARGO_ENV) $(CARGO) test --manifest-path $(MANIFEST) --test update_live -- --nocapture
+	DSH_DESKTOP_LIVE_TESTS=1 $(CARGO_ENV) $(CARGO) test --manifest-path $(MANIFEST) -- --nocapture
 
 dev:
 	$(CARGO_ENV) $(CARGO) run --manifest-path $(MANIFEST)

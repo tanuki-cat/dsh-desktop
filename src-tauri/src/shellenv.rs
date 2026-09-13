@@ -38,7 +38,9 @@ pub fn is_reserved(key: &str) -> bool {
 pub fn parse_env(output: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for line in output.lines() {
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         if key.is_empty() || is_reserved(key) {
             continue;
         }
@@ -56,7 +58,10 @@ pub fn merge_path(prefix: &[String], shell_path: Option<&str>, app_path: Option<
     let mut parts: Vec<String> = Vec::new();
     let mut add = |value: &str| {
         for part in value.split(':') {
-            if !part.is_empty() && part.starts_with('/') && !parts.iter().any(|existing| existing == part) {
+            if !part.is_empty()
+                && part.starts_with('/')
+                && !parts.iter().any(|existing| existing == part)
+            {
                 parts.push(part.to_string());
             }
         }
@@ -129,7 +134,10 @@ mod tests {
         let output = "PATH=/usr/bin:/bin\nbanner without equals\nDEEPSEEK_API_KEY=sk-abc=def\n\n1BAD=x\n=empty\n";
         let map = parse_env(output);
         assert_eq!(map.get("PATH").map(String::as_str), Some("/usr/bin:/bin"));
-        assert_eq!(map.get("DEEPSEEK_API_KEY").map(String::as_str), Some("sk-abc=def"));
+        assert_eq!(
+            map.get("DEEPSEEK_API_KEY").map(String::as_str),
+            Some("sk-abc=def")
+        );
         assert!(!map.contains_key("1BAD"));
         assert_eq!(map.len(), 2);
     }

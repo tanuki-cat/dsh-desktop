@@ -7,7 +7,18 @@ use std::path::PathBuf;
 
 fn path_lookup(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths).map(|dir| dir.join(name)).find(|c| c.is_file())
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(name))
+        .find(|c| c.is_file())
+}
+
+/// Keep the live queries off the user npm cache: npm refuses to run when that cache is not
+/// writable (restricted sandbox, read-only home), which has nothing to do with this shell.
+/// Both tests share one directory, so the process-global setting stays race-free.
+fn use_private_npm_cache() {
+    let cache = std::env::temp_dir().join("dsh-desktop-live-npm-cache");
+    let _ = std::fs::create_dir_all(&cache);
+    std::env::set_var("npm_config_cache", &cache);
 }
 
 #[test]
@@ -18,6 +29,7 @@ fn live_check_reports_the_registry_head() {
     }
     let node = path_lookup("node").expect("node must be on PATH for this test");
     let npm = update::npm_for(&node).expect("npm must be resolvable from node");
+    use_private_npm_cache();
     let tags = vec!["latest".to_string(), "next".to_string()];
 
     // Any real published version outranks 0.0.1, so this must report an update.
@@ -45,6 +57,7 @@ fn cache_short_circuits_the_second_query() {
     }
     let node = path_lookup("node").expect("node must be on PATH for this test");
     let npm = update::npm_for(&node).expect("npm must be resolvable from node");
+    use_private_npm_cache();
     let tags = vec!["latest".to_string(), "next".to_string()];
     let dir = std::env::temp_dir().join("dsh-desktop-live-cache-test");
     let _ = std::fs::remove_dir_all(&dir);
@@ -59,9 +72,18 @@ fn cache_short_circuits_the_second_query() {
 
     println!("cold = {cold_ms} ms (query), warm = {warm_ms} ms (cache)");
     assert!(!cold.cached, "first call must query the registry");
-    assert!(warm.cached, "second call inside the interval must use the cache");
-    assert_eq!(cold.status, warm.status, "cached answer must match the fresh one");
-    assert!(warm_ms * 5 < cold_ms.max(50), "cached path should be far cheaper: {warm_ms} vs {cold_ms} ms");
+    assert!(
+        warm.cached,
+        "second call inside the interval must use the cache"
+    );
+    assert_eq!(
+        cold.status, warm.status,
+        "cached answer must match the fresh one"
+    );
+    assert!(
+        warm_ms * 5 < cold_ms.max(50),
+        "cached path should be far cheaper: {warm_ms} vs {cold_ms} ms"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

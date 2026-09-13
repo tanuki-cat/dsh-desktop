@@ -22,8 +22,10 @@ const TERMINATE_GRACE: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Fixed port keeps the cookie authority stable so a restart can reuse its session.
+    #[serde(default = "default_port")]
     pub port: u16,
-    /// Agent workspace root; `dsh` treats the invoking directory as the workspace root.
+    /// Agent workspace root; dsh treats the invoking directory as the workspace root.
+    #[serde(default = "default_workspace")]
     pub workspace: PathBuf,
     /// `None` shares `~/.dsh` with CLI usage (keeps marketplace plugins and settings).
     pub dsh_home: Option<PathBuf>,
@@ -50,6 +52,16 @@ pub struct Config {
     pub env: BTreeMap<String, String>,
 }
 
+fn default_port() -> u16 {
+    3080
+}
+
+fn default_workspace() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/"))
+}
+
 fn default_import_shell_env() -> bool {
     true
 }
@@ -74,14 +86,17 @@ impl Config {
     fn load(data_dir: &Path) -> Config {
         let path = data_dir.join("config.json");
         if let Ok(raw) = std::fs::read_to_string(&path) {
-            if let Ok(cfg) = serde_json::from_str::<Config>(&raw) {
-                return cfg;
+            match serde_json::from_str::<Config>(&raw) {
+                Ok(config) => return config,
+                // Never rewrite a file the user owns: fall back for this run and say why.
+                Err(error) => harness::app_log(&format!(
+                    "config.json 无法解析，本次使用默认配置且不覆盖该文件: {error}"
+                )),
             }
         }
-        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"));
-        let cfg = Config {
-            port: 3080,
-            workspace: home,
+        let config = Config {
+            port: default_port(),
+            workspace: default_workspace(),
             dsh_home: None,
             take_over_existing: true,
             auto_update: true,
@@ -91,8 +106,13 @@ impl Config {
             env: BTreeMap::new(),
         };
         let _ = std::fs::create_dir_all(data_dir);
-        let _ = std::fs::write(&path, serde_json::to_vec_pretty(&cfg).unwrap_or_default());
-        cfg
+        if !path.exists() {
+            let _ = std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&config).unwrap_or_default(),
+            );
+        }
+        config
     }
 }
 
@@ -156,7 +176,11 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     // 1) Self-heal: an instance left behind by a crashed shell is terminated first.
     if let Some(state) = process::read_state(data_dir) {
         if process::is_alive(state.pid) {
-            window::set_status(app, "正在清理上次残留的 Harness…", &format!("pid {}", state.pid));
+            window::set_status(
+                app,
+                "正在清理上次残留的 Harness…",
+                &format!("pid {}", state.pid),
+            );
             process::terminate(state.pid, TERMINATE_GRACE);
         }
         process::clear_state(data_dir);
@@ -164,6 +188,17 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
 
     let config = Config::load(data_dir);
     let port = config.port;
+
+    // The login-shell capture costs ~160 ms and depends on nothing that follows, so it runs
+    // alongside the version lookup and update check and is joined just before the child env
+    // is assembled.
+    let env_capture = config.import_shell_env.then(|| {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        std::thread::spawn(move || {
+            let imported = shellenv::import(Path::new(&shell));
+            (shell, imported)
+        })
+    });
 
     // 3) Locate dsh + node (a GUI-launched app has no Homebrew PATH).
     window::set_status(app, "正在定位 dsh 与 node…", "");
@@ -187,13 +222,19 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                     interval,
                 );
                 if checked.cached {
-                    harness::app_log(&format!("update check: cached answer (interval {interval} min)"));
+                    harness::app_log(&format!(
+                        "update check: cached answer (interval {interval} min)"
+                    ));
                 } else {
                     window::set_status(app, "正在检查 dsh 更新…", &format!("当前 dsh {version}"));
                 }
                 match checked.status {
                     update::Status::UpdateAvailable { from, to } => {
-                        window::set_status(app, &format!("发现新版本 v{to}，正在更新…"), &format!("v{from} -> v{to}"));
+                        window::set_status(
+                            app,
+                            &format!("发现新版本 v{to}，正在更新…"),
+                            &format!("v{from} -> v{to}"),
+                        );
                         harness::app_log(&format!("update available: {from} -> {to}, installing"));
                         let prefix = update::install_prefix(&location.dsh_js);
                         match update::install(&npm, update::PACKAGE, &to, prefix.as_deref()) {
@@ -202,7 +243,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                                 version = locator::version(&location).unwrap_or_else(|| to.clone());
                                 harness::app_log(&format!("dsh updated: {from} -> {to}"));
                             }
-                            Err(reason) => harness::app_log(&format!("update failed, keeping v{from}: {reason}")),
+                            Err(reason) => harness::app_log(&format!(
+                                "update failed, keeping v{from}: {reason}"
+                            )),
                         }
                     }
                     update::Status::UpToDate { version: current } => {
@@ -210,7 +253,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                     }
                     update::Status::Skipped => {}
                     update::Status::Failed { reason } => {
-                        harness::app_log(&format!("update check failed, keeping v{version}: {reason}"));
+                        harness::app_log(&format!(
+                            "update check failed, keeping v{version}: {reason}"
+                        ));
                     }
                 }
             }
@@ -230,7 +275,8 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                 // Our own instance from an earlier run: its cookie is still valid for this
                 // authority (verified across restarts), so reuse it as-is. A fresh update
                 // instead restarts it, otherwise the old binary would keep serving.
-                let url = url::Url::parse(&format!("http://127.0.0.1:{port}/")).map_err(|e| e.to_string())?;
+                let url = url::Url::parse(&format!("http://127.0.0.1:{port}/"))
+                    .map_err(|e| e.to_string())?;
                 window::set_status(app, "复用本应用上次启动的 Harness…", &format!("pid {pid}"));
                 return window::create_harness(app, &url, port).map_err(|e| e.to_string());
             }
@@ -244,7 +290,11 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
 
             // Foreign instance: stop it (the auth fence already proved it is a Harness),
             // then start our own so the window receives a fresh authenticated URL.
-            window::set_status(app, "检测到其它 Harness，正在接管…", &format!("127.0.0.1:{port}"));
+            window::set_status(
+                app,
+                "检测到其它 Harness，正在接管…",
+                &format!("127.0.0.1:{port}"),
+            );
             if let Some(pid) = owner {
                 process::terminate_pid(pid, TERMINATE_GRACE);
             } else {
@@ -261,7 +311,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
             }
         }
         harness::Probe::Other => {
-            return Err(format!("端口 {port} 被其它程序占用，请在 config.json 里换一个端口。"));
+            return Err(format!(
+                "端口 {port} 被其它程序占用，请在 config.json 里换一个端口。"
+            ));
         }
         harness::Probe::Closed => {}
     }
@@ -280,9 +332,13 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     //     supervised CLI would miss DEEPSEEK_API_KEY and friends. Import them here.
     let mut child_env: Vec<(String, String)> = Vec::new();
     let mut shell_path: Option<String> = None;
-    if config.import_shell_env {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        match shellenv::import(Path::new(&shell)) {
+    if let Some(handle) = env_capture {
+        let captured = handle.join().ok();
+        let shell = captured
+            .as_ref()
+            .map(|(shell, _)| shell.clone())
+            .unwrap_or_else(|| "登录 shell".to_string());
+        match captured.and_then(|(_, imported)| imported) {
             Some((flag, imported)) => {
                 let names: Vec<String> = imported.keys().cloned().collect();
                 // Names only: values may be credentials.
@@ -329,17 +385,28 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         env: &child_env,
     };
 
-    window::set_status(app, "正在启动 Harness…", &format!("dsh {version} · 端口 {port}"));
+    window::set_status(
+        app,
+        "正在启动 Harness…",
+        &format!("dsh {version} · 端口 {port}"),
+    );
     let spawned = harness::spawn(&location, &options).map_err(|e| format!("启动进程失败: {e}"))?;
     let pid = spawned.child.id();
-    *LIVE.lock().unwrap() = Some(Live { pid, data_dir: data_dir.to_path_buf() });
+    *LIVE.lock().unwrap() = Some(Live {
+        pid,
+        data_dir: data_dir.to_path_buf(),
+    });
 
     // A profile that does not exist yet is initialised on first use, which is slower
     // (measured ~4s on a warm machine, but plugin installs can take much longer).
     let home = config
         .dsh_home
         .clone()
-        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".dsh")))
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".dsh"))
+        })
         .unwrap_or_else(|| PathBuf::from(".dsh"));
     let timeout = if home.join("profiles").join("web").exists() {
         STARTUP_TIMEOUT_NEXT
@@ -359,7 +426,10 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
             pid,
             port: actual_port,
             cwd: config.workspace.to_string_lossy().to_string(),
-            started_at: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            started_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
         },
     );
 
@@ -368,4 +438,35 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
 
 fn fail(app: &AppHandle, status: &str, detail: &str) {
     window::set_status(app, status, detail);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_configs_parse_and_broken_ones_are_not_overwritten() {
+        let dir = std::env::temp_dir().join("dsh-desktop-config-test");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Missing file: defaults are seeded once.
+        let seeded = Config::load(&dir);
+        assert_eq!(seeded.port, default_port());
+        assert!(dir.join("config.json").is_file());
+
+        // A partial edit keeps its value and takes defaults for the rest.
+        std::fs::write(dir.join("config.json"), "{\"port\": 4321}").unwrap();
+        assert_eq!(Config::load(&dir).port, 4321);
+
+        // Unparsable: defaults apply for this run, the file survives untouched.
+        let broken = "{ not json at all";
+        std::fs::write(dir.join("config.json"), broken).unwrap();
+        assert_eq!(Config::load(&dir).port, default_port());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.json")).unwrap(),
+            broken
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

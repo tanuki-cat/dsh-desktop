@@ -62,10 +62,15 @@ pub fn create_harness(app: &AppHandle, url: &Url, port: u16) -> tauri::Result<()
             match event {
                 DownloadEvent::Requested { url, destination } => {
                     *destination = downloads_dir().join(file_name_of(destination));
-                    harness::app_log(&format!("download started: {url} -> {}", destination.display()));
+                    harness::app_log(&format!(
+                        "download started: {url} -> {}",
+                        destination.display()
+                    ));
                 }
                 DownloadEvent::Finished { url, path, .. } => {
-                    let where_to = path.map(|p| p.display().to_string()).unwrap_or_else(|| "unknown".into());
+                    let where_to = path
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "unknown".into());
                     harness::app_log(&format!("download finished: {url} -> {where_to}"));
                 }
                 // The enum is #[non_exhaustive]: future variants must not break the build.
@@ -90,7 +95,9 @@ pub fn create_harness(app: &AppHandle, url: &Url, port: u16) -> tauri::Result<()
 }
 
 fn downloads_dir() -> PathBuf {
-    let base = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     let dir = base.join("Downloads");
     let _ = std::fs::create_dir_all(&dir);
     dir

@@ -470,3 +470,53 @@ npm registry**。实测各环节：
 
 **验证**：`cargo test` **20 passed**（新增 4 个：噪音行/保留名/重复键/PATH 合并去重）；
 真机变量的捕获能力由上面的 164 ms 实测佐证。
+
+### 13.8 性能审查后的修复（2026-09-13）
+
+第二轮审查逐文件读完 1728 行 Rust 代码。结论：这份壳是进程编排 + I/O，**没有任何后台轮询或定时器，
+空闲 CPU ≈ 0**，没有 CPU/内存热点；问题集中在启动路径的串行开销，外加两个非性能缺陷。以下全部已修。
+
+**P0：npm 子进程缺 PATH，导致更新功能在 GUI 启动时 100% 失效（功能性 bug）**
+
+- 证据（应用自己的日志，两次 GUI 启动各一条）：
+  `update check failed, keeping v0.1.5-rc.2: npm view 失败: env: node: No such file or directory`。
+- 根因：`fetch_dist_tags` / `install` / `global_prefix` 用 `Command::new(npm)` 启动 npm，而 npm 是 `#!/usr/bin/env node` 的 JS 脚本；
+  GUI 启动的壳继承 launchd 的 PATH（不含 node），shebang 直接 exit 127。
+- 实测：`env -i PATH=/usr/bin:/bin /opt/homebrew/bin/npm --version` → 127；把 node 目录前置后 → `10.9.8`。
+  13.6 里"冷查询 1.2–1.9 s"的测量是在终端环境（PATH 含 Homebrew）跑的，因此掩盖了这个 bug ——
+  **回归测试必须在"没有 node 的 PATH"下跑**才有效。
+- 修复：新增纯函数 `npm_path(npm, existing)`（npm 所在目录前置 + 去重）与 `npm_command(npm)`，
+  三处 npm 调用统一改走它。
+
+**P1：探针只有连接超时，没有读写超时（可能永久挂死启动线程）**
+
+- `probe()` 用 `connect_timeout(600ms)` 建连后直接 `read_to_string`；对端 accept 后不回包/不关连接时
+  会无限等待，而接管循环的 deadline 只在两次 probe 之间检查，启动线程就此卡死且无取消路径。
+- 修复：抽出 `PROBE_TIMEOUT = 600 ms`，建连、读、写都用它；新增回归测试
+  `probe_gives_up_on_a_silent_listener`（起一个只 accept 不说话的监听器，断言 1 s 内返回 `Probe::Other`）。
+
+**P2：启动路径上的两处开销**
+
+| 改动 | 前 | 后 |
+|---|---|---|
+| 版本读取 `locator::version` | `node dsh.js --version`，实测 **80 ms**（更新后还会再跑一次） | 先读 CLI 所属 `package.json` 的 `version`（**~1 ms**），失败才回退跑 node |
+| 登录 shell 环境抓取 | 排在更新检查之后串行执行，**160 ms** 全在关键路径上 | 与版本读取/更新检查并行（`std::thread::spawn`，组装子进程环境前 join） |
+
+**附带：config.json 不再被静默覆盖**
+
+- `Config` 的 `port` / `workspace` 原本没有 serde default，缺字段即整体解析失败，
+  随后代码会用默认值**覆盖用户文件**。现在两者都有 `#[serde(default)]`（部分配置照常生效）；
+  文件整体无法解析时只在本进程用默认值、**不写回文件**，并记一条 `config.json 无法解析…` 日志。
+- 只有文件不存在时才写入默认配置。
+
+**顺带清理**：`update.rs` 注释里 6 处「反斜杠 + 反引号」的转义残留改回普通反引号；
+`Ring` 补 `Default` 以满足 13.5 定下的 `clippy -D warnings` 门禁。
+
+验证：`make fmt` / `make clippy`（0 warning）/ `make test` → **24 passed**
+（新增 4 个：npm PATH 前缀、沉默对端探针、package.json 版本解析、部分/损坏 config.json）。
+
+新增联网回归测试 `tests/update_npm_env_live.rs`（独立 test binary，因为它会改写进程 PATH）
+直接复现 GUI 失败场景：解析出 node/npm 后把 `PATH` 换成不含 node 的值、`npm_config_cache` 指向临时目录，
+先断言裸调 npm 退出码为 **127**（前提成立），再断言 `update::check` 能正常拿到 registry head。
+实测输出：`premise confirmed: plain npm exits Some(127) without node on PATH` → `live registry head = 0.1.5-rc.2 with PATH=/nonexistent-bin`。
+`make test-live` 相应改为跑全部联网测试（原先是只跑 `--test update_live`）。

@@ -1,12 +1,13 @@
-//! Check for and install a newer \`dsh\` from the npm registry.
+//! Check for and install a newer `dsh` from the npm registry.
 //!
 //! The shell supervises a globally installed CLI, so "updating the shell's core" means
 //! updating that CLI: query dist-tags, compare with prerelease-aware semver, then run
-//! \`npm install -g <pkg>@<version>\` using the npm that belongs to the resolved node
+//! `npm install -g <pkg>@<version>` using the npm that belongs to the resolved node
 //! (a GUI-launched app has no Homebrew PATH, so npm must be resolved explicitly).
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,7 +44,12 @@ impl Version {
         if parts.next().is_some() {
             return None;
         }
-        Some(Version { major, minor, patch, pre })
+        Some(Version {
+            major,
+            minor,
+            patch,
+            pre,
+        })
     }
 
     fn cmp_pre(a: &[String], b: &[String]) -> Ordering {
@@ -99,24 +105,66 @@ pub enum Status {
     Failed { reason: String },
 }
 
-/// Highest version among the given dist-tags, e.g. \`["latest", "next"]\`.
+/// Highest version among the given dist-tags, e.g. `["latest", "next"]`.
 pub fn newest_tagged(tags: &[(String, String)]) -> Option<Version> {
     tags.iter().filter_map(|(_, raw)| Version::parse(raw)).max()
 }
 
-/// Read \`npm view <pkg> dist-tags --json\` and return the tags that exist.
+/// PATH for an npm child process: npm is a `#!/usr/bin/env node` script, and a GUI-launched
+/// app inherits launchd PATH, which normally has no `node`. The shebang then died with exit
+/// 127 before npm ever ran, so every update check failed. npm sits next to the node that
+/// should run it, so that directory goes first.
+pub fn npm_path(npm: &Path, existing: Option<&OsStr>) -> OsString {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = npm.parent() {
+        if !dir.as_os_str().is_empty() {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    if let Some(value) = existing {
+        for dir in std::env::split_paths(value) {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    match std::env::join_paths(&dirs) {
+        Ok(joined) => joined,
+        Err(_) => existing.unwrap_or_default().to_os_string(),
+    }
+}
+
+/// npm command that starts whatever PATH the app was launched with.
+fn npm_command(npm: &Path) -> Command {
+    let mut command = Command::new(npm);
+    command.env("PATH", npm_path(npm, std::env::var_os("PATH").as_deref()));
+    command
+}
+
+/// Read `npm view <pkg> dist-tags --json` and return the tags that exist.
 pub fn fetch_dist_tags(npm: &Path, package: &str) -> Result<Vec<(String, String)>, String> {
     let timeout = format!("--fetch-timeout={FETCH_TIMEOUT_MS}");
-    let output = Command::new(npm)
-        .args(["view", package, "dist-tags", "--json", timeout.as_str(), "--fetch-retries=1"])
+    let output = npm_command(npm)
+        .args([
+            "view",
+            package,
+            "dist-tags",
+            "--json",
+            timeout.as_str(),
+            "--fetch-retries=1",
+        ])
         .output()
         .map_err(|error| format!("无法执行 npm: {error}"))?;
     if !output.status.success() {
-        let tail: String = String::from_utf8_lossy(&output.stderr).lines().take(3).collect::<Vec<_>>().join(" | ");
+        let tail: String = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" | ");
         return Err(format!("npm view 失败: {tail}"));
     }
-    let parsed: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(|error| format!("dist-tags 解析失败: {error}"))?;
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("dist-tags 解析失败: {error}"))?;
     let mut tags = Vec::new();
     if let Some(object) = parsed.as_object() {
         for (name, value) in object {
@@ -133,16 +181,29 @@ pub fn fetch_dist_tags(npm: &Path, package: &str) -> Result<Vec<(String, String)
 pub fn judge(latest: &str, current: &str) -> Status {
     let current_version = match Version::parse(current) {
         Some(version) => version,
-        None => return Status::Failed { reason: format!("无法解析已安装版本 {current:?}") },
+        None => {
+            return Status::Failed {
+                reason: format!("无法解析已安装版本 {current:?}"),
+            }
+        }
     };
     let latest_version = match Version::parse(latest) {
         Some(version) => version,
-        None => return Status::Failed { reason: format!("无法解析 registry 版本 {latest:?}") },
+        None => {
+            return Status::Failed {
+                reason: format!("无法解析 registry 版本 {latest:?}"),
+            }
+        }
     };
     if latest_version > current_version {
-        Status::UpdateAvailable { from: current.to_string(), to: format!("{latest_version}") }
+        Status::UpdateAvailable {
+            from: current.to_string(),
+            to: format!("{latest_version}"),
+        }
     } else {
-        Status::UpToDate { version: format!("{latest_version}") }
+        Status::UpToDate {
+            version: format!("{latest_version}"),
+        }
     }
 }
 
@@ -157,15 +218,19 @@ pub fn check(npm: &Path, package: &str, wanted_tags: &[String], current: &str) -
         .filter(|(name, _)| wanted_tags.iter().any(|wanted| wanted == name))
         .collect();
     if selected.is_empty() {
-        return Status::Failed { reason: format!("没有匹配的 dist-tag: {}", wanted_tags.join(",")) };
+        return Status::Failed {
+            reason: format!("没有匹配的 dist-tag: {}", wanted_tags.join(",")),
+        };
     }
     match newest_tagged(&selected) {
-        None => Status::Failed { reason: "dist-tag 里没有可解析的版本号".to_string() },
+        None => Status::Failed {
+            reason: "dist-tag 里没有可解析的版本号".to_string(),
+        },
         Some(latest) => judge(&format!("{latest}"), current),
     }
 }
 
-/// \`npm\` that belongs to the same installation as the resolved node.
+/// `npm` that belongs to the same installation as the resolved node.
 pub fn npm_for(node: &Path) -> Option<PathBuf> {
     if let Some(dir) = node.parent() {
         let candidate = dir.join("npm");
@@ -174,19 +239,29 @@ pub fn npm_for(node: &Path) -> Option<PathBuf> {
         }
     }
     if let Some(paths) = std::env::var_os("PATH") {
-        if let Some(found) = std::env::split_paths(&paths).map(|dir| dir.join("npm")).find(|p| p.is_file()) {
+        if let Some(found) = std::env::split_paths(&paths)
+            .map(|dir| dir.join("npm"))
+            .find(|p| p.is_file())
+        {
             return Some(found);
         }
     }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let output = Command::new(shell).args(["-lc", "command -v npm"]).output().ok()?;
+    let output = Command::new(shell)
+        .args(["-lc", "command -v npm"])
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let candidate = PathBuf::from(text);
-    if candidate.is_file() { Some(candidate) } else { None }
+    if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 /// Global prefix implied by the location of the installed CLI
-/// (\`/opt/homebrew/lib/node_modules/@deepseek-ai/dsh\` -> \`/opt/homebrew\`).
+/// (`/opt/homebrew/lib/node_modules/@deepseek-ai/dsh` -> `/opt/homebrew`).
 pub fn install_prefix(dsh_js: &Path) -> Option<PathBuf> {
     let text = dsh_js.to_string_lossy();
     let marker = "/lib/node_modules/";
@@ -195,28 +270,45 @@ pub fn install_prefix(dsh_js: &Path) -> Option<PathBuf> {
 }
 
 fn global_prefix(npm: &Path) -> Option<String> {
-    let output = Command::new(npm).args(["prefix", "-g"]).output().ok()?;
+    let output = npm_command(npm).args(["prefix", "-g"]).output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// Run the global install, mirroring the launcher script: pin the resolved version and, when
 /// npm's global prefix differs from where the CLI actually lives, install into that prefix.
-pub fn install(npm: &Path, package: &str, version: &str, prefix: Option<&Path>) -> Result<(), String> {
-    let mut command = Command::new(npm);
+pub fn install(
+    npm: &Path,
+    package: &str,
+    version: &str,
+    prefix: Option<&Path>,
+) -> Result<(), String> {
+    let mut command = npm_command(npm);
     command.args(["install", "-g", "--no-fund", "--no-audit"]);
     if let Some(wanted) = prefix {
-        let differs = global_prefix(npm).map(|current| current != wanted.to_string_lossy()).unwrap_or(true);
+        let differs = global_prefix(npm)
+            .map(|current| current != wanted.to_string_lossy())
+            .unwrap_or(true);
         if differs {
             command.arg("--prefix").arg(wanted);
         }
     }
     command.arg(format!("{package}@{version}"));
-    let output = command.output().map_err(|error| format!("无法执行 npm install: {error}"))?;
+    let output = command
+        .output()
+        .map_err(|error| format!("无法执行 npm install: {error}"))?;
     if output.status.success() {
         return Ok(());
     }
-    let tail: String = String::from_utf8_lossy(&output.stderr).lines().take(5).collect::<Vec<_>>().join(" | ");
+    let tail: String = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .take(5)
+        .collect::<Vec<_>>()
+        .join(" | ");
     Err(format!("npm install 失败: {tail}"))
 }
 
@@ -250,7 +342,10 @@ impl Cache {
 }
 
 pub fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn cache_path(data_dir: &Path) -> PathBuf {
@@ -289,9 +384,14 @@ pub fn check_cached(
         if cache.is_fresh(now, current, interval_minutes) {
             let status = match cache.latest.as_deref() {
                 Some(latest) => judge(latest, current),
-                None => Status::Failed { reason: "上次查询失败（缓存结果）".to_string() },
+                None => Status::Failed {
+                    reason: "上次查询失败（缓存结果）".to_string(),
+                },
             };
-            return Checked { status, cached: true };
+            return Checked {
+                status,
+                cached: true,
+            };
         }
     }
     let status = check(npm, package, wanted_tags, current);
@@ -300,8 +400,18 @@ pub fn check_cached(
         Status::UpToDate { version } => Some(version.clone()),
         _ => None,
     };
-    let _ = write_cache(data_dir, &Cache { checked_at: now, installed: current.to_string(), latest });
-    Checked { status, cached: false }
+    let _ = write_cache(
+        data_dir,
+        &Cache {
+            checked_at: now,
+            installed: current.to_string(),
+            latest,
+        },
+    );
+    Checked {
+        status,
+        cached: false,
+    }
 }
 
 impl std::fmt::Display for Version {
@@ -365,12 +475,31 @@ mod tests {
     fn judge_reports_updates_and_up_to_date() {
         assert_eq!(
             judge("0.1.5-rc.2", "0.1.5-rc.1"),
-            Status::UpdateAvailable { from: "0.1.5-rc.1".into(), to: "0.1.5-rc.2".into() }
+            Status::UpdateAvailable {
+                from: "0.1.5-rc.1".into(),
+                to: "0.1.5-rc.2".into()
+            }
         );
-        assert_eq!(judge("0.1.5-rc.1", "0.1.5-rc.2"), Status::UpToDate { version: "0.1.5-rc.1".into() });
-        assert_eq!(judge("0.1.5-rc.1", "0.1.5-rc.1"), Status::UpToDate { version: "0.1.5-rc.1".into() });
-        assert!(matches!(judge("garbage", "0.1.5-rc.1"), Status::Failed { .. }));
-        assert!(matches!(judge("0.1.5-rc.1", "garbage"), Status::Failed { .. }));
+        assert_eq!(
+            judge("0.1.5-rc.1", "0.1.5-rc.2"),
+            Status::UpToDate {
+                version: "0.1.5-rc.1".into()
+            }
+        );
+        assert_eq!(
+            judge("0.1.5-rc.1", "0.1.5-rc.1"),
+            Status::UpToDate {
+                version: "0.1.5-rc.1".into()
+            }
+        );
+        assert!(matches!(
+            judge("garbage", "0.1.5-rc.1"),
+            Status::Failed { .. }
+        ));
+        assert!(matches!(
+            judge("0.1.5-rc.1", "garbage"),
+            Status::Failed { .. }
+        ));
     }
 
     #[test]
@@ -381,9 +510,17 @@ mod tests {
             latest: latest.map(|text| text.to_string()),
         };
         // Inside the window, same installed version -> fresh.
-        assert!(entry(Some("0.1.5-rc.2"), "0.1.5-rc.1").is_fresh(1_000 + 59 * 60, "0.1.5-rc.1", 60));
+        assert!(entry(Some("0.1.5-rc.2"), "0.1.5-rc.1").is_fresh(
+            1_000 + 59 * 60,
+            "0.1.5-rc.1",
+            60
+        ));
         // Past the window -> stale.
-        assert!(!entry(Some("0.1.5-rc.2"), "0.1.5-rc.1").is_fresh(1_000 + 61 * 60, "0.1.5-rc.1", 60));
+        assert!(!entry(Some("0.1.5-rc.2"), "0.1.5-rc.1").is_fresh(
+            1_000 + 61 * 60,
+            "0.1.5-rc.1",
+            60
+        ));
         // Manual upgrade changed the installed version -> stale.
         assert!(!entry(Some("0.1.5-rc.2"), "0.1.5-rc.1").is_fresh(1_000 + 60, "0.1.6", 60));
         // Interval 0 disables caching entirely.
@@ -397,15 +534,34 @@ mod tests {
     fn cache_round_trips_on_disk() {
         let dir = std::env::temp_dir().join("dsh-desktop-update-cache-test");
         let _ = std::fs::remove_dir_all(&dir);
-        let cache = Cache { checked_at: 42, installed: "0.1.5-rc.1".into(), latest: Some("0.1.5-rc.2".into()) };
+        let cache = Cache {
+            checked_at: 42,
+            installed: "0.1.5-rc.1".into(),
+            latest: Some("0.1.5-rc.2".into()),
+        };
         write_cache(&dir, &cache).unwrap();
         assert_eq!(read_cache(&dir), Some(cache));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn npm_path_puts_the_node_directory_first() {
+        let existing = OsStr::new("/usr/bin:/opt/homebrew/bin");
+        let path = npm_path(Path::new("/opt/homebrew/bin/npm"), Some(existing));
+        assert_eq!(path.to_string_lossy(), "/opt/homebrew/bin:/usr/bin");
+        // No PATH at all still yields the directory npm itself lives in.
+        assert_eq!(
+            npm_path(Path::new("/opt/homebrew/bin/npm"), None).to_string_lossy(),
+            "/opt/homebrew/bin"
+        );
+    }
+
     #[test]
     fn derives_install_prefix_from_cli_path() {
-        let prefix = install_prefix(Path::new("/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"));
+        let prefix = install_prefix(Path::new(
+            "/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
+        ));
         assert_eq!(prefix, Some(PathBuf::from("/opt/homebrew")));
         assert_eq!(install_prefix(Path::new("/tmp/plain/bin.js")), None);
     }
