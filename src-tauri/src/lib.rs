@@ -10,6 +10,7 @@ pub mod window;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -88,7 +89,11 @@ impl Config {
         let path = data_dir.join("config.json");
         if let Ok(raw) = std::fs::read_to_string(&path) {
             match serde_json::from_str::<Config>(&raw) {
-                Ok(config) => return config,
+                Ok(config) => {
+                    // The `env` map may hold credentials, and older versions wrote 0644.
+                    process::restrict(&path);
+                    return config;
+                }
                 // Never rewrite a file the user owns: fall back for this run and say why.
                 Err(error) => harness::app_log(&format!(
                     "config.json 无法解析，本次使用默认配置且不覆盖该文件: {error}"
@@ -108,10 +113,13 @@ impl Config {
         };
         let _ = std::fs::create_dir_all(data_dir);
         if !path.exists() {
-            let _ = std::fs::write(
+            let written = std::fs::write(
                 &path,
                 serde_json::to_vec_pretty(&config).unwrap_or_default(),
             );
+            if written.is_ok() {
+                process::restrict(&path);
+            }
         }
         config
     }
@@ -174,6 +182,51 @@ pub fn run() {
                 shutdown();
             }
         });
+}
+
+/// Forget a supervised pid without signalling it (used when the process is already gone).
+fn disown(pid: u32) {
+    let mut guard = LIVE.lock().unwrap();
+    if guard.as_ref().is_some_and(|live| live.pid == pid) {
+        *guard = None;
+    }
+}
+
+/// A launch that failed after spawning must not leave a half-started Harness behind: it
+/// would keep the port and make the failure page a lie.
+fn abort_start(pid: u32, reason: String) -> Result<(), String> {
+    process::terminate(pid, TERMINATE_GRACE);
+    disown(pid);
+    Err(reason)
+}
+
+/// Wait for the Harness to end. An unexpected exit leaves the window on a page that can never
+/// connect again, so report it instead of letting the app look alive.
+fn watch_harness(
+    app: AppHandle,
+    data_dir: PathBuf,
+    pid: u32,
+    ring: harness::Ring,
+    mut child: Child,
+) {
+    let status = child.wait();
+    if EXITING.load(Ordering::SeqCst) {
+        return;
+    }
+    let code = status.as_ref().ok().and_then(|status| status.code());
+    harness::app_log(&format!(
+        "Harness pid {pid} exited unexpectedly (code {code:?})"
+    ));
+    disown(pid);
+    process::clear_state(&data_dir);
+    window::show_failure(
+        &app,
+        "Harness 已退出",
+        &format!(
+            "dsh web 进程已结束（退出码 {code:?}）。关闭本窗口即退出应用，重新启动即可恢复。\n\n最近输出:\n{}",
+            ring.tail()
+        ),
+    );
 }
 
 fn startup(app: AppHandle) {
@@ -442,10 +495,15 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         STARTUP_TIMEOUT_FIRST
     };
 
-    let url = spawned.wait_for_url(timeout).map_err(|reason| {
-        let tail = spawned.ring.tail();
-        format!("{reason}\n\n最近输出:\n{tail}")
-    })?;
+    let url = match spawned.wait_for_url(timeout) {
+        Ok(url) => url,
+        Err(reason) => {
+            // The CLI may still be starting even though nothing answered in time. Stopping it
+            // keeps the failure page honest and leaves the port free for the next attempt.
+            let tail = spawned.ring.tail();
+            return abort_start(pid, format!("{reason}\n\n最近输出:\n{tail}"));
+        }
+    };
 
     let actual_port = url.port().unwrap_or(port);
     let _ = process::write_state(
@@ -461,7 +519,18 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         },
     );
 
-    window::create_harness(app, &url, actual_port).map_err(|e| e.to_string())
+    if let Err(error) = window::create_harness(app, &url, actual_port) {
+        return abort_start(pid, error.to_string());
+    }
+
+    // The CLI outlives this function, so hand the child to a watchdog: an unexpected exit
+    // must be visible rather than leaving the window on a dead page.
+    let ring = spawned.ring.clone();
+    let child = spawned.into_child();
+    let handle = app.clone();
+    let data_dir = data_dir.to_path_buf();
+    std::thread::spawn(move || watch_harness(handle, data_dir, pid, ring, child));
+    Ok(())
 }
 
 fn fail(app: &AppHandle, status: &str, detail: &str) {

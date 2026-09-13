@@ -567,3 +567,60 @@ npm registry**。实测各环节：
   修复前的形态（日志只有启动、无 stopping、state.json 残留）不再出现。
 
 **仍只能靠自愈的场景**：SIGKILL 强杀、崩溃、断电 —— 任何回调都拿不到，下次启动按原有自愈路径清理。
+
+### 13.10 第三轮审查：剩余问题与修复（2026-09-13）
+
+复查范围：进程生命周期、退出路径、状态页与文件权限。共 2 个 P1、2 个 P2、3 个 P3，全部已修。
+
+**P1-1 启动超时后子进程没有被终止**
+
+`wait_for_url(timeout)` 失败后直接 `?` 返回，`fail()` 只更新状态页；
+`Spawned` / `Child` 被 drop，而 Rust 的 `Child` drop 不杀进程。于是"启动失败"的页面对着
+仍在后台运行的 `dsh web`，它可能继续起来并占住端口，下次启动再把它当外部实例接管。
+
+修复：新增 `abort_start(pid, reason)`，超时与 `create_harness` 失败两条路径都先
+`process::terminate` 再从 `LIVE` 摘除（`disown`），最后才返回错误。
+
+**P1-2 关掉状态页会留下没有窗口的进程**
+
+Tauri 2 在最后一个窗口关闭时不会退出应用：`tauri/src/app.rs:2544` 的 `Destroyed` 只调
+`manager.on_window_close`，`manager/mod.rs:653` 仅把窗口从注册表移除；tao 也没有
+`applicationShouldTerminateAfterLastWindowClosed`。所以启动失败后用户点红点关掉错误页，
+Dock 里就只剩一个没有窗口的进程。
+
+修复：`create_splash` 挂 `CloseRequested`，**且仅当 Harness 窗口不存在时**才 `exit(0)`。
+
+> **本轮回归（已修，值得记住）**：给状态页挂上关闭处理之后，应用启动完会立刻自己退出 —— 日志形如
+> `dsh web: …` 紧跟 `stopping Harness pid N`。根因是 `WebviewWindow::close()` 与用户点红点
+> 走的是同一条链路：`close()` → `WindowMessage::Close` → `on_close_requested()`（`tauri-runtime-wry/src/lib.rs:4368`）
+> → 逐个调用窗口监听器；而 `create_harness` 收尾时正是用 `close()` 关掉状态页。
+> 修法两条一起上：程序化移除一律改 `destroy()`（"Similar to close but does not emit any events"，
+> `webview_window.rs:2221`），状态页的关闭处理再加"Harness 窗口不存在"的判据。
+
+**P2-1 Harness 中途退出无人知晓**
+
+启动完成后不再观察子进程，`Child` 从不 `wait`。修复：`Spawned::into_child()` 把子句柄交给
+`watch_harness` 看护线程 —— `wait` 返回且 `EXITING` 为假时，记一条
+`Harness pid N exited unexpectedly (code …)`，`disown` + 清 state.json，并用 `window::show_failure` 弹回状态页
+显示退出码与最近输出。
+
+**P2-2 config.json 是 0644**
+
+`restrict(0600)` 原先只作用于 state.json，而 README 建议把 API Key 放进 config.json 的 `env`。
+修复：`process::restrict` 改为公开，写入与读取 config.json 时都收紧权限（读取也收紧，顺带修好旧文件）。
+
+**P3**
+
+- 下载同名文件会被静默覆盖 → 新增 `unique_download_path()`，重名自动 `name-1.ext`（含单测）；
+- 状态页最早几条状态会丢（`eval` 早于页面加载）→ `index.html` 把 `__setStatus` 提到 `<head>`，
+  值先缓存，`__applyStatus` 在 DOM 就绪后套用；
+- Windows 分支未支持且存活探测恒真 → 代码注释写明要移植必须先换 `OpenProcess` + `GetExitCodeProcess`，
+  README 明确平台范围只覆盖 macOS/Linux。
+
+**验证**
+
+- `cargo test` **26 passed**（新增下载重名避让用例），`make clippy` 0 warning。
+- 实机：启动后应用保持运行、日志以 URL 行结尾（不再出现紧跟的 `stopping`）、state.json 为新 pid；
+  `config.json` 权限由 0644 就地改成 0600。
+- 崩溃提示路径（P2-1）的可复现步骤：启动后 `kill -9 <harness pid>`，应看到状态页报错与
+  `Harness pid N exited unexpectedly`；本轮未在会话中强杀，避免打断正在使用的实例。

@@ -284,6 +284,12 @@ impl Spawned {
             Err(RecvTimeoutError::Disconnected) => Err("Harness 输出已结束（进程已退出）。".to_string()),
         }
     }
+
+    /// Give the child handle to the supervisor, so it can wait for the process to end.
+    /// Consumes the value: the URL receiver belongs to the startup phase only.
+    pub fn into_child(self) -> Child {
+        self.child
+    }
 }
 
 fn forward_lines<R: Read + Send + 'static>(

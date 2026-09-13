@@ -128,6 +128,10 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
+/// Windows branch: not covered by this project. The Makefile refuses to build anywhere but
+/// macOS and Linux, and `None` here cannot tell a live process from a dead one, so
+/// `terminate` would always sit out the full grace period. Treat Windows as unsupported
+/// until someone ports and tests it (OpenProcess + GetExitCodeProcess).
 #[cfg(windows)]
 fn kill_signal(pid: u32, signal: Option<TermSignal>) -> bool {
     match signal {
@@ -140,14 +144,16 @@ fn kill_signal(pid: u32, signal: Option<TermSignal>) -> bool {
     }
 }
 
+/// Keep a file only this user can read. Used for the state file and for config.json, whose
+/// `env` map may hold credentials.
 #[cfg(unix)]
-fn restrict(path: &Path) {
+pub fn restrict(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
 
 #[cfg(not(unix))]
-fn restrict(_path: &Path) {}
+pub fn restrict(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {

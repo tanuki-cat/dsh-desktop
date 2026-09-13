@@ -22,9 +22,12 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - 实例：固定端口；探测 → 复用自己上次的实例 / 接管外部 Harness / 占用时错误页
 - 生命周期：退出即 SIGTERM 进程组（5s 后 SIGKILL）并删除 state.json —— 关闭窗口（`RunEvent::ExitRequested`）
   与 ⌘Q / Dock 退出（`RunEvent::Exit`）两条事件链都处理；复用的上次实例也登记，退出时一并停掉
+- 启动失败即收尾：等待 URL 超时或窗口创建失败时，先停掉刚起的进程再报错，不留"假失败 + 端口被占"
+- 看护线程：启动成功后继续 `wait` 子进程，Harness 意外退出会弹回状态页报错、清掉 state.json（应用不静默变死页面）
 - 残留自愈：只有强杀/崩溃这类拿不到回调的场景才靠下次启动清理（state.json 0600 + 存活校验）
 - 安全：Harness 窗口零 capability、导航限定当次 authority、外链与 `window.open` 交系统浏览器
-- 下载：`on_download` 落盘到 `~/Downloads`；附件上传由 wry 的 `runOpenPanel` 原生处理
+- 下载：`on_download` 落盘到 `~/Downloads`，同名文件自动加 `-1`/`-2` 后缀（不静默覆盖）；
+  附件上传由 wry 的 `runOpenPanel` 原生处理
 - **dsh 核心升级**：每次启动查 registry（默认取 `latest`+`next` 最高版本），有新版就装并重启实例；
   npm 子进程显式带上 node 所在目录的 PATH（否则 GUI 启动下 `#!/usr/bin/env node` 必然 exit 127）
 - 打包：`pnpm tauri build --bundles app` → `DSH Desktop.app`
@@ -36,10 +39,11 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - 退出路径实机复现（2026-09-13，macOS）：⌘Q 等价的 Apple Event 退出后，日志出现
   `stopping Harness pid 92619` / `Harness stopped`，3080 端口释放、`state.json` 删除；
   修复前只处理红点关闭（`ExitRequested`），⌘Q 走的是 `RunEvent::Exit`，清理从未执行。
-- 离线测试：`cargo test` **25 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析、
+- 离线测试：`cargo test` **26 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析、
   6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、缓存落盘往返、
   npm PATH 前缀、沉默对端探针超时、package.json 版本解析、部分/损坏 config.json 处理、
-  进程组终止与僵尸进程识别）。
+  进程组终止与僵尸进程识别、下载重名避让）。
+- 权限：`config.json`（`env` 字段可能放 API Key）与 `state.json` 均为 0600；旧版本留下的 0644 文件会在下次启动时被就地收紧（实机已确认）。
 - 更新链路的失败证据也来自实机日志：修复前每次 GUI 启动都记 `npm view 失败: env: node: No such file or directory`
   （见设计文档 §13.8）。
 - 联网测试：`make test-live` → registry head = 0.1.5-rc.2 且不降级；**冷查询 1168–1217 ms → 缓存命中 0 ms**。
@@ -48,7 +52,10 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 
 **待实机点击确认**：附件上传、下载、`window.open` 实际效果、macOS TCC 授权归因。
 
-**未做**：签名与公证（对外分发必需）、Windows Job Object（当前 `taskkill /T /F`）、多 workspace 切换 UI；
+**平台**：构建入口只覆盖 macOS 与 Linux（其他平台在 Makefile 解析阶段直接报错）。Windows 分支代码保留但**未支持也未验证**：
+那里的存活探测恒为真，`terminate` 会白等满 grace，要移植得先换成 `OpenProcess` + `GetExitCodeProcess`。
+
+**未做**：签名与公证（对外分发必需）、多 workspace 切换 UI；
 **自带运行时（打包 Node/dsh）已规划未实施**，见下方"后续实施计划"。
 
 ## 构建（Makefile，支持 macOS 与 Linux）
@@ -151,6 +158,10 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | 退出发生在 Harness 启动途中 | `EXITING` 标志：刚起来的子进程立即停掉，不会漏成孤儿 |
 | 复用上次实例后退出 | 该实例已登记，退出时照样 SIGTERM（旧行为不登记 → 留孤儿） |
 | 强杀（SIGKILL）/ 崩溃 | 拿不到任何回调，只能靠下次启动自愈清理 |
+| 启动等待 URL 超时 / 窗口创建失败 | 停掉刚起的子进程 → 状态页报错（不会留下占着端口的半启动实例） |
+| 启动成功后 Harness 意外退出 | 看护线程发现退出 → 重新弹出状态页显示退出码与最近输出、清 state.json |
+| 下载同名文件 | 自动改名 `name-1.ext`，不覆盖已有文件 |
+| 关闭状态页（启动失败时） | 直接退出应用（此时没有 Harness 窗口，不会留下无窗口进程）；应用自己移除该窗口走 `destroy`，不触发这条 |
 | 壳被强杀后再次启动 | 读取 state.json 自愈清理残留进程 |
 
 > 为什么必须接管：启动 URL 里的 launch token 是 `randomBytes(32)` 且只存在于那个进程内存中，外部无法取得；

@@ -2,7 +2,7 @@
 
 use crate::harness;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::webview::{DownloadEvent, NewWindowResponse};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
@@ -11,12 +11,36 @@ pub const SPLASH: &str = "splash";
 pub const HARNESS: &str = "harness";
 
 pub fn create_splash(app: &AppHandle) -> tauri::Result<()> {
-    WebviewWindowBuilder::new(app, SPLASH, WebviewUrl::App("index.html".into()))
+    let window = WebviewWindowBuilder::new(app, SPLASH, WebviewUrl::App("index.html".into()))
         .title("DeepSeek Harness")
         .inner_size(460.0, 300.0)
         .resizable(false)
         .build()?;
+    // Tauri keeps the app alive when its last window closes, so a status window the user
+    // dismisses (typically after a failed start) would leave a windowless app behind. Only
+    // then may closing it end the process: the app removes this window itself once the
+    // Harness window is up (via destroy), and that must not look like the user quitting.
+    let handle = window.app_handle().clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { .. } = event {
+            if handle.get_webview_window(HARNESS).is_none() {
+                handle.exit(0);
+            }
+        }
+    });
     Ok(())
+}
+
+/// Put a status page in front of the user for something they must see, such as a Harness that
+/// died after a successful start. Rebuilds the splash when it was already closed.
+pub fn show_failure(app: &AppHandle, status: &str, detail: &str) {
+    if app.get_webview_window(SPLASH).is_none() {
+        if let Err(error) = create_splash(app) {
+            harness::app_log(&format!("could not reopen the status window: {error}"));
+            return;
+        }
+    }
+    set_status(app, status, detail);
 }
 
 /// Update the splash without granting the page any Tauri permission (Rust-side eval).
@@ -34,8 +58,10 @@ pub fn set_status(app: &AppHandle, status: &str, detail: &str) {
 /// The Harness page is remote content: it gets no capability, and navigation is fenced
 /// to the current loopback authority. Everything else opens in the system browser.
 pub fn create_harness(app: &AppHandle, url: &Url, port: u16) -> tauri::Result<()> {
+    // `destroy` rather than `close`: close fires the window listeners (and the Harness window
+    // ends the app on a user close), which must stay a user-only signal.
     if let Some(existing) = app.get_webview_window(HARNESS) {
-        let _ = existing.close();
+        let _ = existing.destroy();
     }
     let window = WebviewWindowBuilder::new(app, HARNESS, WebviewUrl::External(url.clone()))
         .title("DeepSeek Harness")
@@ -61,7 +87,8 @@ pub fn create_harness(app: &AppHandle, url: &Url, port: u16) -> tauri::Result<()
         .on_download(move |_webview, event| {
             match event {
                 DownloadEvent::Requested { url, destination } => {
-                    *destination = downloads_dir().join(file_name_of(destination));
+                    *destination =
+                        unique_download_path(&downloads_dir(), &file_name_of(destination));
                     harness::app_log(&format!(
                         "download started: {url} -> {}",
                         destination.display()
@@ -89,7 +116,8 @@ pub fn create_harness(app: &AppHandle, url: &Url, port: u16) -> tauri::Result<()
     });
 
     if let Some(splash) = app.get_webview_window(SPLASH) {
-        let _ = splash.close();
+        // Same reason as above: removing the status window is not a user close.
+        let _ = splash.destroy();
     }
     Ok(())
 }
@@ -101,6 +129,33 @@ fn downloads_dir() -> PathBuf {
     let dir = base.join("Downloads");
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+/// Never overwrite an existing download: `report.pdf` becomes `report-1.pdf` when taken.
+fn unique_download_path(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let name = Path::new(name);
+    let stem = name
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| "dsh-download".to_string());
+    let extension = name
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_string());
+    for index in 1..1000 {
+        let file = match &extension {
+            Some(extension) => format!("{stem}-{index}.{extension}"),
+            None => format!("{stem}-{index}"),
+        };
+        let candidate = dir.join(file);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(name)
 }
 
 fn file_name_of(suggested: &std::path::Path) -> std::ffi::OsString {
@@ -122,4 +177,40 @@ pub fn open_external(target: &str) {
     #[cfg(target_os = "windows")]
     command.args(["/C", "start", ""]);
     let _ = command.arg(target).spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_names_never_collide() {
+        let dir = std::env::temp_dir().join("dsh-desktop-download-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Free name is used as-is, taken names get a counter before the extension.
+        assert_eq!(
+            unique_download_path(&dir, std::ffi::OsStr::new("a.pdf")),
+            dir.join("a.pdf")
+        );
+        std::fs::write(dir.join("a.pdf"), "x").unwrap();
+        assert_eq!(
+            unique_download_path(&dir, std::ffi::OsStr::new("a.pdf")),
+            dir.join("a-1.pdf")
+        );
+        std::fs::write(dir.join("a-1.pdf"), "x").unwrap();
+        assert_eq!(
+            unique_download_path(&dir, std::ffi::OsStr::new("a.pdf")),
+            dir.join("a-2.pdf")
+        );
+        // Extension-less names keep working.
+        std::fs::write(dir.join("b"), "x").unwrap();
+        assert_eq!(
+            unique_download_path(&dir, std::ffi::OsStr::new("b")),
+            dir.join("b-1")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

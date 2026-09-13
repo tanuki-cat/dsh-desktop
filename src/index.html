@@ -27,6 +27,15 @@
       @keyframes spin { to { transform: rotate(360deg); } }
       .error .spinner { display: none; }
     </style>
+    <script>
+      // Rust pushes status through WebviewWindow::eval, which can land before the body
+      // exists. Buffer the value here so the first messages are not dropped.
+      window.__pendingStatus = null;
+      window.__setStatus = function (status, detail) {
+        window.__pendingStatus = [status, detail];
+        if (window.__applyStatus) window.__applyStatus();
+      };
+    </script>
   </head>
   <body>
     <div class="spinner" id="spinner"></div>
@@ -34,15 +43,18 @@
     <div id="status">正在启动…</div>
     <div id="detail"></div>
     <script>
-      // Rust updates this through WebviewWindow::eval, so the page needs no Tauri permission.
-      window.__setStatus = function (status, detail) {
-        document.getElementById("status").textContent = status;
+      // Render whatever Rust has already sent (and every later update).
+      window.__applyStatus = function () {
+        var pending = window.__pendingStatus;
+        if (!pending) return;
+        document.getElementById("status").textContent = pending[0];
         var box = document.getElementById("detail");
-        box.textContent = detail || "";
-        if (detail && detail.length > 0) {
+        box.textContent = pending[1] || "";
+        if (pending[1]) {
           document.body.classList.add("error");
         }
       };
+      window.__applyStatus();
     </script>
   </body>
 </html>
