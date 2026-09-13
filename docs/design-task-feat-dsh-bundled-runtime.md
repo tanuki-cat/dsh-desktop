@@ -668,16 +668,30 @@ make runtime-clean     # 清理 staging（约 475MB）
 4. **构建期缓存要独立**：staging 的 npm/pnpm 都改用 `.runtime-cache/` 下的 store（CI 可复用、不碰用户缓存）；
 5. 打包耗时：31k 文件的资源复制 + 构建 ≈ **47 s**，磁盘峰值约 1.1 GB（staging 520 MB + bundle 复制一份）。
 
-### 20.3 尚未接入（P1 剩余）
+### 20.3 已接入启动流程（2026-09-13，第二次推进）
 
-- **接进启动流程**：`resource_dir()/runtime` 解析、按 `runtime.rs` 的决策选 node/dsh、日志与状态页显示来源与版本；
-- **首启播种 profile**（§2.5）：`$DSH_HOME/profiles/web` 不存在时复制 `profile-template`；
-- **PATH 与全局安装落点**（§5/§18.2）：按来源区分 PATH 顺序 + 注入 `npm_config_prefix`/`PNPM_HOME` 指向 app-data；
-- **更新落点改到 app-data**（§18.1 H1：`install_prefix` 必须可被运行时来源覆盖，否则会写只读 bundle）；
+| 项 | 实现 | 验证 |
+|---|---|---|
+| 种子发现 | `seed_root_for()`：`DSH_DESKTOP_RUNTIME` → 应用资源目录 → `tauri dev` 在二进制旁的 `target/<profile>/runtime`（两种布局都试），node 兼容 `node.exe` | 单测 `finds_a_seed_under_the_resource_directory` |
+| 运行时决策 | `resolve_runtime()` 组装 `Inputs`（系统那一半先过 arch/能力门槛）、调 `decide()`、日志记来源与更新落点 | 单测 `forcing_bundled_resolves_into_the_seed_tree` |
+| 候选为空 | `decide()` 返回 `None` ⇒ 错误页提示装 node/dsh 或用环境变量指定 | 单测 `no_candidate_at_all_is_reported_as_none` |
+| 偏好覆盖 | `DSH_DESKTOP_RUNTIME_PREFERENCE=bundled\|system\|auto`（排障/验证用） | 单测 `runtime_preference_parses_the_env_spelling` |
+| 首启播种 | `$DSH_HOME/profiles/web` 不存在时复制 seed 的 `profile-template`（§2.5） | 复用模板实验结论 |
+| PATH | 自带时把 app-data 与 seed 的 `tools/bin` 前置 | 代码审查 + 单测覆盖来源判定 |
+| 全局安装落点 | 注入 `npm_config_prefix` / `PNPM_HOME` 指向可写 tools 前缀（§5） | 同上 |
+| 更新落点 | 自带 → `app-data/runtime/prefix`；系统安装 → **只提示不安装**（§2.4/§18.1 H1） | 单测 + 更新流程改动 |
+
+### 20.4 仍未做（P1 剩余）
+
+- **带自带的 GUI 实机验证**：需要 `make bundle-bundled` 的产物 + `DSH_DESKTOP_RUNTIME_PREFERENCE=bundled` 跑一次；
+  本轮因开发机上已有实例占用 3080（会抢占会话）而未执行；
 - **平台矩阵**：`bundle.macOS.minimumSystemVersion` 提到 11.0（§18.1 H2）；Linux 侧 staging 尚未跑过；
-- **签名与公证**（§7）：需要 Developer ID；本轮产物未签名。
+- **签名与公证**（§7）：需要 Developer ID；本轮产物未签名；
+- **构建期磁盘**：实测 tauri 会把整份 `runtime/` 复制到 `target/<profile>/runtime`（debug 下 **584 MB**），
+  加上 staging 与 bundle 各一份 ⇒ 峰值约 1.7 GB，比 §6 原先估的 1.5 GB 更高；
+- **Windows 侧**：交叉编译已能出 exe（见 shell 方案相关提交），但自带运行时仍需按平台单独 staging。
 
-### 20.4 复现命令
+### 20.5 复现命令
 
 ```bash
 git checkout feat/bundled-runtime
