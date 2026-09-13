@@ -62,6 +62,13 @@ pub struct Config {
     /// (pre-bundled behaviour, for development).
     #[serde(default)]
     pub runtime: runtime::Preference,
+    /// What to do when the supervised CLI is the user's own installation and a newer version
+    /// exists: `install` (default — upgrade it in place, the pre-bundled behaviour) or
+    /// `notify` (report it and leave the tree alone, §2.4: never rewrite a prefix we do not
+    /// own). Only affects system installations; a bundled runtime always updates its shadow
+    /// prefix.
+    #[serde(default)]
+    pub system_updates: runtime::SystemUpdates,
 }
 
 fn default_port() -> u16 {
@@ -196,6 +203,7 @@ impl Config {
             env: BTreeMap::new(),
             require_tested_dsh: false,
             runtime: runtime::Preference::Auto,
+            system_updates: runtime::SystemUpdates::Install,
         };
         let _ = std::fs::create_dir_all(data_dir);
         if !path.exists() {
@@ -442,6 +450,42 @@ fn dsh_js_in(prefix: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// The verdict on the user's own installation (§2.4).
+#[derive(Debug, PartialEq, Eq)]
+enum SystemGate {
+    Accept,
+    /// Usable, but the bundled runtime would be a better fit: say so and keep it.
+    Warn(String),
+    Reject(String),
+}
+
+/// Gate the system installation on the two facts `probe_node` reports.
+///
+/// `module.stripTypeScriptTypes` is fatal either way: the CLI's code-runtime worker needs it and
+/// `@deepseek-ai/dsh` declares no `engines.node`, so Node < 22.13 cannot run it (measured). A
+/// wrong architecture is different — an x64 node under Rosetta runs a self-consistent x64 tree,
+/// so it is only worth rejecting when a bundled runtime can take its place; without one, refusing
+/// would turn a slow-but-working setup into an error page.
+fn system_runtime_gate(facts: &locator::NodeFacts, host_arch: &str, bundled: bool) -> SystemGate {
+    if !facts.strip_types {
+        return SystemGate::Reject(format!(
+            "node 缺少 module.stripTypeScriptTypes（需要 Node 22.13 以上，当前架构 {}）",
+            facts.arch
+        ));
+    }
+    if facts.arch != host_arch {
+        let reason = format!("node 架构 {} 与宿主 {} 不一致", facts.arch, host_arch);
+        return if bundled {
+            SystemGate::Reject(format!("{reason}，改用自带运行时"))
+        } else {
+            SystemGate::Warn(format!(
+                "{reason}，且本构建没有自带运行时，继续使用系统安装"
+            ))
+        };
+    }
+    SystemGate::Accept
+}
+
 /// Decide which node and which dsh tree to supervise (bundled-runtime plan §2.3/§2.4).
 fn resolve_runtime(
     resources: Option<&Path>,
@@ -470,15 +514,24 @@ fn resolve_runtime(
         "x86_64" => "x64",
         other => other,
     };
-    let accepted = facts
-        .as_ref()
-        .filter(|facts| facts.arch == host_arch && facts.strip_types);
-    if let (Some(facts), None) = (facts.as_ref(), accepted) {
-        harness::app_log(&format!(
-            "system node rejected (arch {}, stripTypeScriptTypes {}); using the bundled runtime",
-            facts.arch, facts.strip_types
-        ));
-    }
+    let bundled = seed_node.is_some() && seed_dsh.is_some();
+    let mut rejection: Option<String> = None;
+    let accepted =
+        facts.as_ref().map(
+            |facts| match system_runtime_gate(facts, host_arch, bundled) {
+                SystemGate::Accept => Some(facts),
+                SystemGate::Warn(reason) => {
+                    harness::app_log(&format!("system runtime kept with a warning: {reason}"));
+                    Some(facts)
+                }
+                SystemGate::Reject(reason) => {
+                    harness::app_log(&format!("system runtime rejected: {reason}"));
+                    rejection = Some(reason);
+                    None
+                }
+            },
+        );
+    let accepted = accepted.flatten();
     let system_node = accepted.and(system.as_ref().map(|loc| loc.node.clone()));
     let system_dsh = accepted.and(system.as_ref().map(|loc| loc.dsh_js.clone()));
 
@@ -503,12 +556,22 @@ fn resolve_runtime(
         seed_version: seed_version.as_deref(),
         shadow_version: shadow_version.as_deref(),
     })
-    .ok_or_else(|| {
-        "找不到 dsh，也没有自带运行时。请安装 node 与 @deepseek-ai/dsh，或用 DSH_DESKTOP_DSH / DSH_DESKTOP_NODE 指定路径。"
-            .to_string()
+    .ok_or_else(|| match &rejection {
+        // Say which gate failed: "找不到 dsh" would be wrong, and the fix differs (upgrade
+        // node vs. install dsh).
+        Some(reason) => format!(
+            "系统安装的 dsh 不可用（{reason}），本构建也没有自带运行时。请升级 node / 重装 @deepseek-ai/dsh，或用 DSH_DESKTOP_DSH / DSH_DESKTOP_NODE 指定路径。"
+        ),
+        None => "找不到 dsh，也没有自带运行时。请安装 node 与 @deepseek-ai/dsh，或用 DSH_DESKTOP_DSH / DSH_DESKTOP_NODE 指定路径。"
+            .to_string(),
     })?;
 
-    let describe = format!("{} | updates: {:?}", decision.describe(), decision.updates);
+    let describe = format!(
+        "{} | updates: {:?} (system_updates: {})",
+        decision.describe(),
+        decision.updates,
+        config.system_updates.label()
+    );
     harness::app_log(&describe);
     let version = locator::version_of(&decision.dsh.path).unwrap_or_else(|| "未知".into());
     Ok(ResolvedRuntime {
@@ -710,15 +773,20 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                             &format!("发现新版本 v{to}，正在更新…"),
                             &format!("v{from} -> v{to}"),
                         );
-                        // The CLI belongs to the user when we resolved their installation: the shell
-                        // never writes a prefix it does not own (§2.4), it only reports.
-                        if matches!(resolved.updates, runtime::Updates::Notify) {
+                        // The user's own installation is upgraded in place by default (that is
+                        // what this shell always did); `system_updates: notify` in config.json
+                        // switches to reporting only, for anyone who would rather run their own
+                        // npm upgrade (§2.4).
+                        if matches!(resolved.updates, runtime::Updates::Notify)
+                            && config.system_updates == runtime::SystemUpdates::Notify
+                        {
                             harness::app_log(&format!(
-                                "update available: {from} -> {to}; the CLI is the user install, not touching it"
+                                "update available: {from} -> {to}; policy {} leaves the user install alone",
+                                config.system_updates.label()
                             ));
                             window::set_status(
                                 app,
-                                &format!("有新版本 v{to}（当前使用系统安装，未自动更新）"),
+                                &format!("有新版本 v{to}（system_updates=notify，未自动更新）"),
                                 &format!("v{from} -> v{to}"),
                             );
                         } else {
@@ -734,7 +802,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                                     "update deferred, keeping v{from}: {reason}"
                                 )),
                                 Ok(()) => {
-                                    let prefix = resolved.update_prefix(data_dir);
+                                    let prefix = resolved
+                                        .update_prefix(data_dir)
+                                        .or_else(|| update::install_prefix(&resolved.dsh_js));
                                     match update::install(
                                         &npm,
                                         update::PACKAGE,
@@ -1126,6 +1196,63 @@ mod tests {
         }
         // Everywhere else the helper must not touch a path.
         assert_eq!(unverbatim(Path::new("/a/b")), PathBuf::from("/a/b"));
+    }
+
+    #[test]
+    fn the_system_runtime_gate_only_refuses_what_it_must() {
+        let apple = locator::NodeFacts {
+            arch: "arm64".into(),
+            strip_types: true,
+        };
+        let intel = locator::NodeFacts {
+            arch: "x64".into(),
+            strip_types: true,
+        };
+        let old = locator::NodeFacts {
+            arch: "arm64".into(),
+            strip_types: false,
+        };
+
+        assert_eq!(
+            system_runtime_gate(&apple, "arm64", true),
+            SystemGate::Accept
+        );
+        // An x64 node under Rosetta is only worth refusing when the bundled runtime can take
+        // its place; without one it is the only way to run, so it is kept with a warning.
+        assert!(matches!(
+            system_runtime_gate(&intel, "arm64", true),
+            SystemGate::Reject(_)
+        ));
+        assert!(matches!(
+            system_runtime_gate(&intel, "arm64", false),
+            SystemGate::Warn(_)
+        ));
+        // Node < 22.13 cannot run the CLI at all, so this one is fatal in both cases.
+        assert!(matches!(
+            system_runtime_gate(&old, "arm64", false),
+            SystemGate::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn system_updates_defaults_to_upgrading_the_user_install() {
+        let dir = std::env::temp_dir().join("dsh-desktop-system-updates-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The pre-bundled behaviour: an upgrade installs. Losing that silently would be a
+        // regression for everyone already running this shell.
+        assert_eq!(
+            Config::load(&dir).system_updates,
+            runtime::SystemUpdates::Install
+        );
+        std::fs::write(dir.join("config.json"), "{\"system_updates\": \"notify\"}").unwrap();
+        assert_eq!(
+            Config::load(&dir).system_updates,
+            runtime::SystemUpdates::Notify
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

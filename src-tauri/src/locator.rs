@@ -3,8 +3,10 @@
 //! `dsh` ships as `#!/usr/bin/env node`, and a GUI-launched app has no Homebrew PATH, so
 //! resolving the launcher alone is not enough: node must be resolved too.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct DshLocation {
@@ -38,19 +40,68 @@ pub struct NodeFacts {
     pub strip_types: bool,
 }
 
+/// A node binary we cannot talk to must not stall startup: this probe runs before the
+/// supervised process and before the URL wait, so a hanging shim would freeze the splash page
+/// with no timeout to fall back on. Measured cost of a successful probe is ~80 ms.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Probe node once (~80 ms) for the facts above.
 pub fn probe_node(node: &Path) -> Option<NodeFacts> {
+    probe_node_within(node, PROBE_TIMEOUT)
+}
+
+/// `probe_node` with an explicit budget, so the timeout itself is testable.
+fn probe_node_within(node: &Path, timeout: Duration) -> Option<NodeFacts> {
     const SCRIPT: &str =
         "process.stdout.write(process.arch + \" \" + (typeof require(\"module\").stripTypeScriptTypes))";
-    let output = Command::new(node).arg("-e").arg(SCRIPT).output().ok()?;
-    if !output.status.success() {
-        return None;
+    let mut child = Command::new(node)
+        .arg("-e")
+        .arg(SCRIPT)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    // Read on another thread: the pipe must be drained while we wait, or a chatty node fills
+    // the buffer and deadlocks against our try_wait loop.
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let text = reader.join().unwrap_or_default();
+                if !status.success() {
+                    return None;
+                }
+                let mut parts = text.split_whitespace();
+                let arch = parts.next()?.to_string();
+                let strip_types = parts.next() == Some("function");
+                return Some(NodeFacts { arch, strip_types });
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // The reader is dropped, not joined: a grandchild can still hold the pipe
+                // (`sh -c 'sleep 30'`), and waiting for it here would reintroduce the very
+                // hang this deadline exists to avoid. The thread ends with the pipe.
+                drop(reader);
+                let why = match other {
+                    Err(error) => format!("探测失败: {error}"),
+                    _ => format!("探测超过 {}s 未返回", timeout.as_secs()),
+                };
+                crate::harness::app_log(&format!("{why}；按不可用处理: {}", node.display()));
+                return None;
+            }
+        }
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut parts = text.split_whitespace();
-    let arch = parts.next()?.to_string();
-    let strip_types = parts.next() == Some("function");
-    Some(NodeFacts { arch, strip_types })
 }
 
 /// Version of a CLI tree, from the package.json that owns the entry script.
@@ -224,6 +275,29 @@ mod tests {
             "node {} lacks stripTypeScriptTypes",
             facts.arch
         );
+    }
+
+    /// A node that never answers must not hold up startup: the probe runs before the
+    /// supervised process and before the URL wait, so it carries its own deadline.
+    #[test]
+    #[cfg(unix)]
+    fn gives_up_on_a_node_that_never_answers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join("dsh-desktop-hanging-node-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("node");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        assert!(probe_node_within(&fake, Duration::from_millis(300)).is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the probe must not wait for the child"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

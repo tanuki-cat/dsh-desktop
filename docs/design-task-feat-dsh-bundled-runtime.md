@@ -129,7 +129,9 @@ DSH Desktop.app/Contents/Resources/runtime/
 所以"系统的 node + 自带的 dsh 树"（或反之）不会因为 ABI 直接崩。真正的门槛只剩两条：
 
 1. **架构必须一致**：系统 node 可能是 x64（Rosetta）而自带预编译产物是 arm64，混用会加载失败 ⇒
-   比较 `process.arch` 与自带运行时一致才允许混搭；
+   比较 `process.arch` 与自带运行时一致才允许混搭。**v3.4 修正**：这条只在该构建**确实带运行时**
+   （seed 的 node 与 dsh 都在）时才能拒绝；没有自带候选时降级为警告并继续用系统安装 ——
+   x64 node + x64 dsh 树本身自洽，拒绝它只是把“能跑但慢”换成错误页；
 2. **能力门槛，而不是版本号**：`@deepseek-ai/dsh` 的 `package.json` **没有 `engines.node` 字段**（实测），
    所以"按 engines 判断"落空。可用的硬指标是能力探测：dsh 的 `@deepseek-ai/dsh-code-runtime-worker-thread`
    依赖 `module.stripTypeScriptTypes()`（Node ≥ 22.13；日志里那条 `ExperimentalWarning: stripTypeScriptTypes` 就是它），
@@ -139,8 +141,11 @@ DSH Desktop.app/Contents/Resources/runtime/
 **必须一起定的两条规则**（否则这套策略会自我矛盾）：
 
 - **更新语义**：若采用系统 dsh，而更新仍落到自带的影子前缀，那条"更高版本优先"的规则会让更新后的核心
-  反过来盖掉用户自己的安装。建议：**使用系统 dsh 时不做自动安装**，只提示有新版（可一键切到自带运行时再更新）；
-  桌面壳永远不写用户自己的全局前缀 —— 那既可能失败（权限、pnpm/yarn 布局），也是"GUI 偷偷改我环境"的典型投诉；
+  反过来盖掉用户自己的安装。原建议是"使用系统 dsh 时不做自动安装，只提示有新版"；**实现时改成可配置**
+  （v3.4，见 §21）：`config.json` 的 `system_updates` 默认 `install`，即沿用自带运行时之前"有新版就装进
+  用户自己的前缀"的既有行为 —— 老用户静默失去自动升级比一次 npm 全局写入更糟；想只提示就写 `notify`。
+  装到哪个前缀仍由 `update::install_prefix(dsh_js)` 从 CLI 位置反推（与旧实现一致）；自带运行时不受该开关
+  影响（始终写影子前缀）。"GUI 偷偷改我环境"的顾虑交给这个显式开关，而不是替用户默认关掉；
 - **决策要稳定且可见**：系统运行时依赖登录 shell 探测，rc 文件改动或导入失败都会让结果在两次启动之间翻转。
   因此：探测一次后把结论与版本写进配置/诊断，并保留手动 `runtime: system | bundled | auto` 覆盖；
   启动日志与状态页显示 `runtime: system (node 22.23.2 / dsh 0.1.5-rc.2)` 这类信息。
@@ -773,3 +778,21 @@ workspace = …` 和 `spawn: <完整命令行>` 两行日志——下一次失�
 
 排障入口：`%APPDATA%\com.deepseek.dsh.desktop\logs\harness.log`，关键字
 `runtime: node … (bundled|system) + dsh … | updates: …` 与 `spawn: …`。
+
+---
+
+## 21. 修订记录（v3.4：合并影响审查后的四处修正，2026-09-13）
+
+对 `main..feat/bundled-runtime` 做了一次"合并到主分支会影响原有功能吗"的审查，结论是：普通用户的可启动路径
+等价（同一个 node、同一份 `bin.js`、同样的启动参数；`src/`、`package.json`、`tauri.conf.json`、`Cargo.toml`
+全部未动、没有新增 crate），但以下四处需要先修，否则合并会改变或破坏现有行为。四处都已实现并补了测试：
+
+| 项 | 问题 | 修法 | 测试 |
+|---|---|---|---|
+| 交叉编译入口 | `Makefile` 的 `TARGET=` 支持只存在于 `main`（`tauri build … $(if $(TARGET),--target $(TARGET),)`），分支上没有；合并若按分支解析，`release.yml` 的 macOS x64 会静默编成 host 版，随后 `[ -d "$app" ]` 报错 | 把 main 的 `TARGET` 传参与产物路径判断取回分支（`make -n bundle TARGET=…` 已核对输出 `--target x86_64-apple-darwin`），`make help` 也补上该变量 | CI（tag 触发时由 `release.yml` 兜底） |
+| 系统安装的自动升级 | 新增的 `Updates::Notify` 让系统安装**只提示不安装**，等于删掉壳的既有卖点（每次启动有新版就装并重启） | 新增 `config.json` 的 `system_updates: install（默认）\| notify`；`install` 时用 `update::install_prefix(dsh_js)` 反推用户前缀并就地升级（与自带运行时之前的实现一致），`notify` 才是只提示 | `system_updates_defaults_to_upgrading_the_user_install` |
+| 架构门槛 | Rosetta 下的 x64 node 原本可用（dsh 树同架构、N-API 自洽），新门槛会直接拒掉它，**非自带构建**因此没有候选 ⇒ 错误页 | `system_runtime_gate()`：能力门槛（`stripTypeScriptTypes`，Node < 22.13 本来也跑不起来）保持硬性；架构不一致只在**有自带候选**时拒绝，否则警告并继续用系统安装；错误页也改为说明具体是哪道门槛 | `the_system_runtime_gate_only_refuses_what_it_must` |
+| 能力探测没有超时 | `probe_node()` 用 `Command::output()` 阻塞，而它跑在启动状态机之前 —— 版本管理器 shim 一挂住，启动页就永久卡住，连"等 URL 超时"的兜底都用不上 | `probe_node_within(node, timeout)`：独立线程读管道 + `try_wait` 轮询，5 s 到期即 kill 并记日志；超时路径**不 join 读线程**（孙进程可能还握着管道，join 会把卡死搬回来） | `gives_up_on_a_node_that_never_answers`（300 ms 预算） |
+
+顺带记录一处**未修**的既有缺口：§4 要求更新时追加 `--cache <app-data>/runtime/npm-cache` 复用依赖树缓存，
+`update::install()` 目前没有传（每次更新重新下载整棵依赖树）。它不影响合并安全性，留待后续。

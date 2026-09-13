@@ -63,7 +63,7 @@ help:
 	@echo "  make icon-art    重新绘制 icon.png（需 python3 + Pillow）"
 	@echo "  make clean / distclean"
 	@echo ''
-	@echo "变量：CARGO_HOME= PNPM_STORE= BUNDLE_TARGETS= CARGO= PNPM= PYTHON="
+	@echo "变量：CARGO_HOME= PNPM_STORE= BUNDLE_TARGETS= TARGET= CARGO= PNPM= PYTHON="
 
 doctor:
 	@echo "平台  : $(UNAME_S) ($(PLATFORM))"
@@ -108,9 +108,11 @@ node-deps:
 	@command -v $(PNPM) >/dev/null 2>&1 || { echo "需要 pnpm：npm i -g pnpm"; exit 1; }
 	$(PNPM) install $(PNPM_INSTALL_ARGS)
 
+# TARGET 用于交叉编译（例如在 arm64 runner 上产出 Intel 包）：
+#   make bundle TARGET=x86_64-apple-darwin
 bundle: node-deps
-	$(CARGO_ENV) $(PNPM) tauri build --bundles $(BUNDLE_TARGETS)
-	@echo "产物: $(BUNDLE_PATH)"
+	$(CARGO_ENV) $(PNPM) tauri build --bundles $(BUNDLE_TARGETS) $(if $(TARGET),--target $(TARGET),)
+	@echo "产物: $(if $(TARGET),$(TAURI_DIR)/target/$(TARGET),$(TAURI_DIR)/target)/release/bundle/$(if $(filter macos,$(PLATFORM)),macos,deb)"
 
 ifeq ($(PLATFORM),macos)
 run: bundle

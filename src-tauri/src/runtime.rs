@@ -67,6 +67,30 @@ impl Preference {
     }
 }
 
+/// `system_updates` in config.json: what a newer core means for a CLI we do not own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SystemUpdates {
+    /// Upgrade the user's installation in place — the behaviour from before the bundled
+    /// runtime existed. The default: silently losing auto-upgrade would be a functional
+    /// regression for everyone already running this shell.
+    #[default]
+    Install,
+    /// Report the new version and leave the tree alone (§2.4: never rewrite a prefix the
+    /// shell does not own).
+    Notify,
+}
+
+impl SystemUpdates {
+    /// Label for the log line, so one lookup tells which policy ran.
+    pub fn label(self) -> &'static str {
+        match self {
+            SystemUpdates::Install => "install",
+            SystemUpdates::Notify => "notify",
+        }
+    }
+}
+
 /// One half of the decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pick {

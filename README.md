@@ -125,10 +125,15 @@ Windows 免安装版也由它构建，见 [Windows 免安装包](#windows-免安
 **运行时解析已接进启动流程**（`src-tauri/src/runtime.rs` + `lib.rs::resolve_runtime`）：
 
 - 来源：`DSH_DESKTOP_RUNTIME` → 应用资源目录 → `tauri dev` 的 `target/<profile>/runtime`；
-- 候选：显式环境变量 → 系统安装（先过架构与 `stripTypeScriptTypes` 两道门槛）→ 自带（seed 与
-  影子前缀取版本更高者）；一个候选都没有时给「装 node + dsh」错误页；
+- 候选：显式环境变量 → 系统安装（先过能力门槛）→ 自带（seed 与影子前缀取版本更高者）；一个候选都没有时给
+  「装 node + dsh」错误页（若系统安装被门槛拒掉，错误页会说明是哪一道）；
+- 门槛：`module.stripTypeScriptTypes`（Node 22.13 以上）是硬性的——dsh 没有它跑不起来；架构不一致只在
+  **本构建确实带运行时**时才拒绝，否则降级为警告继续用系统安装（Rosetta 下的 x64 node 自洽、可用）。
+  能力探测带 5 秒超时，版本管理器 shim 挂住时不会把启动页卡死；
 - 自带时：首启播种 profile 模板（含插件市场）、PATH 前置自带工具目录、注入 `npm_config_prefix`／
-  `PNPM_HOME` 指向可写前缀；核心更新只落到 `app-data/runtime/prefix`，用系统安装时只提示不安装；
+  `PNPM_HOME` 指向可写前缀；核心更新只落到 `app-data/runtime/prefix`；
+- 用系统安装时：**默认仍然就地升级**（`system_updates: install`，与自带运行时之前的行为一致），
+  想自己管升级就写 `system_updates: notify`（只提示，不动用户的全局前缀）；
 - 想看效果：`DSH_DESKTOP_RUNTIME_PREFERENCE=bundled|system|auto` 可覆盖 `config.json` 的 `runtime`。
 
 **Windows 免安装包已实机验证通过**（2026-09-13：解压到 `D:\dsh` 双击即启动，自带 node + dsh 拉起 Web GUI，
