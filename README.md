@@ -114,8 +114,7 @@ Windows 免安装包实机验证通过），`main` 上未实施，见下方"后�
 
 ### 自带运行时（进行中）
 
-已完成并可实机复现，全部在 **`feat/bundled-runtime`** 分支上（**长期分支，暂不合并到 `main`**；
-Windows 免安装版也由它构建，见 [Windows 免安装包](#windows-免安装包手动触发)）：
+已完成并可实机复现，并已**并入 `main`**（2026-09-13 合并 `feat/bundled-runtime`）：
 
 - `make runtime-fetch / runtime-stage / runtime-clean / bundle-bundled` 四个目标全部跑通；
 - staging 自带校验（`scripts/check-runtime-stage.sh`，`--self-test` 会先用假目录验证闸门本身有效）：必需文件、**悬空符号链接**（会让 `tauri build` 失败）、**绝对符号链接**（会被解引用，把宿主机文件复制进包）、**quarantine 属性**（会带进 .app）、**文件数/体积闸门**（多放 2 万个文件这类残留以前会被静默打包）；
@@ -299,9 +298,8 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
 
 ## Windows 免安装包（手动触发）
 
-**这个包只由 `feat/bundled-runtime` 分支产出**：工作流文件挂在 `main` 上（这样 Actions 页面随时能触发），
-默认构建的却是 `build_ref` 指向的分支代码。该分支是长期分支、**暂不合并到 `main`**；`main` 上没有自带运行时，
-即使跑同一个工作流也只会得到一份用不上的 `runtime/`。
+自带运行时已并入 `main`（2026-09-13），所以这个工作流默认就从 `main` 构建；`build_ref` 仍可指向任意
+分支或 tag（例如临时验证某个分支的 staging）。
 
 工作流：`.github/workflows/windows-portable.yml` —— 在 Actions 页面 **Run workflow** 手动触发（`workflow_dispatch`），
 在 `windows-latest` 上**原生** stage 运行时，产出 `dsh-desktop_<版本>_windows-x64-portable.zip`：
@@ -313,12 +311,11 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
 |---|---|---|
 | `dsh_version` | `0.1.5-rc.2` | 随包附带的 dsh 版本 |
 | `node_version` | `22.23.2` | 随包附带的 Node 版本 |
-| `build_ref` | `feat/bundled-runtime` | 从哪个分支/tag 构建（自带运行时只在该分支上） |
+| `build_ref` | `main` | 从哪个分支/tag 构建 |
 | `attach_to_release` | 空 | 填一个已存在的 Release tag 就把 zip 一并传上去；留空只作为 workflow artifact |
 
 **打 tag 发版**：`release.yml` 的 `windows-portable` 任务用 `workflow_call` 复用同一份实现
-（`build_ref` 传 tag 名），所以**在 `feat/bundled-runtime` 上打 tag** 就能把 Windows 包和 macOS/Linux 产物
-一起发出去；`main` 的 `release.yml` 没有这个任务。
+（`build_ref` 传 tag 名），所以**在 `main` 上打 tag** 就能把 Windows 免安装包和 macOS/Linux 产物一起发出去。
 
 **实机验证（2026-09-13，run 34752267176 的产物）**：Windows 11 解压到 `D:\dsh` 后双击即启动，
 自带 Node 22.23.2 + dsh 0.1.5-rc.2 拉起 Web GUI，首启播种的插件市场可用，会话内

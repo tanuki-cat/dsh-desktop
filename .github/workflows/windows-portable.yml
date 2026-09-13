@@ -10,9 +10,8 @@ name: windows-portable
 #   * workflow_dispatch —— 手动出包，产物作为 workflow artifact（可选附加到已有 Release）；
 #   * workflow_call    —— 由 release.yml 在打 tag 时调用，产物交给它的 release 任务统一发布。
 #
-# 分支策略：自带运行时只存在于长期分支 feat/bundled-runtime（**暂不合并到 main**），Windows 免安装包
-# 目前是该分支唯一的对外产物。工作流文件留在 main 上只是为了能随时手动触发 —— 构建的是 build_ref
-# 指向的分支代码（默认就是 feat/bundled-runtime）。用 main 当 build_ref 只会得到一份用不上的 runtime/。
+# 分支策略：自带运行时已并入 main（2026-09-13 合并 feat/bundled-runtime），因此默认就从 main 构建；
+# build_ref 仍可指向任意分支或 tag（临时验证某个分支的 staging 时用）。
 on:
   workflow_dispatch:
     inputs:
@@ -27,10 +26,10 @@ on:
         type: string
         default: 22.23.2
       build_ref:
-        description: 从哪个分支标签构建（自带运行时的实现目前在 feat/bundled-runtime）
+        description: 从哪个分支或 tag 构建
         required: false
         type: string
-        default: feat/bundled-runtime
+        default: main
       attach_to_release:
         description: 可选：把产物传到已存在的 Release tag（留空则只作为 workflow artifact）
         required: false
@@ -50,10 +49,10 @@ on:
         type: string
         default: 22.23.2
       build_ref:
-        description: 从哪个分支标签构建（release.yml 传 tag 名）
+        description: 从哪个分支或 tag 构建（release.yml 传 tag 名）
         required: false
         type: string
-        default: feat/bundled-runtime
+        default: main
       attach_to_release:
         description: 可选：把产物传到已存在的 Release tag（release.yml 留空，交给它的 release 任务发布）
         required: false

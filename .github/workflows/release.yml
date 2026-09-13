@@ -165,8 +165,7 @@ jobs:
   # 手动出包和打 tag 发布不会各修一遍。产物交给下面的 release 任务统一发布，
   # 所以这里不传 attach_to_release。
   #
-  # 注意：自带运行时只存在于长期分支 feat/bundled-runtime（暂不合并到 main），所以这个任务
-  # 在 main 上不会生效 —— Windows 发布要在 feat/bundled-runtime 上打 tag。main 版本刻意不加。
+  # 自带运行时已并入 main（2026-09-13 合并 feat/bundled-runtime），所以在 main 上打 tag 就会
   windows-portable:
     name: build windows-x64
     needs: preflight
