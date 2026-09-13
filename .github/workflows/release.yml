@@ -55,13 +55,14 @@ jobs:
           - os: macos-14          # Apple Silicon
             suffix: macos-arm64
             bundles: app
+            target: ""
             timeout: 60
-          # Intel 构建：macos-13 是最后一个 x64 托管镜像；若它下线，改为
-          #   os: macos-14 + 在打包前加 rustup target add x86_64-apple-darwin
-          #   并给 tauri build 传 --target x86_64-apple-darwin
-          - os: macos-13          # Intel
+          # Intel 包在 arm64 runner 上交叉编译：macos-13（最后一个 x64 镜像）排队时间不可控，
+          # 实测曾把整个 run 卡在 queued，导致 release job 永不执行。
+          - os: macos-14
             suffix: macos-x64
             bundles: app
+            target: x86_64-apple-darwin
             timeout: 60
           - os: ubuntu-22.04
             suffix: linux-x64
@@ -110,21 +111,27 @@ jobs:
           make clippy
           make test
 
+      - name: 交叉编译所需的 Rust target
+        if: matrix.target != ''
+        run: rustup target add ${{ matrix.target }}
+
       - name: 打包
         env:
           BUNDLE_TARGETS: ${{ matrix.bundles }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          make bundle BUNDLE_TARGETS="$BUNDLE_TARGETS"
+          make bundle BUNDLE_TARGETS="$BUNDLE_TARGETS" TARGET="$TARGET"
 
       - name: 整理 macOS 产物
         if: runner.os == 'macOS'
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
           SUFFIX: ${{ matrix.suffix }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          app="src-tauri/target/release/bundle/macos/DSH Desktop.app"
+          app="src-tauri/target/${TARGET:+$TARGET/}release/bundle/macos/DSH Desktop.app"
           [ -d "$app" ] || { echo "::error::找不到 $app"; exit 1; }
           mkdir -p dist
           out="dist/dsh-desktop_${VERSION}_${SUFFIX}.app.zip"
@@ -136,11 +143,12 @@ jobs:
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
           SUFFIX: ${{ matrix.suffix }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           mkdir -p dist
           shopt -s nullglob
-          debs=(src-tauri/target/release/bundle/deb/*.deb)
+          debs=(src-tauri/target/${TARGET:+$TARGET/}release/bundle/deb/*.deb)
           [ ${#debs[@]} -gt 0 ] || { echo "::error::没有产出 .deb"; exit 1; }
           for deb in "${debs[@]}"; do
             cp "$deb" "dist/dsh-desktop_${VERSION}_${SUFFIX}.deb"

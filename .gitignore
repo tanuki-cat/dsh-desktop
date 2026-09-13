@@ -10,3 +10,9 @@ src-tauri/gen/
 
 # icon artwork scratch space
 .icon-work/
+
+# bundled-runtime staging: downloaded node tarball, npm/pnpm stores, unpacked payload
+.runtime-cache/
+
+# python bytecode from the staging helper scripts
+__pycache__/
