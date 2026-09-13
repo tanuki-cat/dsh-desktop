@@ -156,7 +156,12 @@ windows:
 		echo "警告：$(RUNTIME_DIR)/ 里是别的平台的运行时，会被一起打进 Windows 包；先 make runtime-clean" >&2; \
 	fi
 	$(CARGO_ENV) $(PNPM) tauri build --target $(WINDOWS_TARGET) --no-bundle
-	@echo "产物: $(TAURI_DIR)/target/$(WINDOWS_TARGET)/release/dsh-desktop.exe"
+	@case "$(WINDOWS_TARGET)" in *aarch64*) arch=arm64;; *i686*) arch=x86;; *) arch=x64;; esac; \
+	  cargo_home=$(if $(CARGO_HOME),$(CARGO_HOME),$$HOME/.cargo); \
+	  dll=$$(find "$$cargo_home/registry/src" -path "*webview2-com-sys-*/$$arch/WebView2Loader.dll" 2>/dev/null | head -1); \
+	  if [ -n "$$dll" ]; then cp "$$dll" $(TAURI_DIR)/target/$(WINDOWS_TARGET)/release/ && echo "已附带 WebView2Loader.dll ($$arch)"; \
+	  else echo "提示：未找到 WebView2Loader.dll；目标机需要有 WebView2 运行时" >&2; fi
+	@echo "产物目录: $(TAURI_DIR)/target/$(WINDOWS_TARGET)/release/（拷贝其中的 dsh-desktop.exe 与 WebView2Loader.dll）"
 
 clean:
 	$(CARGO_ENV) $(CARGO) clean --manifest-path $(MANIFEST)

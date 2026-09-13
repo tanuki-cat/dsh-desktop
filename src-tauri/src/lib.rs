@@ -69,9 +69,27 @@ fn default_port() -> u16 {
 }
 
 fn default_workspace() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/"))
+    home_dir().unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// The user's home directory, on every platform we build for.
+///
+/// `HOME` is a Unix convention: a Windows GUI process normally only has `USERPROFILE`
+/// (sometimes `HOMEDRIVE` + `HOMEPATH`), so looking for `HOME` alone left the workspace and
+/// the profile check pointing at a drive root.
+pub fn home_dir() -> Option<PathBuf> {
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(value) = std::env::var_os(key) {
+            if !value.is_empty() {
+                return Some(PathBuf::from(value));
+            }
+        }
+    }
+    let drive = std::env::var_os("HOMEDRIVE")?;
+    let path = std::env::var_os("HOMEPATH")?;
+    let mut combined = PathBuf::from(drive);
+    combined.push(path);
+    Some(combined)
 }
 
 fn default_import_shell_env() -> bool {
@@ -605,11 +623,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     let home = config
         .dsh_home
         .clone()
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".dsh"))
-        })
+        .or_else(|| home_dir().map(|home| home.join(".dsh")))
         .unwrap_or_else(|| PathBuf::from(".dsh"));
     let timeout = if home.join("profiles").join("web").exists() {
         STARTUP_TIMEOUT_NEXT

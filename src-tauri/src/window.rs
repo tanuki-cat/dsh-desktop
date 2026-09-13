@@ -123,9 +123,7 @@ pub fn create_harness(app: &AppHandle, url: &Url, port: u16) -> tauri::Result<()
 }
 
 fn downloads_dir() -> PathBuf {
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base = crate::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let dir = base.join("Downloads");
     let _ = std::fs::create_dir_all(&dir);
     dir
