@@ -254,9 +254,11 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
   自带运行时版本的最低系统版本要提到 **macOS 11.0**（实测 node 22.23.2 的 `minos 11.0`，当前壳声明的是 10.15）；
 - **只读 seed + 可写影子前缀**：seed 放在 `Contents/Resources/runtime/`，dsh 核心更新落到
   `app-data/runtime/prefix`（不写签名的 bundle）；
-- 实施前必须先落 4 项 P0：**回退/last-known-good、seed 与前缀的版本仲裁、pnpm 随包分发（否则离线装不了插件）、
-  按平台 staging（12 个原生模块）**；另有两项在 v3 实测中升级为 P0：**签名保留 entitlements**、
-  **staging 校验悬空符号链接**；
+- 实施前必须先落的 P0：**回退/last-known-good、seed 与前缀的版本仲裁、pnpm 随包分发、按平台 staging
+  （12 个原生模块）、随包附带插件市场**（全新 DSH_HOME 的 profile 是空的、没有安装入口 ⇒ 用真 pnpm 生成
+  6.5 MB 的 profile 模板，仅在 profile 不存在时于首启播种）；
+- 实测中升级为 P0 的两项：**签名必须保留 Node 的 entitlements**（否则 node 启动即崩）、
+  **staging 必须校验悬空符号链接**（否则 `tauri build` 直接失败）；
 - 首启更新策略待定：默认 `auto_update` 会在首启就下载整棵依赖树，与"离线首启"的宣传冲突（方案 §4 给了两个选项）；
 - 分阶段：P1 macOS arm64（无 node 可跑）→ P2 签名公证 → P3 Linux x64/arm64 → P4 universal/Windows/自更新。
 

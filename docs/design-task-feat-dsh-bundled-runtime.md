@@ -3,6 +3,9 @@
 > 目标：在**没有预装 Node.js 和 DeepSeek Harness** 的机器上，双击即用。
 > 上游设计：[`design-task-feat-dsh-tauri-desktop-shell.md`](./design-task-feat-dsh-tauri-desktop-shell.md)（其 §22 已把本方案列为 V2）。
 >
+> **v3.3（随包附带插件市场）**：全新 DSH_HOME 的 profile 是空的、没有安装入口，必须附带 dshmarket
+> —— 实测 6.5 MB 纯 JS 模板 + 首启播种（§2.5）。
+>
 > **v3.2（与壳方案做兼容性对齐后）**：两个硬冲突（`install_prefix` 会把更新写进只读 bundle、
 > `minimumSystemVersion` 低于 Node 的实际门槛）与两处语义冲突（环境变量覆盖顺序、PATH 语义），见 §18。
 >
@@ -48,7 +51,8 @@
 **非目标**
 
 - 不用自带运行时代替系统 WebView（macOS 用 WKWebView、Linux 仍需 WebKitGTK，见 §9）；
-- 不打包 marketplace 第三方插件（由用户按需安装，走 profile 的 pnpm）；
+- 除**插件市场本身**外不打包第三方插件：其余插件仍由用户按需安装（走 profile 的 pnpm）；
+  市场必须随包附带，理由见 §2.5（否则干净机器没有任何安装入口）；
 - 不修改 Harness 本体。
 
 ---
@@ -137,12 +141,54 @@ DSH Desktop.app/Contents/Resources/runtime/
 **代价**：支持矩阵从 1 种变成 4 种组合。建议把（系统+系统）与（自带+自带）列为受支持组合并纳入验收，
 两种混搭标注为"尽力而为"（有上面两道门槛 + 失败回退），并在 README 写明。
 
+### 2.5 随包附带插件市场 dshmarket（v3.3 新增，含实测）
+
+**问题**：dsh 在全新 `DSH_HOME` 上生成的 profile 是**完全空的**（实测）：
+
+```json
+{ "name": "dsh-profile-web", "private": true, "dependencies": {},
+  "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"], "patchReload": "live" } } }
+```
+
+而 `dsh plugin --profile <name> <args…>` 其实是**对 pnpm 的透传**（实测：帮助输出就是 pnpm 自己的），
+也就是说干净机器上既没有安装入口、也没有任何插件 —— 这正是"必须随包附带市场"的原因。
+
+**做法：profile 模板 + 首次播种**（已实测可行）
+
+1. staging 时在临时目录用**真 pnpm** 生成模板：
+   `package.json`（`dependencies: { dshmarket: "<pin>" }`，bundles 追加 `dshmarket`）、
+   与 dsh 生成一致的 `pnpm-workspace.yaml`，然后 `pnpm install`；
+2. 把整个 `profiles/web` 目录（`package.json` / `pnpm-lock.yaml` / `pnpm-workspace.yaml` / `node_modules`）
+   放进 `.app` 的 `Resources/runtime/profile-template/`；
+3. 首次启动、且 `$DSH_HOME/profiles/web` **不存在**时，把模板复制过去，再启动 harness。
+
+**实测数据**：
+
+| 项 | 结果 |
+|---|---|
+| 模板体积 | **6.5 MB**（`dshmarket` + `js-yaml` + `argparse` + `undici`，全部纯 JS，**无原生模块**） |
+| 平台相关性 | 与 dsh 树不同，模板是**纯 JS ⇒ 一套通用**，不必按平台各做一份 |
+| 播种后 pnpm 是否认它 | 认：`dsh plugin --profile web list` → `dshmarket@1.45.1`（手抄的 node_modules 不行 —— 缺 pnpm 的元数据） |
+| 播种后能否启动 | 能：`dsh web` **4 秒**输出启动 URL，stderr 为空，无模块解析错误 |
+| 市场是否真的加载 | 是：profile 目录里出现了只有 dshmarket 才会创建的 `.dsh-market/` |
+
+**边界与策略**：
+
+- **只在缺失时播种**：用户已有 `profiles/web`（例如共用 `~/.dsh` 的老用户）时一个字节都不动；
+  这类用户本来就能自行 `dsh plugin add dshmarket`。可选：给一个"安装插件市场"的显式入口；
+- **市场自身可升级**：它只是普通依赖，用户/市场界面升级后落在 DSH_HOME，与 seed 模板无关（模板只在首次播种）；
+- **安装其他插件仍需网络与 pnpm**：随包解决的是"没有入口"和"离线可用"，不是"离线装任意插件"；
+- **许可**：`dshmarket` 为 MIT（其依赖 js-yaml/argparse/undici 也需一并收录进 `THIRD-PARTY-NOTICES.md`，见 §10）；
+- **供应链**：模板在 staging 时由 npm registry 安装并固定版本，锁文件随包分发，便于审计。
+
 ---
 
 ## 3. 首次启动流程
 
 1. 解析运行时（§2.3），日志记录来源（`runtime: bundled / system`）与版本；
 2. 确保 `app-data/runtime/{prefix,tools,npm-cache}` 存在（`create_dir_all`，幂等）；
+2b. **首次播种 profile 模板**（§2.5）：若 `$DSH_HOME/profiles/web` 不存在，把 `Resources/runtime/profile-template/`
+   复制过去（内含插件市场 dshmarket）。存在则完全不动；
 3. 更新检查（现有逻辑）→ 需要更新时走 §4；
 4. 用 `Resources/runtime/node/bin/node` 启动 `<dsh 树>/lib/bin.js --profile web --patch <overlay> --no-open --port <固定端口>`；
 5. 其余（探测/接管/窗口/退出回收）不变。
@@ -207,7 +253,8 @@ DSH Desktop.app/Contents/Resources/runtime/
 
 ```bash
 make runtime-fetch     # 按 uname/arch 下载官方 Node，并校验 SHASUMS256.txt
-make runtime-stage     # 组装 src-tauri/runtime/{node,dsh-prefix,tools,THIRD-PARTY-NOTICES.md}
+make runtime-stage     # 组装 src-tauri/runtime/{node,dsh-prefix,tools,profile-template,THIRD-PARTY-NOTICES.md}
+make plugin-template   # 可选：单独重建 profile 模板（固定 dshmarket 版本，真 pnpm install）
 make bundle            # 打包（依赖 runtime-stage）；resources 已配置
 make runtime-clean     # 清理 staging（约 475MB）
 ```
@@ -245,6 +292,8 @@ make runtime-clean     # 清理 staging（约 475MB）
   建议 staging 时用 `license-checker --json`（或等价工具）汇总，并把 Node/npm 自带的 LICENSE 一并收集；
 - **构建耗时不是问题**（实测）：20,000 个文件的资源复制 + 打包共 **3.8 s**（sys 3.2 s），
   折算 25,412 文件的 dsh 树约 4–5 s；瓶颈仍是磁盘占用（§6）而不是时间；
+- **profile 模板必须由真 pnpm 生成**（v3.3，见 §2.5）：手抄 `node_modules` 会缺 pnpm 元数据，
+  `dsh plugin list` 认不出来；模板随包分发，只在首次播种时使用；升级 `dshmarket` 固定版本后要重新生成；
 - **staging 目标目录必须先清空**（v3.1）：`src-tauri/runtime/` 里任何残留都会被静默打包 —— 实测放进 20,000 个文件的探针，
   `make bundle` 全程没有任何提示，产物直接多了 78 MB。`runtime-stage` 开头 `rm -rf` 目标（保留 marker 语义即可），
   并在 `bundle` 前加一道闸门：文件数/体积落在预期区间（如 25k±10%、解压 ≤ 550 MB）否则报错；
@@ -342,7 +391,9 @@ make runtime-clean     # 清理 staging（约 475MB）
 - Node.js：MIT（含 npm 为 Artistic-2.0），随发行版带 `LICENSE`；
 - `@deepseek-ai/dsh`：BSD-3-Clause；
 - 需在 `THIRD-PARTY-NOTICES.md` 汇总 Node / npm / dsh 及其依赖的许可证；
-- marketplace 第三方插件**不随包分发**，由用户安装，责任与许可归其作者。
+- **随包附带插件市场** `dshmarket`（MIT，`github.com/dsh-market/dsh-market`）及其运行时依赖
+  `js-yaml`（MIT）/ `argparse`（Python-2.0）/ `undici`（MIT）—— 见 §2.5；
+- 其余 marketplace 第三方插件**不随包分发**，由用户安装，责任与许可归其作者。
 
 ---
 
@@ -361,6 +412,8 @@ make runtime-clean     # 清理 staging（约 475MB）
 | `Makefile` | `runtime-fetch / runtime-stage / runtime-clean`，`bundle` 依赖 chain；**staging 结尾做悬空链接校验**；自动生成 `THIRD-PARTY-NOTICES.md` | ~80 行 |
 | staging 签名脚本 | 逐个 Mach-O 重签，**带 `--preserve-metadata=entitlements`**；签名后跑 `node -e` 冒烟 | ~25 行 |
 | `runtime.rs`（新） | pnpm 用独立的 `runtime/tools` 前缀（不随 dsh 更新替换），PATH 注入两份 | 含上行 |
+| `runtime.rs`（新） | **首次播种 profile 模板**（仅当 `$DSH_HOME/profiles/web` 不存在）：复制 `Resources/runtime/profile-template/` | ~25 行 |
+| staging（Makefile） | 生成 profile 模板：固定 `dshmarket` 版本 → 真 `pnpm install` → 拷进 `runtime/profile-template/` | ~15 行 |
 
 ---
 
@@ -374,7 +427,9 @@ make runtime-clean     # 清理 staging（约 475MB）
 - [ ] 体积不超过阈值（解压 ≤ 500 MB，分发包 ≤ 250 MB）；
 - [ ] 系统已装 node/dsh 的开发机上，仍能通过配置切回系统运行时（用于开发与排障）；
 - [ ] **断网首启实测**（拔网/禁网后首启，不使用任何网络）；
-- [ ] **插件安装可用**：干净机器上能装 marketplace 插件（验证 pnpm 已随包/staging 就位）；
+- [ ] **市场可用**：干净机器首启后，profile 里出现 `.dsh-market/`（证明 dshmarket 已加载）、市场界面能打开；
+- [ ] **插件安装可用**：从市场里装一个第三方插件（验证 pnpm 随包就位 + 联网安装链路）；
+- [ ] **已有 profile 不被改动**：把测试机 `$DSH_HOME/profiles/web` 换成用户自己的，启动后该目录字节不变；
 - [ ] **回退演练**：人为破坏 app-data 前缀（删 `lib/bin.js`）后仍能用 seed 启动；
 - [ ] **版本仲裁**：把 app-data 前缀替换成旧版本时，启动应选用 seed 里更高的版本；
 - [ ] **更新中断演练**：更新过程被 kill 后，下次启动仍可用（`prefix → prefix.old → prefix` 三步替换生效）；
@@ -560,3 +615,26 @@ make runtime-clean     # 清理 staging（约 475MB）
 - `otool -l <node>/bin/node | grep -A4 LC_BUILD_VERSION` → `minos 11.0`（arm64 与 x64 都是）；
 - `PATH=<seed>/bin:$PATH <seed>/bin/npm prefix -g` → 输出那份 node 目录本身；
 - 现有代码路径：`lib.rs` 调 `update::install_prefix(&location.dsh_js)`，规则见 `update.rs` 的 `install_prefix`。
+
+## 19. 修订记录（v3.3：随包附带插件市场）
+
+**触发**：干净机器上无法安装任何插件 —— dsh 在全新 `DSH_HOME` 造出来的 profile 是空的
+（`dependencies: {}`，bundles 只有 base + web-app，实测），而 `dsh plugin --profile X …` 只是对 pnpm 的透传，
+没有任何"安装入口"。因此原方案"不打包任何插件"的非目标必须改为"**只附带插件市场本身**"。
+
+| # | 级别 | 问题 | 处理 |
+|---|---|---|---|
+| 1 | P0 | 干净机器的 profile 没有安装入口，用户无法手动装插件 | §2.5 新增"随包附带 dshmarket"：staging 生成 profile 模板 + 首启播种；§1 非目标相应修正 |
+| 2 | P1 | 模板若手抄 node_modules，pnpm 不认（缺元数据），后续 `dsh plugin add` 可能重建整棵树 | §2.5/§5 要求**真 pnpm install** 生成模板并随包分发锁文件 |
+| 3 | P1 | 播种可能覆盖用户既有 profile | §2.5 明确**仅当 profile 不存在时播种**，§12 增加"已有 profile 不被改动"验收 |
+| 4 | P2 | 三方插件的许可与供应链未覆盖 | §10 收录 dshmarket 及其三个依赖的许可；§2.5 记录版本固定与锁文件审计 |
+
+**实测明细**（macOS，dsh 0.1.5-rc.2，pnpm 12.3.4）：
+
+- 全新 DSH_HOME 跑 `dsh web` → profile 的 `dependencies` 为 `{}`、`bundles` 只有两个 base 包，`node_modules/` 为空；
+- `dsh plugin --profile web --help` 输出的是 **pnpm 自己的帮助** ⇒ 插件管理 = pnpm 透传；
+- 用真 pnpm 生成模板：`pnpm install` → 6.5 MB（dshmarket/js-yaml/argparse/undici，**0 个 .node**）；
+- 把模板放进全新 DSH_HOME：`dsh plugin --profile web list` → `dshmarket@1.45.1`；
+- 启动：`dsh web` **4 秒**输出 URL、stderr 为空、无模块解析错误，profile 内出现 `.dsh-market/`（市场已加载）。
+
+**未验证**：断网首启（§12 仍列为验收项）、从市场实际安装一个第三方插件的端到端链路。
