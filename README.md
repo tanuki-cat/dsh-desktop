@@ -380,6 +380,13 @@ macOS/Linux 每个平台会先出精简版，再出 `-bundled` 的自带运行�
 `bundle.resources`）→ 打包并生成每平台 `SHA256SUMS-<suffix>`（该平台两种产物一起）→ `release` job 汇总成
 `SHA256SUMS` 并 `gh release upload --clobber`（可重复运行）。
 
+**缓存**：cargo 的 registry 与 `src-tauri/target` 由 `Swatinem/rust-cache` 按平台各缓存一份，
+`node_modules` 由 `setup-node` 的 pnpm store 缓存；本轮又给自带运行时的 staging 输入加了缓存
+（`.runtime-cache/`：Node 压缩包 + SHASUMS + npm/pnpm store，key 里带平台标识，`runtime.lock`
+或版本变量变化时自动换 key，缓存只省下载 —— SHA256 校验照旧）。刻意**不缓存** `src-tauri/runtime/`：
+520 MB × 5 个平台会挤占仓库 10 GB 的缓存配额，而它每次都会被整体清空重建；也没有引入第三方的
+apt 缓存 action，Linux 的系统依赖仍是每次 `apt-get install`。
+
 **发版步骤**：
 
 ```bash

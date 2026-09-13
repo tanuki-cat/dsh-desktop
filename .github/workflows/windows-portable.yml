@@ -91,6 +91,21 @@ jobs:
           workspaces: src-tauri
           key: windows-portable
 
+      # 与 release.yml 同一份 staging 输入缓存（Windows 上 npm 装 2.5 万文件尤其慢）；
+      # key 用 runner.os + 平台名，不会串到别的平台。
+      # 缓存只省下载：stage-runtime.sh 仍按 src-tauri/runtime.lock 校验 node 包的 SHA256。
+      - name: 缓存 staging 输入（Node 包 + npm/pnpm 缓存）
+        uses: actions/cache@v4
+        with:
+          path: |
+            .runtime-cache/node-v*
+            .runtime-cache/SHASUMS256*.txt
+            .runtime-cache/npm
+            .runtime-cache/pnpm-store
+          key: runtime-${{ runner.os }}-windows-x64-${{ hashFiles('src-tauri/runtime.lock', 'Makefile', 'scripts/stage-runtime.sh', 'scripts/make-profile-template.sh') }}
+          restore-keys: |
+            runtime-${{ runner.os }}-windows-x64-
+
       - name: 工具链自检
         run: |
           set -euo pipefail

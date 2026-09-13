@@ -108,6 +108,26 @@ jobs:
           workspaces: src-tauri
           key: ${{ matrix.suffix }}
 
+      # staging 的输入比产物小得多、复用收益却很大：dsh 依赖树来自几百个 registry 包，
+      # 冷装是几百次带延迟的请求，热缓存则是一次 ~250 MB 的恢复（npm 缓存 204 MB + Node 包 48 MB）。
+      # key 里带 matrix.suffix：macos-arm64 与 macos-x64 都在 arm64 runner 上跑，需要各自隔离。
+      # 缓存不影响信任链 —— runtime-fetch 仍然按 src-tauri/runtime.lock 校验 SHA256，
+      # 缓存命中只是省掉下载。
+      #
+      # 刻意不缓存 src-tauri/runtime/ 本身：520 MB × 5 个平台会把仓库 10 GB 的缓存配额挤爆，
+      # 而 staging 每次都会被整体清空重建（见 Makefile 的 runtime-stage 与那份闸门脚本）。
+      - name: 缓存 staging 输入（Node 包 + npm/pnpm 缓存）
+        uses: actions/cache@v4
+        with:
+          path: |
+            .runtime-cache/node-v*
+            .runtime-cache/SHASUMS256*.txt
+            .runtime-cache/npm
+            .runtime-cache/pnpm-store
+          key: runtime-${{ runner.os }}-${{ matrix.suffix }}-${{ hashFiles('src-tauri/runtime.lock', 'Makefile', 'scripts/stage-runtime.sh', 'scripts/make-profile-template.sh') }}
+          restore-keys: |
+            runtime-${{ runner.os }}-${{ matrix.suffix }}-
+
       - name: 工具链自检
         run: make doctor
 

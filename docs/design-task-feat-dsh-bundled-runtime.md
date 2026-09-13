@@ -818,6 +818,7 @@ Windows 继续复用 `windows-portable.yml` 的免安装包（它本身就是自
 | 产物 | 每平台两种：`…_<suffix>.app.zip` / `.deb`（精简版，需自备 node/dsh）与 `…_<suffix>-bundled.app.zip` / `-bundled.deb`（自带运行时，压缩后约 150–330 MB）；同平台两种产物写进同一份 `SHA256SUMS-<suffix>`，`release` 任务照旧合并成一份 |
 | 打包顺序 | 先 `make bundle`，把精简版挪进 `thin/`，再 `make bundle-bundled`。第二遍构建会覆盖同名产物，顺序颠倒会丢掉精简版 |
 | CI 依赖 | 新增 `actions/setup-python@v5`（`write_third_party_notices.py` 需要 python3）；macOS 超时 60→90 分钟、Linux 45→75 分钟（staging + 两份产物 + 500 MB 级资源复制） |
+| CI 缓存 | staging 输入加 `actions/cache@v4`（`.runtime-cache/`：Node 压缩包、SHASUMS、npm 与 pnpm store；key 含 `runner.os` + 平台标识 + `runtime.lock`/`Makefile`/两个 staging 脚本的哈希，key 变化时用 `restore-keys` 恢复上一份，整份恢复、不做文件级合并）；cargo 与 `node_modules` 原本就有 `Swatinem/rust-cache` / `setup-node` 的缓存。**不缓存** `src-tauri/runtime/`：520 MB × 5 平台会挤占 10 GB 配额，而且放进缓存会引入"发出过期 dsh 版本"的风险（`check-runtime-stage.sh` 只校验结构，不校验版本） |
 | 兜底断言 | macOS 断言 `Contents/Resources/runtime/node/bin/node` 存在；Linux 断言自带运行时版 `.deb` 至少是精简版的 3 倍（deb 内部路径由打包器决定，用体积比代替路径断言）。两者都是为了拦住「`bundle.resources` 没生效、安静发出一个只有壳的 `-bundled` 包」 |
 
 已做的验证：`make -n runtime-stage TARGET=x86_64-apple-darwin` 显示下载并校验
