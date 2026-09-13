@@ -19,6 +19,7 @@ market_version=${DSHMARKET_VERSION:-1.45.1}
 cache=${CACHE_DIR:-.runtime-cache}
 python=${PYTHON:-python3}
 here=$(cd "$(dirname "$0")" && pwd)
+lock="$here/../src-tauri/runtime.lock"
 
 host_os=$(uname -s | tr "[:upper:]" "[:lower:]")
 case "$host_os" in
@@ -51,13 +52,23 @@ if [ ! -f "$cache/$tarball" ]; then
   curl -fsSL -o "$cache/$tarball" "$base_url/$tarball"
 fi
 
-echo "校验 ${tarball}（SHASUMS256.txt）"
+# 信任链钉在仓库里的 src-tauri/runtime.lock：只校验下载来的 SHASUMS256.txt 等于把信任交给
+# TLS，清单被换掉时发现不了（review P2-12）。
+echo "校验 ${tarball}（对照 src-tauri/runtime.lock）"
 curl -fsSL -o "$cache/SHASUMS256-$node_os-$node_arch.txt" "$base_url/SHASUMS256.txt"
-(cd "$cache" && grep " $tarball$" "SHASUMS256-$node_os-$node_arch.txt" > .expected \
-  && (shasum -a 256 -c .expected 2>/dev/null || sha256sum -c .expected) && rm -f .expected)
+grep " $tarball$" "$lock" > "$cache/.locked" \
+  || { echo "$lock 里没有 $tarball 的 SHA256，先补上再打包" >&2; exit 1; }
+(cd "$cache" && grep " $tarball$" "SHASUMS256-$node_os-$node_arch.txt" > .downloaded \
+  && cmp -s .locked .downloaded \
+  || { echo "下载的 SHASUMS256.txt 与 runtime.lock 不一致：$tarball" >&2; exit 1; })
+(cd "$cache" && (shasum -a 256 -c .locked 2>/dev/null || sha256sum -c .locked) && rm -f .locked .downloaded)
 
 echo "组装 $out"
-rm -rf "$out/node" "$out/dsh-prefix" "$out/tools" "$out/profile-template"
+# 整体清空（只留 README.md 这个非空 marker）：只删四个已知子目录时，别的平台/上一次的残留
+# 会被 bundle.resources 静默打进包（review P1-8）。
+if [ -d "$out" ]; then
+  find "$out" -mindepth 1 -maxdepth 1 ! -name README.md -exec rm -rf {} +
+fi
 rm -rf "$cache/unpacked" && mkdir -p "$cache/unpacked" "$out"
 case "$node_os" in
   win) unzip -q "$cache/$tarball" -d "$cache/unpacked" ;;

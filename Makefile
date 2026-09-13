@@ -45,7 +45,7 @@ PNPM_STORE ?=
 CARGO_ENV         := $(if $(CARGO_HOME),CARGO_HOME=$(CARGO_HOME),)
 PNPM_INSTALL_ARGS := $(if $(PNPM_STORE),--store-dir=$(PNPM_STORE),)
 
-.PHONY: help doctor check fmt clippy test test-live dev build bundle node-deps run icons clean distclean
+.PHONY: help doctor check fmt fmt-check clippy test test-live dev build bundle node-deps run icons clean distclean
 
 help:
 	@echo "dsh-desktop 构建入口（平台: $(PLATFORM)，打包目标: $(BUNDLE_TARGETS)）"
@@ -54,7 +54,7 @@ help:
 	@echo "  make check       cargo check --all-targets"
 	@echo "  make test        离线单元测试"
 	@echo "  make test-live   联网集成测试（查询 npm registry）"
-	@echo "  make fmt / clippy"
+	@echo "  make fmt / fmt-check / clippy"
 	@echo "  make dev         运行 debug 版"
 	@echo "  make build       编译 release 可执行文件"
 	@echo "  make bundle      打包（$(BUNDLE_TARGETS)）"
@@ -88,6 +88,10 @@ check:
 fmt:
 	$(CARGO) fmt --manifest-path $(MANIFEST)
 
+# 只检查不改工作区：CI 门禁用这个，避免"先改再查"把 runner 的工作树改脏
+fmt-check:
+	$(CARGO) fmt --manifest-path $(MANIFEST) --check
+
 clippy:
 	$(CARGO_ENV) $(CARGO) clippy --manifest-path $(MANIFEST) --all-targets -- -D warnings
 
@@ -111,7 +115,7 @@ node-deps:
 # TARGET 用于交叉编译（例如在 arm64 runner 上产出 Intel 包）：
 #   make bundle TARGET=x86_64-apple-darwin
 bundle: node-deps
-	$(CARGO_ENV) $(PNPM) tauri build --bundles $(BUNDLE_TARGETS) $(if $(TARGET),--target $(TARGET),)
+	$(CARGO_ENV) $(PNPM) tauri build --bundles $(BUNDLE_TARGETS) $(if $(TARGET),--target $(TARGET),) $(if $(TAURI_CONFIG_EXTRA),--config '$(TAURI_CONFIG_EXTRA)',)
 	@echo "产物: $(if $(TARGET),$(TAURI_DIR)/target/$(TARGET),$(TAURI_DIR)/target)/release/bundle/$(if $(filter macos,$(PLATFORM)),macos,deb)"
 
 ifeq ($(PLATFORM),macos)
@@ -194,7 +198,10 @@ endif
 NODE_DIST_NAME    := node-v$(NODE_VERSION)-$(NODE_OS)-$(NODE_ARCH)
 NODE_BASE_URL     := https://nodejs.org/dist/v$(NODE_VERSION)
 NODE_BIN          := $(abspath $(RUNTIME_DIR))/node/bin
+RUNTIME_LOCK      := $(TAURI_DIR)/runtime.lock
 
+# 信任链钉在仓库里的 $(RUNTIME_LOCK)：只校验"下载来的 SHASUMS256.txt"等于把信任交给 TLS，
+# 清单被换掉时发现不了（review P2-12）。
 runtime-fetch:
 	@mkdir -p $(RUNTIME_CACHE)
 	@if [ ! -f $(RUNTIME_CACHE)/$(NODE_TARBALL) ]; then \
@@ -202,13 +209,20 @@ runtime-fetch:
 		curl -fsSL -o $(RUNTIME_CACHE)/$(NODE_TARBALL) $(NODE_BASE_URL)/$(NODE_TARBALL); \
 	fi
 	@curl -fsSL -o $(RUNTIME_CACHE)/SHASUMS256.txt $(NODE_BASE_URL)/SHASUMS256.txt
-	@cd $(RUNTIME_CACHE) && grep " $(NODE_TARBALL)$$" SHASUMS256.txt > .expected \
-		&& (shasum -a 256 -c .expected 2>/dev/null || sha256sum -c .expected) && rm -f .expected
-	@echo "已校验 $(NODE_TARBALL)（SHASUMS256.txt）"
+	@grep " $(NODE_TARBALL)$$" $(RUNTIME_LOCK) > $(RUNTIME_CACHE)/.locked \
+		|| { echo "$(RUNTIME_LOCK) 里没有 $(NODE_TARBALL) 的 SHA256，先补上再打包" >&2; exit 1; }
+	@cd $(RUNTIME_CACHE) && grep " $(NODE_TARBALL)$$" SHASUMS256.txt > .downloaded \
+		&& cmp -s .locked .downloaded \
+		|| { echo "下载的 SHASUMS256.txt 与 $(RUNTIME_LOCK) 不一致：$(NODE_TARBALL)" >&2; exit 1; }
+	@cd $(RUNTIME_CACHE) && (shasum -a 256 -c .locked 2>/dev/null || sha256sum -c .locked) && rm -f .locked .downloaded
+	@echo "已校验 $(NODE_TARBALL)（对照 $(RUNTIME_LOCK)）"
 
 runtime-stage: runtime-fetch
+	@sh scripts/check-runtime-stage.sh --self-test
 	@echo "组装 $(RUNTIME_DIR) …"
-	@rm -rf $(RUNTIME_DIR)/node $(RUNTIME_DIR)/dsh-prefix $(RUNTIME_DIR)/tools $(RUNTIME_DIR)/profile-template
+	@# 整体清空（只留 README.md 这个非空 marker）：只删四个已知子目录时，别的平台/上一次的残留
+	@# 会被 bundle.resources 静默打进包（review P1-8）。
+	@if [ -d $(RUNTIME_DIR) ]; then find $(RUNTIME_DIR) -mindepth 1 -maxdepth 1 ! -name README.md -exec rm -rf {} +; fi
 	@rm -rf $(RUNTIME_CACHE)/unpacked && mkdir -p $(RUNTIME_CACHE)/unpacked $(RUNTIME_DIR)
 	@tar -xf $(RUNTIME_CACHE)/$(NODE_TARBALL) -C $(RUNTIME_CACHE)/unpacked
 	@mv $(RUNTIME_CACHE)/unpacked/$(NODE_DIST_NAME) $(RUNTIME_DIR)/node
@@ -224,13 +238,16 @@ runtime-stage: runtime-fetch
 		"$(RUNTIME_DIR)/profile-template" "$(DSHMARKET_VERSION)" "$(RUNTIME_DIR)/tools/bin"
 	@xattr -cr $(RUNTIME_DIR) 2>/dev/null || true
 	@$(PYTHON) scripts/write_third_party_notices.py "$(RUNTIME_DIR)" "$(NODE_VERSION)" "$(DSH_VERSION)" "$(PNPM_VERSION)" "$(DSHMARKET_VERSION)"
-	@sh scripts/check-runtime-stage.sh "$(RUNTIME_DIR)"
+	@DSH_RUNTIME_MAX_FILES=45000 DSH_RUNTIME_MAX_MB=600 sh scripts/check-runtime-stage.sh "$(RUNTIME_DIR)"
 	@du -sh $(RUNTIME_DIR) 2>/dev/null || true
 
-# 打包"无需预装 node/dsh"的版本：bundle.resources 会把 runtime/ 一起塞进 .app
+# 打包"无需预装 node/dsh"的版本：bundle.resources 会把 runtime/ 一起塞进 .app。
+# 自带运行时的发行版必须声明 macOS 11.0：随包的 node 22 是 `minos 11.0`，而 tauri.conf.json 里的
+# 10.15 只对精简版成立 —— 声明 10.15 的结果是"能装、能开壳、一起 harness 就崩"（方案 §18.1 H2 实测）。
 bundle-bundled: runtime-stage
-	@$(MAKE) --no-print-directory bundle
+	@$(MAKE) --no-print-directory bundle $(if $(filter macos,$(PLATFORM)),TAURI_CONFIG_EXTRA='{"bundle":{"macOS":{"minimumSystemVersion":"11.0"}}}',)
 
 runtime-clean:
-	rm -rf $(RUNTIME_CACHE) $(RUNTIME_DIR)/node $(RUNTIME_DIR)/dsh-prefix $(RUNTIME_DIR)/tools $(RUNTIME_DIR)/profile-template $(RUNTIME_DIR)/THIRD-PARTY-NOTICES.md
+	rm -rf $(RUNTIME_CACHE)
+	@if [ -d $(RUNTIME_DIR) ]; then find $(RUNTIME_DIR) -mindepth 1 -maxdepth 1 ! -name README.md -exec rm -rf {} +; fi
 	@echo "已回收 staging 与下载缓存（src-tauri/runtime/README.md 保留）"

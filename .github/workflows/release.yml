@@ -106,8 +106,7 @@ jobs:
       - name: 格式、lint 与测试（发布门禁）
         run: |
           set -euo pipefail
-          make fmt
-          git diff --exit-code    # 格式不对就报错，避免带着未格式化的代码发版
+          make fmt-check          # 只检查：make fmt 会改工作区，失败时看不出原始差异
           make clippy
           make test
 
