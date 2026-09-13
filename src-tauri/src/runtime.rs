@@ -151,9 +151,13 @@ impl Decision {
 pub fn decide(input: &Inputs<'_>) -> Option<Decision> {
     let node = pick_node(input)?;
     let dsh = pick_dsh(input)?;
+    // Only a tree this shell owns may be rewritten by a core update, and `Shadow` installs into
+    // the writable prefix. `Env` points at a tree that is not ours: classifying it as `Shadow`
+    // both installed updates where they are never read and flipped the shell into "bundled"
+    // mode, which rewrites PATH / npm_config_prefix / PNPM_HOME for the child (review P1-5).
     let updates = match dsh.origin {
-        Origin::System => Updates::Notify,
-        _ => Updates::Shadow,
+        Origin::Seed | Origin::Shadow => Updates::Shadow,
+        Origin::System | Origin::Env => Updates::Notify,
     };
     Some(Decision { node, dsh, updates })
 }
@@ -345,6 +349,9 @@ mod tests {
         assert_eq!(decision.dsh.path, PathBuf::from("/custom/dsh/lib/bin.js"));
         assert_eq!(decision.node.origin, Origin::Env);
         assert_eq!(decision.dsh.origin, Origin::Env);
+        // An override points at a tree this shell does not own: updates only notify, and the
+        // "bundled" side effects (PATH, npm_config_prefix, PNPM_HOME) stay off (review P1-5).
+        assert_eq!(decision.updates, Updates::Notify);
     }
 
     #[test]

@@ -177,6 +177,22 @@ fn find_launcher(
     Err("找不到 dsh。可用环境变量 DSH_DESKTOP_DSH 指定绝对路径。".into())
 }
 
+/// The system `dsh` launcher, resolved without requiring node to exist (review P1-4).
+pub fn system_dsh() -> Option<PathBuf> {
+    find_launcher(None, None)
+        .ok()
+        .map(|launcher| real_path(&launcher))
+}
+
+/// The system `node`, resolved without requiring a `dsh` launcher to exist.
+///
+/// `DSH_DESKTOP_NODE` is deliberately not consulted: it is an input of its own
+/// (`Inputs::env_node`), and feeding it back as "the system node" would push the user's explicit
+/// choice through the capability gate that override exists to bypass (review P1-4).
+pub fn system_node() -> Option<PathBuf> {
+    find_node_without_env(Path::new(""))
+}
+
 fn find_node(launcher: &Path) -> Result<PathBuf, String> {
     if let Ok(raw) = std::env::var("DSH_DESKTOP_NODE") {
         let p = PathBuf::from(raw);
@@ -184,24 +200,24 @@ fn find_node(launcher: &Path) -> Result<PathBuf, String> {
             return Ok(p);
         }
     }
+    find_node_without_env(launcher).ok_or_else(|| {
+        "找不到 node。dsh 以 `#!/usr/bin/env node` 运行，没有 node 时启动会直接失败（exit 127）。"
+            .to_string()
+    })
+}
+
+/// The node belonging to an installation: next to the launcher first, then PATH, then the login
+/// shell. Split out from `find_node` so the system probe can run without a launcher (P1-4).
+fn find_node_without_env(launcher: &Path) -> Option<PathBuf> {
     if let Some(dir) = launcher.parent() {
         for name in ["node", "node.exe"] {
             let candidate = dir.join(name);
             if candidate.is_file() {
-                return Ok(candidate);
+                return Some(candidate);
             }
         }
     }
-    if let Some(p) = path_lookup("node") {
-        return Ok(p);
-    }
-    if let Some(p) = login_shell_lookup("node") {
-        return Ok(p);
-    }
-    Err(
-        "找不到 node。dsh 以 `#!/usr/bin/env node` 运行，没有 node 时启动会直接失败（exit 127）。"
-            .into(),
-    )
+    path_lookup("node").or_else(|| login_shell_lookup("node"))
 }
 
 pub(crate) fn path_lookup(name: &str) -> Option<PathBuf> {
