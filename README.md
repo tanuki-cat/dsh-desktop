@@ -5,8 +5,13 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 
 > 许可证：MIT（见 `LICENSE`）。
 >
-> 当前版本仍**要求系统已装 `node` 与 `dsh`**。让目标机器无需预装这两者的发行方案
-> （自带 Node + dsh 核心）已规划完成，见 [后续实施计划](#后续实施计划自带运行时无需预装-nodedsh)。
+> 当前版本（`main`）仍**要求系统已装 `node` 与 `dsh`**。让目标机器无需预装这两者的发行方案
+> （自带 Node + dsh 核心）已在 `feat/bundled-runtime` 分支落地，见 [后续实施计划](#后续实施计划自带运行时无需预装-nodedsh)。
+>
+> **分支策略**：`feat/bundled-runtime` 是**长期分支，暂不合并到 `main`**，当前用途是构建与发布
+> **Windows 免安装版**（自带 Node + dsh + 插件市场，已实机验证）。要出包时用 `main` 上的
+> `.github/workflows/windows-portable.yml` 手动触发：工作流挂在 `main` 只是为了随时能跑，
+> 构建的却是 `build_ref` 指向的分支代码（默认 `feat/bundled-runtime`）。该分支的 README 有完整说明。
 
 设计依据：[`docs/design-task-feat-dsh-tauri-desktop-shell.md`](docs/design-task-feat-dsh-tauri-desktop-shell.md)
 （正文为设计，实施偏差与验证证据见其 §13.1–13.4）。
@@ -55,8 +60,9 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 
 **待实机点击确认**：附件上传、下载、`window.open` 实际效果、macOS TCC 授权归因。
 
-**平台**：构建入口只覆盖 macOS 与 Linux（其他平台在 Makefile 解析阶段直接报错）。Windows 分支代码保留但**未支持也未验证**：
-那里的存活探测恒为真，`terminate` 会白等满 grace，要移植得先换成 `OpenProcess` + `GetExitCodeProcess`。
+**平台**：构建入口只覆盖 macOS 与 Linux（其他平台在 Makefile 解析阶段直接报错）。Windows 分支代码保留但 `main` 上**未支持也未验证**：
+这里的存活探测恒为真，`terminate` 会白等满 grace，要移植得先换成 `OpenProcess` + `GetExitCodeProcess`
+—— 这些已在长期分支 `feat/bundled-runtime` 完成并实机验证（Windows 免安装包），该分支**暂不合并到 `main`**。
 
 **未做**：签名与公证（对外分发必需）、多 workspace 切换 UI；
 **自带运行时（打包 Node/dsh）已规划未实施**，见下方"后续实施计划"。

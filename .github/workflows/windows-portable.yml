@@ -5,6 +5,10 @@ name: windows-portable
 # 为什么必须在 Windows 上 stage：在 macOS 上用 `npm install --os=win32` 装 dsh 时，
 # koffi 的平台包不会被装上（npm 的 --os/--cpu 对全局安装的依赖树不生效），postinstall 会
 # 回退到就地编译并因缺 CMake 失败 —— 实测过。Windows runner 上原生安装才能拿到正确的原生模块。
+#
+# 分支策略：自带运行时只存在于长期分支 feat/bundled-runtime（**暂不合并到 main**），Windows 免安装包
+# 目前是该分支唯一的对外产物。本文件留在 main 上只是为了能随时手动触发 —— 构建的是 build_ref 指向的
+# 分支代码（默认 feat/bundled-runtime）。用 main 当 build_ref 只会得到一份用不上的 runtime/。
 on:
   workflow_dispatch:
     inputs:
