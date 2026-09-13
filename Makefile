@@ -61,6 +61,7 @@ help:
 	@echo "  make run         构建后启动"
 	@echo "  make icons       重新生成 icon.icns（仅 macOS）"
 	@echo "  make icon-art    重新绘制 icon.png（需 python3 + Pillow）"
+	@echo "  make runtime-stage / bundle-bundled / runtime-clean   自带运行时（无需预装 node/dsh）"
 	@echo "  make clean / distclean"
 	@echo ''
 	@echo "变量：CARGO_HOME= PNPM_STORE= BUNDLE_TARGETS= TARGET= CARGO= PNPM= PYTHON="
@@ -187,12 +188,25 @@ PNPM_VERSION      ?= 12.3.4
 DSHMARKET_VERSION ?= 1.46.1
 RUNTIME_DIR       := $(TAURI_DIR)/runtime
 RUNTIME_CACHE     := .runtime-cache
-NODE_ARCH         := $(shell uname -m | sed -e s/arm64/arm64/ -e s/aarch64/arm64/ -e s/x86_64/x64/)
+# 交叉编译时（TARGET 非空）必须按**目标**平台 staging：在 arm64 runner 上打 x64 包却塞进 arm64 的
+# node，产物装到目标机上直接起不来。Rust 三元组的第一段就是架构（x86_64-apple-darwin → x86_64）。
+NODE_ARCH_HOST    := $(shell uname -m | sed -e s/arm64/arm64/ -e s/aarch64/arm64/ -e s/x86_64/x64/)
+NODE_ARCH_TARGET  := $(shell echo "$(TARGET)" | cut -d- -f1 | sed -e s/aarch64/arm64/ -e s/x86_64/x64/)
+NODE_ARCH         := $(if $(TARGET),$(NODE_ARCH_TARGET),$(NODE_ARCH_HOST))
 ifeq ($(PLATFORM),macos)
 NODE_OS           := darwin
-NODE_TARBALL      := node-v$(NODE_VERSION)-darwin-$(NODE_ARCH).tar.gz
 else
 NODE_OS           := linux
+endif
+# make windows（交叉编译实验）时 tarball 也要跟着换，否则 staging 里会混进 unix 的 node
+ifneq ($(findstring windows,$(TARGET)),)
+NODE_OS           := win
+endif
+ifeq ($(NODE_OS),win)
+NODE_TARBALL      := node-v$(NODE_VERSION)-win-$(NODE_ARCH).zip
+else ifeq ($(NODE_OS),darwin)
+NODE_TARBALL      := node-v$(NODE_VERSION)-darwin-$(NODE_ARCH).tar.gz
+else
 NODE_TARBALL      := node-v$(NODE_VERSION)-linux-$(NODE_ARCH).tar.xz
 endif
 NODE_DIST_NAME    := node-v$(NODE_VERSION)-$(NODE_OS)-$(NODE_ARCH)
@@ -233,7 +247,8 @@ runtime-stage: runtime-fetch
 	@# 会被 bundle.resources 静默打进包（review P1-8）。
 	@if [ -d $(RUNTIME_DIR) ]; then find $(RUNTIME_DIR) -mindepth 1 -maxdepth 1 ! -name README.md -exec rm -rf {} +; fi
 	@rm -rf $(RUNTIME_CACHE)/unpacked && mkdir -p $(RUNTIME_CACHE)/unpacked $(RUNTIME_DIR)
-	@tar -xf $(RUNTIME_CACHE)/$(NODE_TARBALL) -C $(RUNTIME_CACHE)/unpacked
+	@if [ "$(NODE_OS)" = win ]; then unzip -q $(RUNTIME_CACHE)/$(NODE_TARBALL) -d $(RUNTIME_CACHE)/unpacked; \
+	else tar -xf $(RUNTIME_CACHE)/$(NODE_TARBALL) -C $(RUNTIME_CACHE)/unpacked; fi
 	@mv $(RUNTIME_CACHE)/unpacked/$(NODE_DIST_NAME) $(RUNTIME_DIR)/node
 	@echo "安装 dsh $(DSH_VERSION) 到 dsh-prefix …"
 	@PATH="$(NODE_BIN):$$PATH" $(RUNTIME_DIR)/node/bin/npm install -g --prefix $(RUNTIME_DIR)/dsh-prefix \

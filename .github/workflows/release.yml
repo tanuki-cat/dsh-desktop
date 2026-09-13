@@ -2,6 +2,10 @@ name: release
 
 # 由 release tag（v*，例如 v0.1.0）触发：构建 macOS / Linux 产物并附到同名 GitHub Release。
 # 手动触发（workflow_dispatch）只构建并上传 workflow artifact，不创建 Release。
+#
+# 每个平台出两种产物：精简版（只有壳，目标机器需自备 node/dsh）与自带运行时版（文件名带
+# `-bundled`，随包带 Node + dsh + 插件市场，双击即用）。自带运行时版由 make bundle-bundled 产出，
+# 运行时按 **TARGET** 的平台 staging —— 在 arm64 runner 上交叉编译 x64 时不会误装 arm64 的 node。
 on:
   push:
     tags:
@@ -56,23 +60,23 @@ jobs:
             suffix: macos-arm64
             bundles: app
             target: ""
-            timeout: 60
+            timeout: 90
           # Intel 包在 arm64 runner 上交叉编译：macos-13（最后一个 x64 镜像）排队时间不可控，
           # 实测曾把整个 run 卡在 queued，导致 release job 永不执行。
           - os: macos-14
             suffix: macos-x64
             bundles: app
             target: x86_64-apple-darwin
-            timeout: 60
+            timeout: 90
           - os: ubuntu-22.04
             suffix: linux-x64
             bundles: deb
-            timeout: 45
+            timeout: 75
           # arm64 runner 对公开仓库可用；若你的计划里没有，删掉下面这一项即可
           - os: ubuntu-24.04-arm
             suffix: linux-arm64
             bundles: deb
-            timeout: 45
+            timeout: 75
     steps:
       - uses: actions/checkout@v4
 
@@ -90,6 +94,10 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+
+      - uses: actions/setup-python@v5   # make runtime-stage 用 python3 生成 THIRD-PARTY-NOTICES.md
+        with:
+          python-version: "3.12"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -114,13 +122,31 @@ jobs:
         if: matrix.target != ''
         run: rustup target add ${{ matrix.target }}
 
-      - name: 打包
+      - name: 打包（精简版 + 自带运行时版）
         env:
           BUNDLE_TARGETS: ${{ matrix.bundles }}
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
+          out="src-tauri/target/${TARGET:+$TARGET/}release/bundle"
           make bundle BUNDLE_TARGETS="$BUNDLE_TARGETS" TARGET="$TARGET"
+
+          # 第二遍构建会用同名产物覆盖第一遍：先把精简版挪进 thin/。macOS 是 .app，Linux 是 .deb。
+          mkdir -p thin
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            mv "$out/macos/DSH Desktop.app" thin/
+          else
+            shopt -s nullglob
+            debs=("$out/deb"/*.deb)
+            [ ${#debs[@]} -gt 0 ] || { echo "::error::精简版没有产出 .deb"; exit 1; }
+            mv "${debs[@]}" thin/
+          fi
+          ls -l thin
+
+          # 自带运行时版：runtime-stage 组装**本平台**的运行时（TARGET 决定 stage 哪个架构），
+          # 再以 --config 注入 bundle.resources —— 基座 tauri.conf.json 里没有这条 glob，
+          # 否则普通 make bundle 会把整份 staging 静默打进包（桌面壳审查 §10 记过的坑）。
+          make bundle-bundled BUNDLE_TARGETS="$BUNDLE_TARGETS" TARGET="$TARGET"
 
       - name: 整理 macOS 产物
         if: runner.os == 'macOS'
@@ -131,10 +157,16 @@ jobs:
         run: |
           set -euo pipefail
           app="src-tauri/target/${TARGET:+$TARGET/}release/bundle/macos/DSH Desktop.app"
-          [ -d "$app" ] || { echo "::error::找不到 $app"; exit 1; }
+          [ -d "$app" ] || { echo "::error::找不到自带运行时版的 $app"; exit 1; }
+          # bundle.resources 没生效时会安静地产出一个只有壳的包，这里直接拦住
+          [ -f "$app/Contents/Resources/runtime/node/bin/node" ] \
+            || { echo "::error::自带运行时版的 .app 里没有 runtime/node（bundle.resources 没生效？）"; exit 1; }
+          du -sh "$app" thin/"DSH Desktop.app"
           mkdir -p dist
-          out="dist/dsh-desktop_${VERSION}_${SUFFIX}.app.zip"
-          ditto -c -k --sequesterRsrc --keepParent "$app" "$out"
+          # 精简版：只有壳，目标机器需自备 node/dsh
+          ditto -c -k --sequesterRsrc --keepParent "thin/DSH Desktop.app" "dist/dsh-desktop_${VERSION}_${SUFFIX}.app.zip"
+          # 自带运行时版：约 600 MB，解压拖进「应用程序」即可，无需预装
+          ditto -c -k --sequesterRsrc --keepParent "$app" "dist/dsh-desktop_${VERSION}_${SUFFIX}-bundled.app.zip"
           (cd dist && shasum -a 256 ./*.zip | sed "s|\./||" > "SHA256SUMS-${SUFFIX}")
 
       - name: 整理 Linux 产物
@@ -147,11 +179,21 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           shopt -s nullglob
-          debs=(src-tauri/target/${TARGET:+$TARGET/}release/bundle/deb/*.deb)
-          [ ${#debs[@]} -gt 0 ] || { echo "::error::没有产出 .deb"; exit 1; }
-          for deb in "${debs[@]}"; do
+          # 精简版：只有壳，目标机器需自备 node/dsh
+          for deb in thin/*.deb; do
             cp "$deb" "dist/dsh-desktop_${VERSION}_${SUFFIX}.deb"
           done
+          # 自带运行时版：约 600 MB（deb 里是整棵 Node 依赖树）
+          bundled=(src-tauri/target/${TARGET:+$TARGET/}release/bundle/deb/*.deb)
+          [ ${#bundled[@]} -gt 0 ] || { echo "::error::没有产出自带运行时版的 .deb"; exit 1; }
+          for deb in "${bundled[@]}"; do
+            cp "$deb" "dist/dsh-desktop_${VERSION}_${SUFFIX}-bundled.deb"
+          done
+          # resources 没打进去时会安静地产出一个和精简版差不多大的包，这里按体积比拦住
+          thin_size=$(stat -c%s "dist/dsh-desktop_${VERSION}_${SUFFIX}.deb")
+          bundled_size=$(stat -c%s "dist/dsh-desktop_${VERSION}_${SUFFIX}-bundled.deb")
+          [ "$bundled_size" -gt $((thin_size * 3)) ] \
+            || { echo "::error::自带运行时版只比精简版大一点（$bundled_size vs $thin_size 字节），resources 可能没生效"; exit 1; }
           (cd dist && sha256sum ./*.deb | sed "s|\./||" > "SHA256SUMS-${SUFFIX}")
 
       - uses: actions/upload-artifact@v4
@@ -207,16 +249,22 @@ jobs:
           cat > notes.md <<'MD'
           ## DSH Desktop v__VERSION__
 
-          Windows 免安装包**自带 node 与 dsh**，解压即用；macOS 与 Linux 产物**仍需要机器上已安装
-          node 与 dsh** —— 自带运行时的 macOS/Linux 发行版仍在实施中，见 README 的"后续实施计划"。
+          macOS / Linux 每个平台都有两种产物，Windows 只有一种（它本身就是免安装的）：
 
-          | 平台 | 产物 |
-          |---|---|
-          | macOS arm64 | dsh-desktop___VERSION___macos-arm64.app.zip |
-          | macOS x64 | dsh-desktop___VERSION___macos-x64.app.zip |
-          | Linux x64 | dsh-desktop___VERSION___linux-x64.deb |
-          | Linux arm64 | dsh-desktop___VERSION___linux-arm64.deb |
-          | Windows x64 | dsh-desktop___VERSION___windows-x64-portable.zip（免安装，自带运行时）|
+          - **自带运行时版**（文件名带 `-bundled`）：随包附带 Node 22 与 dsh 核心，**目标机器无需
+            安装任何东西**，解压 / 安装后双击即用；分发包较大（压缩后约 150–330 MB）。
+          - **精简版**（文件名不带后缀）：只有桌面壳，**目标机器需自备 node 与 dsh**，体积小。
+
+          | 平台 | 自带运行时版（推荐） | 精简版（需自备 node/dsh） |
+          |---|---|---|
+          | macOS arm64 | dsh-desktop___VERSION___macos-arm64-bundled.app.zip | dsh-desktop___VERSION___macos-arm64.app.zip |
+          | macOS x64 | dsh-desktop___VERSION___macos-x64-bundled.app.zip | dsh-desktop___VERSION___macos-x64.app.zip |
+          | Linux x64 | dsh-desktop___VERSION___linux-x64-bundled.deb | dsh-desktop___VERSION___linux-x64.deb |
+          | Linux arm64 | dsh-desktop___VERSION___linux-arm64-bundled.deb | dsh-desktop___VERSION___linux-arm64.deb |
+          | Windows x64 | dsh-desktop___VERSION___windows-x64-portable.zip（免安装，自带运行时） | —— |
+
+          自带运行时版首次启动会用包内的 Node + dsh 拉起 Web GUI，不需要联网下载；dsh 核心与插件市场
+          dshmarket 之后跟随 npm registry 自动更新（默认开启，可用 config.json 的 auto_update 关闭）。
 
           > ⚠️ 这些构建**未签名也未公证**：macOS 首次打开请右键 →「打开」，或执行
           > xattr -dr com.apple.quarantine "/Applications/DSH Desktop.app"。Linux 上 WebKitGTK 仍来自系统。
@@ -224,7 +272,7 @@ jobs:
           校验：shasum -a 256 -c SHA256SUMS（Linux 用 sha256sum -c SHA256SUMS）。
 
           安装：macOS 解压后把 DSH Desktop.app 拖进「应用程序」；
-          Linux sudo apt install ./dsh-desktop___VERSION___linux-x64.deb；
+          Linux sudo apt install ./dsh-desktop___VERSION___linux-x64-bundled.deb；
           Windows 解压到短路径（如 D:\dsh）后双击 DSH Desktop\dsh-desktop.exe —— 包内依赖树最深
           约 223 字符，路径太长时资源管理器会报 0x80010135，可改用同名的 .exe 自解压包或 tar -xf。
           MD
