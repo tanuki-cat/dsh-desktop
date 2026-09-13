@@ -22,15 +22,15 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 
 - locator：解析 dsh 启动器、其真实 `lib/bin.js`（穿软链）、以及 node（GUI 启动没有 Homebrew PATH）
 - 启动：launcher flag 顺序、显式 cwd（agent workspace）、`--patch` overlay 强制 `printUrl`、独立进程组
-- 输出：持续读 stdout/stderr、token 脱敏写日志（5MB 轮转）、200 行环缓冲用于错误页
+- 输出：持续读 stdout/stderr、token 脱敏写日志（5MB × 3 份轮转，写入前判定）、200 行环缓冲用于错误页
 - URL：解析首个 token（对 `(LAN: ...)` 后缀健壮）、首启 90s / 常态 30s 超时
 - 实例：固定端口；探测 → 复用自己上次的实例 / 接管外部 Harness / 占用时错误页
 - 生命周期：退出即 SIGTERM 进程组（5s 后 SIGKILL）并删除 state.json —— 关闭窗口（`RunEvent::ExitRequested`）
   与 ⌘Q / Dock 退出（`RunEvent::Exit`）两条事件链都处理；复用的上次实例也登记，退出时一并停掉
 - 启动失败即收尾：等待 URL 超时或窗口创建失败时，先停掉刚起的进程再报错，不留"假失败 + 端口被占"
 - 看护线程：启动成功后继续 `wait` 子进程，Harness 意外退出会弹回状态页报错、清掉 state.json（应用不静默变死页面）
-- 残留自愈：只有强杀/崩溃这类拿不到回调的场景才靠下次启动清理（state.json 0600 + 存活校验）
-- 安全：Harness 窗口零 capability、导航限定当次 authority、外链与 `window.open` 交系统浏览器
+- 残留自愈：只有强杀/崩溃这类拿不到回调的场景才靠下次启动清理；state.json 0600，且**只有记录的 pid 仍监听记录的端口**时才发信号（否则只清文件，避免 pid 复用误杀无关进程组）
+- 安全：Harness 窗口零 capability、导航限定当次 authority、外链与 `window.open` 只把 `http`/`https` 交系统浏览器（`file:`、自定义 scheme 记 `external scheme blocked` 后丢弃）
 - 下载：`on_download` 落盘到 `~/Downloads`，同名文件自动加 `-1`/`-2` 后缀（不静默覆盖）；
   附件上传由 wry 的 `runOpenPanel` 原生处理
 - **dsh 核心升级**：每次启动查 registry（默认取 `latest`+`next` 最高版本），有新版就装并重启实例；
@@ -47,10 +47,13 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - 退出路径实机复现（2026-09-13，macOS）：⌘Q 等价的 Apple Event 退出后，日志出现
   `stopping Harness pid 92619` / `Harness stopped`，3080 端口释放、`state.json` 删除；
   修复前只处理红点关闭（`ExitRequested`），⌘Q 走的是 `RunEvent::Exit`，清理从未执行。
-- 离线测试：`cargo test` **29 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析、
-  6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、缓存落盘往返、
-  npm PATH 前缀、沉默对端探针超时、package.json 版本解析、部分/损坏 config.json 处理、
-  进程组终止与僵尸进程识别、下载重名避让、URL 解析兜底、CLI 版本区间判定）。
+- 离线测试：`cargo test` **43 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
+  `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
+  缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口不重复安装"、npm PATH 前缀、沉默对端探针超时、
+  package.json 版本解析、部分/损坏 config.json 处理、workspace / dsh_path 回退不改文件、HOME 缺失不回落 `/`、
+  进程组终止与僵尸进程识别、外链 scheme 白名单、页面加载重试判定矩阵、自愈进程身份校验、
+  更新前停止模式、日志运行中轮转与备份份数、日志句柄共享、spawn 路径校验点名、
+  下载重名避让、URL 解析兜底、CLI 版本区间判定）。
 - 权限：`config.json`（`env` 字段可能放 API Key）与 `state.json` 均为 0600；旧版本留下的 0644 文件会在下次启动时被就地收紧（实机已确认）。
 - 更新链路的失败证据也来自实机日志：修复前每次 GUI 启动都记 `npm view 失败: env: node: No such file or directory`
   （见设计文档 §13.8）。
@@ -63,6 +66,8 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 **平台**：构建入口只覆盖 macOS 与 Linux（其他平台在 Makefile 解析阶段直接报错）。Windows 分支代码保留但 `main` 上**未支持也未验证**：
 这里的存活探测恒为真，`terminate` 会白等满 grace，要移植得先换成 `OpenProcess` + `GetExitCodeProcess`
 —— 这些已在长期分支 `feat/bundled-runtime` 完成并实机验证（Windows 免安装包），该分支**暂不合并到 `main`**。
+`main` 的 `lib.rs` 因此带 `#[cfg(windows)] compile_error!`：在 Windows 上误用 `main` 会直接编译失败，
+而不是产出一个看起来能用、实际行为不对的包（`build_ref` 默认就指向那个分支，见上方分支策略）。
 
 **未做**：签名与公证（对外分发必需）、多 workspace 切换 UI；
 **自带运行时（打包 Node/dsh）已规划未实施**，见下方"后续实施计划"。
@@ -76,8 +81,8 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 | `make` / `make help` | 列出全部目标 | 默认目标 |
 | `make doctor` | 检查工具链与平台依赖 | Linux 用 `pkg-config` 查 `webkit2gtk-4.1` / `gtk+-3.0` / `libsoup-3.0` 并给出 Debian/Fedora/Arch 安装命令；macOS 提示装 Xcode CLT |
 | `make check` | `cargo check --all-targets` | 与 CI 口径一致 |
-| `make fmt` / `make clippy` | 格式化 / lint（`clippy -D warnings`） | |
-| `make test` | 离线单元测试（当前 **20** 个） | 不联网 |
+| `make fmt` / `make fmt-check` / `make clippy` | 格式化 / 只检查格式（CI 门禁用，不改工作区）/ lint（`clippy -D warnings`） | |
+| `make test` | 离线单元测试（当前 **43** 个） | 不联网 |
 | `make test-live` | 联网集成测试（全部） | 自动设 `DSH_DESKTOP_LIVE_TESTS=1`：查真实 registry、对比冷/热缓存耗时，并在「PATH 里没有 node」的模拟 GUI 环境下验证 npm 仍可运行 |
 | `make dev` | 运行 debug 版 | 等价 `cargo run --manifest-path src-tauri/Cargo.toml` |
 | `make build` | 编译 release 可执行文件 | 产物 `src-tauri/target/release/dsh-desktop` |
@@ -93,11 +98,10 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 
 ### 已知坑
 
-- **`src-tauri/runtime/` 不能为空**：`tauri.conf.json` 的 `bundle.resources = ["runtime/**/*"]` 相对
-  `src-tauri/` 解析，匹配为空会让 `make bundle` 直接失败
-  （`glob pattern runtime/**/* path not found or didn't match any files`）。仓库里的
-  `src-tauri/runtime/README.md` 就是为此保留的标记文件：`.gitignore` 配置为**只忽略 payload、保留它**
-  （若本项目纳入版本库，请确保该文件被提交）。误删后重新创建同名文件即可（内容不限，说明用途即可）。
+- **`main` 不再声明 `bundle.resources`**：main 上既没有 staging 目标也没有读取自带运行时的代码，
+  留着 `["runtime/**/*"]` 只会把别的分支跑 `make runtime-stage` 后残留在 `src-tauri/runtime/` 的
+  payload（实测 520 MB）静默打进 `.app`。该配置与 `src-tauri/runtime/README.md` 标记文件都留给
+  `feat/bundled-runtime`（它需要这条配置，合并时加回）。main 上 `make bundle` 与 `src-tauri/runtime/` 无关。
 - `make bundle` / `make run` 需要 `pnpm`；只跑 `make dev` / `check` / `test` 不需要。
 - Linux 首次构建前请先 `make doctor` 装齐系统依赖；即便将来采用自带 Node/dsh 的发行方式，
   **WebKitGTK 仍来自系统**（见后续实施计划）。
@@ -127,7 +131,8 @@ Node + dsh 树 + pnpm + 许可文件）、`runtime-clean`（回收约 475 MB sta
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `port` | `3080` | 固定端口。authority 稳定才能让 cookie 跨重启复用、也才能接管上次实例 |
-| `workspace` | `$HOME` | 传给 dsh 的工作目录 = agent 的 workspace root |
+| `workspace` | `$HOME` | 传给 dsh 的工作目录 = agent 的 workspace root。不是已存在的绝对目录时本次回落到默认值并记日志（**不改写你的文件**） |
+| `dsh_path` | `null` | 记住的 `dsh` 启动器绝对路径：自动搜索顺序为 `DSH_DESKTOP_DSH` → 本字段 → PATH → 常见目录 → login shell。相对路径或不存在的文件本次忽略并记日志 |
 | `dsh_home` | `null` | `null` 表示共用 `~/.dsh`（插件/设置/会话全保留）；指向别的目录则隔离 |
 | `take_over_existing` | `true` | 端口被外部 Harness 占用时，停止它并接管；`false` 则改用系统浏览器打开 |
 | `auto_update` | `true` | 启动时检查并安装 dsh 新版本 |
@@ -140,7 +145,7 @@ Node + dsh 树 + pnpm + 许可文件）、`runtime-clean`（回收约 475 MB sta
 只要写你想改的字段即可：`port` / `workspace` 缺失会取默认值，其余字段本就有默认值。
 若文件整体无法解析，本次运行使用默认配置并记一条日志，**但不会覆盖你的文件**（只有文件不存在时才会写入）。
 
-状态与日志：`<app-data>/state.json`（0600）、`<app-data>/logs/harness.log`（脱敏，5MB 轮转）。
+状态与日志：`<app-data>/state.json`（0600）、`<app-data>/logs/harness.log`（脱敏；写入前判定 5MB × 3 份轮转，即 `harness.log` + `.1`/`.2`/`.3`）。
 macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.desktop/`。
 
 ## 环境变量（API Key 等）
@@ -179,6 +184,8 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | 强杀（SIGKILL）/ 崩溃 | 拿不到任何回调，只能靠下次启动自愈清理 |
 | 启动等待 URL 超时 / 窗口创建失败 | 停掉刚起的子进程 → 状态页报错（不会留下占着端口的半启动实例） |
 | 启动成功后 Harness 意外退出 | 看护线程发现退出 → 重新弹出状态页显示退出码与最近输出、清 state.json |
+| 窗口首次加载失败（端口尚未开始应答等瞬时竞争） | 20 s 内没等到加载完成、且端口已不再以 Harness 身份应答 → 退避重试同一 token URL，最多 3 次；仍失败弹状态页说明可重新启动。端口仍健康时不重试，避免打断正在进行的加载 |
+| 页面里的非 http/https 链接（`file:`、自定义 scheme…） | 不交给系统：日志记 `external scheme blocked: <scheme> (...)` 后丢弃 |
 | 有新版 dsh 但端口上是外部实例且不允许接管 | 跳过本次更新（不重写别人正在用的树），实例继续服务，日志记 `update deferred` |
 | 下载同名文件 | 自动改名 `name-1.ext`，不覆盖已有文件 |
 | 关闭状态页（启动失败时） | 直接退出应用（此时没有 Harness 窗口，不会留下无窗口进程）；应用自己移除该窗口走 `destroy`，不触发这条 |
@@ -206,14 +213,16 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 5. 所有 npm 子进程都在 PATH 最前面插入 npm 所在目录：npm 是 `#!/usr/bin/env node` 脚本，
    而 GUI 启动的壳只有 launchd 的 PATH（不含 node），不这样处理会直接 `exit 127`（详见设计文档 §13.8）；
 6. 安装后**回读一次 CLI 版本**：版本没变说明 npm 装到了别的前缀（自定义 prefix、pnpm/yarn 布局），
-   此时只记日志、不谎报成功、也不为一次无效更新重启实例；
+   此时只记日志、不谎报成功、也不为一次无效更新重启实例；这次尝试会写进缓存（`attempted`），
+   **同一缓存窗口内不再重复安装**（否则每次启动都会先停掉 Harness 再重建一棵约 289 MB 的依赖树）；
 7. 刚更新过 → 强制重启实例（否则复用旧进程仍跑旧二进制）。
 
-结果写入日志：`dsh is up to date` / `update available: A -> B` / `dsh updated: A -> B` / `update failed, keeping vA`。
+结果写入日志：`dsh is up to date` / `update available: A -> B` / `dsh updated: A -> B` / `update failed, keeping vA` /
+`update A was already attempted in this window and changed nothing; not installing again`。
 
 ## 启动耗时与性能
 
-这份壳是进程编排 + I/O，**没有后台轮询或定时器，空闲时 CPU ≈ 0**。启动路径上各环节实测（macOS，2026-09-13）：
+这份壳是进程编排 + I/O，**空闲时 CPU ≈ 0，没有常驻轮询或定时器**（唯一的定时行为是窗口首次加载看护：最多 3 次、每次等 20 s，加载成功或放弃后线程立即结束）。启动路径上各环节实测（macOS，2026-09-13）：
 
 | 环节 | 实测 | 说明 |
 |---|---|---|
@@ -253,7 +262,7 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
 | `ubuntu-24.04-arm` | `linux-arm64` | `dsh-desktop_<v>_linux-arm64.deb` |
 
 **流程**：`preflight`（校验 tag 与 `tauri.conf.json` / `Cargo.toml` / `package.json` 三处版本一致）→
-每平台 `make fmt` + `git diff --exit-code` + `make clippy` + `make test`（发布门禁）→ `make bundle` →
+每平台 `make fmt-check`（只检查、不改工作区）+ `make clippy` + `make test`（发布门禁）→ `make bundle` →
 打包并生成每平台 `SHA256SUMS-<suffix>` → `release` job 汇总成 `SHA256SUMS` 并 `gh release upload --clobber`（可重复运行）。
 
 **发版步骤**：

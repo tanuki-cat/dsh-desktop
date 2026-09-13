@@ -91,14 +91,14 @@ DSH Desktop (Tauri 2)
 |---|---|---|
 | 1 | Tauri single-instance：已有窗口则 focus | — |
 | 2 | 读状态文件，若上次的 pid 仍存活且命令行匹配 → SIGTERM 清理（自愈） | 清理失败则记日志继续 |
-| 3 | locator：`DSH_DESKTOP_DSH` 环境变量 → 记忆路径 → PATH → 常见目录 → login shell（`/bin/zsh -lc 'command -v dsh'`，**实测可用**） | 找不到 → 错误页 + “选择 dsh 路径…” |
+| 3 | locator：`DSH_DESKTOP_DSH` 环境变量 → 记忆路径（`config.json` 的 `dsh_path`）→ PATH → 常见目录 → login shell（`/bin/zsh -lc 'command -v dsh'`，**实测可用**） | 找不到 → 错误页，文案指向 `dsh_path` / `DSH_DESKTOP_DSH`（**2026-09-13 修正**：不做“选择 dsh 路径…”选择器，记忆路径改为手写配置字段） |
 | 4 | `realpath` 解析 symlink 得 `dsh.js`；定位 node：`dsh` 同目录优先 → PATH → login shell（**实测** 两条路径都拿到 `/opt/homebrew/bin/node`） | 找不到 node → 错误页明确提示“缺 node” |
 | 4b | **解析运行时**（自带运行时启用时）：按自带方案 §2.3 的顺序选 node 与 dsh 树（显式环境变量 → 自带/影子前缀取版本更高者 → 系统），记录来源与版本；架构/能力门槛不过则回退 | 无可用运行时 → 错误页 |
 | 5 | 确定 workspace：记忆值 → 用户选择 → `$HOME` | — |
 | 6 | 写 overlay 文件（强制 `printUrl: true`），启动进程（独立进程组） | spawn 失败 → 错误页 |
 | 7 | 持续读 stdout/stderr；解析 URL 行 | 超时（首启 90s / 常态 30s）→ 错误页 + 最近 200 行日志 |
-| 8 | 创建主窗口加载 token URL | 加载失败 → 允许**重试同一 URL**（token 非一次性，实测） |
-| 9 | 不依赖重新播报：窗口加载失败就重试同一 token URL（**实测可重复使用**） | 连续失败 → 重启 harness 取新 URL |
+| 8 | 创建主窗口加载 token URL | 加载失败 → 允许**重试同一 URL**（token 非一次性，实测；**2026-09-13 落地**：`on_page_load` 未在 20s 内报完成才判失败） |
+| 9 | 不依赖重新播报：窗口加载失败就重试同一 token URL（**实测可重复使用**） | 连续失败 → 重启 harness 取新 URL（**2026-09-13 修正**：只实现“退避重试同一 URL，最多 3 次”，且仅在重试时端口已不再以 Harness 身份应答才重试；重试耗尽给错误页，不重启 harness） |
 | 10 | 退出/崩溃 → 清理状态文件 | — |
 
 > 自带运行时（打包 Node + dsh）下的运行时解析、门槛与 PATH 语义见
@@ -158,7 +158,7 @@ fn parse_dsh_url(line: &str) -> Option<Url> {
 ## 5. 进程生命周期（修正版）
 
 - **正常退出**：向进程组发 SIGTERM → 等 5s → SIGKILL；实测 harness 2s 内优雅退出。
-- **崩溃孤儿（macOS/Linux）**：Tauri 被强杀时子进程会存活。壳在 `App Data/dsh-desktop/state.json` 记录 `{pid, port, cwd, startedAt}`，**下次启动先自愈清理**；同时启动后每 30s 校验一次子进程存活。
+- **崩溃孤儿（macOS/Linux）**：Tauri 被强杀时子进程会存活。壳在 `App Data/dsh-desktop/state.json` 记录 `{pid, port, cwd, startedAt}`，**下次启动先自愈清理**（只在记录的 pid 仍监听记录的端口时才发信号，避免 pid 复用误杀）；启动后不轮询，改由看护线程阻塞 `wait` 子进程，退出即报错页（**2026-09-13 修正**：早期设计的“启动后每 30s 校验一次存活”从未实施，§13.8 已记录用阻塞 `wait` 取代）。
 - **Windows**：V1 用 `taskkill /PID <pid> /T /F`；正式版换 Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）。
 - **单实例**：`tauri-plugin-single-instance` 只保证“一个壳”，不代表“一个 harness”，需与 §6 一起看。
 
