@@ -1,11 +1,18 @@
 # 桌面壳自带 Node 与 dsh 核心的发行方案
 
+> **2026-09-13 更新**：本方案已实施并**合并回 `main`**（`Merge branch 'feat/bundled-runtime' into main`）。
+> 下面这段"分支策略"是合并前的记录，保留原样；后续开发与发布直接在 `main` 上进行。
+>
+> <details><summary>合并前的记录</summary>
+>
 > **分支策略（2026-09-13 起）**：本方案实施在长期分支 `feat/bundled-runtime` 上，**暂不合并到 `main`**。
 > 该分支当前的对外用途是**构建与发布 Windows 免安装版**（`.github/workflows/windows-portable.yml`，
 > 由 `main` 手动触发、构建 `build_ref` 指向的分支代码；在分支上打 tag 则由 `release.yml` 的
 > `windows-portable` 任务一并发布）。macOS/Linux 的自带运行时继续在该分支上验证，
 > `main` 保持“需要预装 node 与 dsh”的现状，只保留调度用的 workflow。合并时机由后续决定，
 > 合入前不要把这里的改动同步回 `main`（`release.yml` 会因此多出一个构建不出有效运行时的 Windows 任务）。
+>
+> </details>
 
 > 目标：在**没有预装 Node.js 和 DeepSeek Harness** 的机器上，双击即用。
 > 上游设计：[`design-task-feat-dsh-tauri-desktop-shell.md`](./design-task-feat-dsh-tauri-desktop-shell.md)（其 §22 已把本方案列为 V2）。
