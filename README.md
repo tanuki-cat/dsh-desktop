@@ -36,6 +36,9 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 
 - 实机（2026-09-13，macOS）：接管外部 Harness → 自启并拿到 token URL → WebView 内 token→cookie 成功，
   会话列表/文件卡片/输入框正常渲染；`state.json` 与端口监听者一致；日志 0 行明文 token。
+- 崩溃提示实机复现（2026-09-13，macOS）：启动后 `kill -9` 掉 harness 进程，日志记
+  `Harness pid 94329 exited unexpectedly (code None)`，状态页重新弹出报错、`state.json` 被清除，
+  应用自身保持运行（不再是一张死页面）。
 - 退出路径实机复现（2026-09-13，macOS）：⌘Q 等价的 Apple Event 退出后，日志出现
   `stopping Harness pid 92619` / `Harness stopped`，3080 端口释放、`state.json` 删除；
   修复前只处理红点关闭（`ExitRequested`），⌘Q 走的是 `RunEvent::Exit`，清理从未执行。
@@ -177,7 +180,9 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
    npm 取自 node 同目录，且 npm 全局前缀 ≠ CLI 实际位置时自动带 `--prefix`；
 4. 所有 npm 子进程都在 PATH 最前面插入 npm 所在目录：npm 是 `#!/usr/bin/env node` 脚本，
    而 GUI 启动的壳只有 launchd 的 PATH（不含 node），不这样处理会直接 `exit 127`（详见设计文档 §13.8）；
-5. 刚更新过 → 强制重启实例（否则复用旧进程仍跑旧二进制）。
+5. 安装后**回读一次 CLI 版本**：版本没变说明 npm 装到了别的前缀（自定义 prefix、pnpm/yarn 布局），
+   此时只记日志、不谎报成功、也不为一次无效更新重启实例；
+6. 刚更新过 → 强制重启实例（否则复用旧进程仍跑旧二进制）。
 
 结果写入日志：`dsh is up to date` / `update available: A -> B` / `dsh updated: A -> B` / `update failed, keeping vA`。
 

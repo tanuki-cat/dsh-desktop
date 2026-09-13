@@ -365,7 +365,7 @@ macOS TCC 授权归因。
 | 检查项 | 结果 |
 |---|---|
 | 3080 监听者 | `node 73596`，即桌面壳自己启动的实例（对外部实例的**接管**成功） |
-| `state.json` | `{pid: 73596, port: 3080, cwd: /Users/wangzy}`，与监听者一致 ⇒ 下次启动走**复用**分支 |
+| `state.json` | `{pid: 73596, port: 3080, cwd: /Users/<you>}`，与监听者一致 ⇒ 下次启动走**复用**分支 |
 | 日志脱敏 | `token=***`，明文 token 0 行 |
 | WebView 会话 | token→cookie 在 WKWebView 内成功，会话列表、文件卡片、输入框均正常 |
 
@@ -622,5 +622,27 @@ Dock 里就只剩一个没有窗口的进程。
 - `cargo test` **26 passed**（新增下载重名避让用例），`make clippy` 0 warning。
 - 实机：启动后应用保持运行、日志以 URL 行结尾（不再出现紧跟的 `stopping`）、state.json 为新 pid；
   `config.json` 权限由 0644 就地改成 0600。
-- 崩溃提示路径（P2-1）的可复现步骤：启动后 `kill -9 <harness pid>`，应看到状态页报错与
-  `Harness pid N exited unexpectedly`；本轮未在会话中强杀，避免打断正在使用的实例。
+- 崩溃提示路径（P2-1）已实机验证：启动后 `kill -9 <harness pid>`，日志记
+  `Harness pid 94329 exited unexpectedly (code None)`，状态页重新弹出报错、
+  `state.json` 被清除、应用自身保持运行。
+
+### 13.11 收尾：安装结果校验与公开仓库前的检查（2026-09-13）
+
+**发现（P3，已修）**：`install()` 成功返回后，应用直接置 `just_updated = true` 并回读版本，
+但从不校验版本是否真的变了。若被监管的 CLI 不在 npm 全局前缀下（自定义 prefix、pnpm/yarn/volta 布局，
+或 `install_prefix()` 因路径不含 `/lib/node_modules/` 而返回 `None`），
+npm 会把包装到别处：实际运行的仍是旧版，日志却写 `dsh updated: A -> B`，还白重启一次实例；
+此后每个缓存周期都会重装一遍。
+
+修复：安装后回读版本，与 `from` 相同则只记一条
+`update installed but the supervised CLI is still A; check npm global prefix`，
+不置 `just_updated`、不重启实例，也不再谎报成功。
+
+**公开仓库前的检查**：
+
+- 按密钥模式（`sk-…`、`ghp_…`、PRIVATE KEY、password 等）扫描工作区与全部历史提交：
+  无命中；唯一匹配是 shellenv 单测里的假值 `sk-abc=def`。
+- 文档里唯一一处本机路径 `/Users/wangzy` 改为 `/Users/<you>`。
+- 仓库 28 个跟踪文件不含日志、配置或凭证：应用数据目录从未入库。
+
+**验证**：`cargo test` 26 passed、`make clippy` 0 warning；崩溃提示路径的实机证据见 13.10。

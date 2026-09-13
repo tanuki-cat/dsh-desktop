@@ -311,9 +311,19 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                         let prefix = update::install_prefix(&location.dsh_js);
                         match update::install(&npm, update::PACKAGE, &to, prefix.as_deref()) {
                             Ok(()) => {
-                                just_updated = true;
                                 version = locator::version(&location).unwrap_or_else(|| to.clone());
-                                harness::app_log(&format!("dsh updated: {from} -> {to}"));
+                                if version == from {
+                                    // npm installed the package somewhere other than where this
+                                    // CLI lives (custom prefix, pnpm/yarn/volta layout), so the
+                                    // supervised binary is unchanged. Say so instead of claiming
+                                    // an update and restarting the Harness for nothing.
+                                    harness::app_log(&format!(
+                                        "update installed but the supervised CLI is still {from}; check npm global prefix"
+                                    ));
+                                } else {
+                                    just_updated = true;
+                                    harness::app_log(&format!("dsh updated: {from} -> {to}"));
+                                }
                             }
                             Err(reason) => harness::app_log(&format!(
                                 "update failed, keeping v{from}: {reason}"
