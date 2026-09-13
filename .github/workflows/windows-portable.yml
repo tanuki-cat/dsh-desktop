@@ -127,6 +127,16 @@ jobs:
           4) 需要 WebView2 运行时：Windows 11 自带；Windows 10 可装
              https://developer.microsoft.com/microsoft-edge/webview2/
 
+          【解压注意】包里是完整的 Node 依赖树，最深约 223 个字符。Windows 资源管理器
+          的“全部解压”会再套一层 <下载目录>\<压缩包名>\，很容易超过 260 字符的 MAX_PATH
+          限制并报错 0x80010135（路径太长）。任选一种方式：
+
+            A. 解压到短路径，例如 D:\dsh
+            B. 用 Windows 10+ 自带的 tar（不依赖任何第三方工具）：
+                 tar -xf dsh-desktop_<版本>_windows-x64-portable.zip -C D:\dsh
+            C. 用 7-Zip 右键“解压到 …”（7-Zip 支持长路径）
+            D. 直接用同目录的 .exe 自解压包（若有），双击后选择 D:\dsh 这类短目录
+
           排障：日志在 %APPDATA%\com.deepseek.dsh.desktop\logs\harness.log，
           里面会写明用的是自带运行时还是系统安装（runtime: node … (bundled) …）。
           TXT
@@ -134,12 +144,31 @@ jobs:
           # 在 dist 里打包：否则 7z 会把 "dist/DSH Desktop/…" 整条相对路径写进压缩包，
           # 解压后多一层 dist 目录。
           (cd dist && 7z a -tzip "dsh-desktop_${VERSION}_windows-x64-portable.zip" "DSH Desktop" >/dev/null)
+
+          # 自解压包：Windows 资源管理器的解压不支持长路径，7-Zip 的 SFX 支持，双击即可用。
+          # 7z.sfx 在 runner 的 7-Zip 安装目录里；没有就跳过（zip 仍在）。
+          sfx="/c/Program Files/7-Zip/7z.sfx"
+          if [ -f "$sfx" ]; then
+            (cd dist && 7z a -t7z -mx=1 "inner.7z" "DSH Desktop" >/dev/null \
+              && cat "$sfx" inner.7z > "dsh-desktop_${VERSION}_windows-x64-portable.exe" \
+              && rm -f inner.7z)
+            echo "已生成自解压 exe（双击解压，支持长路径）"
+          else
+            echo "提示：未找到 7z.sfx，跳过自解压包"
+          fi
+
+          # 诊断：包内最长路径（Windows MAX_PATH 是 260，解压目录会额外占用一截）
+          longest=$(7z l -slt "dist/dsh-desktop_${VERSION}_windows-x64-portable.zip" 2>/dev/null | awk -F" = " "/^Path = /{print length($2)" "$2}" | sort -rn | head -1)
+          echo "包内最长路径: ${longest}"
+          echo "提醒：解压到 D:\\dsh 这类短路径，或使用自解压 exe / tar / 7-Zip"
           ls -lh dist
 
       - uses: actions/upload-artifact@v4
         with:
           name: dsh-desktop-windows-x64-portable
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*-portable.exe
           if-no-files-found: error
           retention-days: 30
 
