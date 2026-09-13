@@ -10,6 +10,7 @@ pub mod window;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, RunEvent};
@@ -123,6 +124,32 @@ struct Live {
 
 static LIVE: Mutex<Option<Live>> = Mutex::new(None);
 
+/// Set as soon as an exit is under way. A Harness that finishes booting afterwards is then
+/// stopped by the startup thread instead of outliving the app.
+static EXITING: AtomicBool = AtomicBool::new(false);
+
+/// Remember the supervised Harness so every exit path can stop it.
+fn adopt(pid: u32, data_dir: &Path) {
+    *LIVE.lock().unwrap() = Some(Live {
+        pid,
+        data_dir: data_dir.to_path_buf(),
+    });
+}
+
+/// Stop the supervised Harness and drop its state file. Idempotent, so every exit path may
+/// call it: window close reaches us as `ExitRequested`, while Cmd+Q / Dock Quit / `quit app`
+/// go through tao application_will_terminate and arrive as `Exit` only.
+fn shutdown() {
+    EXITING.store(true, Ordering::SeqCst);
+    let mut guard = LIVE.lock().unwrap();
+    if let Some(live) = guard.take() {
+        harness::app_log(&format!("stopping Harness pid {}", live.pid));
+        process::terminate(live.pid, TERMINATE_GRACE);
+        process::clear_state(&live.data_dir);
+        harness::app_log("Harness stopped");
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -143,18 +170,10 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build dsh-desktop")
         .run(|_app, event| {
-            if let RunEvent::ExitRequested { .. } = event {
+            if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
                 shutdown();
             }
         });
-}
-
-fn shutdown() {
-    let mut guard = LIVE.lock().unwrap();
-    if let Some(live) = guard.take() {
-        process::terminate(live.pid, TERMINATE_GRACE);
-        process::clear_state(&live.data_dir);
-    }
 }
 
 fn startup(app: AppHandle) {
@@ -278,6 +297,8 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                 let url = url::Url::parse(&format!("http://127.0.0.1:{port}/"))
                     .map_err(|e| e.to_string())?;
                 window::set_status(app, "复用本应用上次启动的 Harness…", &format!("pid {pid}"));
+                // Adopted, but still ours: quitting must stop it rather than leave an orphan.
+                adopt(pid, data_dir);
                 return window::create_harness(app, &url, port).map_err(|e| e.to_string());
             }
 
@@ -385,6 +406,10 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         env: &child_env,
     };
 
+    // The window may already be closed: spawning now would leave an orphan nobody stops.
+    if EXITING.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     window::set_status(
         app,
         "正在启动 Harness…",
@@ -392,10 +417,13 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     );
     let spawned = harness::spawn(&location, &options).map_err(|e| format!("启动进程失败: {e}"))?;
     let pid = spawned.child.id();
-    *LIVE.lock().unwrap() = Some(Live {
-        pid,
-        data_dir: data_dir.to_path_buf(),
-    });
+    adopt(pid, data_dir);
+    // Both sides use SeqCst, so either this thread sees the exit flag or `shutdown` sees the
+    // freshly registered pid: the Harness cannot slip past the app exit unnoticed.
+    if EXITING.load(Ordering::SeqCst) {
+        shutdown();
+        return Ok(());
+    }
 
     // A profile that does not exist yet is initialised on first use, which is slower
     // (measured ~4s on a warm machine, but plugin installs can take much longer).

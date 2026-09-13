@@ -100,12 +100,32 @@ fn signal_pid(pid: u32, _signal: TermSignal) -> bool {
 #[cfg(unix)]
 fn kill_signal(pid: u32, signal: Option<TermSignal>) -> bool {
     let sig = match signal {
-        None => 0,
+        None => return pid_alive(pid),
         Some(TermSignal::Term) => libc::SIGTERM,
         Some(TermSignal::Kill) => libc::SIGKILL,
     };
     // Negative pid targets the process group created by `process_group(0)`.
     unsafe { libc::kill(-(pid as i32), sig) == 0 || libc::kill(pid as i32, sig) == 0 }
+}
+
+/// True while the pid is a running process.
+///
+/// The plain `kill(pid, 0)` probe is not enough: it also succeeds for a zombie, and a child of
+/// ours stays one until it is reaped. The supervised Harness is our child, so probing with the
+/// signal alone would report "still running" for the whole grace period and turn every quit
+/// into a fixed multi-second wait. `waitpid` settles that case; anything that is not our child
+/// (leftovers from an earlier run, foreign instances) falls back to the signal probe.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    let mut status = 0;
+    let reaped = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+    if reaped == pid as i32 {
+        false
+    } else if reaped == 0 {
+        true
+    } else {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
 }
 
 #[cfg(windows)]
@@ -132,6 +152,41 @@ fn restrict(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_stops_a_spawned_process_group() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        // Same shape as the supervised Harness: own process group, silent stdio.
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(is_alive(pid));
+
+        let started = Instant::now();
+        assert!(
+            terminate(pid, Duration::from_secs(3)),
+            "terminate must report success"
+        );
+        assert!(!is_alive(pid), "pid {pid} must be gone after terminate");
+        // A child that exited but was never reaped used to look alive for the whole grace
+        // period, so quit always took the full timeout. SIGTERM must settle this fast.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "terminate waited for a zombie: {:?}",
+            started.elapsed()
+        );
+        let _ = child.wait();
+    }
 
     #[test]
     fn state_round_trip() {

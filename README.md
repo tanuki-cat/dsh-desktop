@@ -20,7 +20,9 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - 输出：持续读 stdout/stderr、token 脱敏写日志（5MB 轮转）、200 行环缓冲用于错误页
 - URL：解析首个 token（对 `(LAN: ...)` 后缀健壮）、首启 90s / 常态 30s 超时
 - 实例：固定端口；探测 → 复用自己上次的实例 / 接管外部 Harness / 占用时错误页
-- 生命周期：关闭窗口即退出并 SIGTERM 进程组（5s 后 SIGKILL）、state.json（0600）+ 崩溃残留自愈
+- 生命周期：退出即 SIGTERM 进程组（5s 后 SIGKILL）并删除 state.json —— 关闭窗口（`RunEvent::ExitRequested`）
+  与 ⌘Q / Dock 退出（`RunEvent::Exit`）两条事件链都处理；复用的上次实例也登记，退出时一并停掉
+- 残留自愈：只有强杀/崩溃这类拿不到回调的场景才靠下次启动清理（state.json 0600 + 存活校验）
 - 安全：Harness 窗口零 capability、导航限定当次 authority、外链与 `window.open` 交系统浏览器
 - 下载：`on_download` 落盘到 `~/Downloads`；附件上传由 wry 的 `runOpenPanel` 原生处理
 - **dsh 核心升级**：每次启动查 registry（默认取 `latest`+`next` 最高版本），有新版就装并重启实例；
@@ -31,9 +33,13 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 
 - 实机（2026-09-13，macOS）：接管外部 Harness → 自启并拿到 token URL → WebView 内 token→cookie 成功，
   会话列表/文件卡片/输入框正常渲染；`state.json` 与端口监听者一致；日志 0 行明文 token。
-- 离线测试：`cargo test` **24 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析、
+- 退出路径实机复现（2026-09-13，macOS）：⌘Q 等价的 Apple Event 退出后，日志出现
+  `stopping Harness pid 92619` / `Harness stopped`，3080 端口释放、`state.json` 删除；
+  修复前只处理红点关闭（`ExitRequested`），⌘Q 走的是 `RunEvent::Exit`，清理从未执行。
+- 离线测试：`cargo test` **25 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析、
   6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、缓存落盘往返、
-  npm PATH 前缀、沉默对端探针超时、package.json 版本解析、部分/损坏 config.json 处理）。
+  npm PATH 前缀、沉默对端探针超时、package.json 版本解析、部分/损坏 config.json 处理、
+  进程组终止与僵尸进程识别）。
 - 更新链路的失败证据也来自实机日志：修复前每次 GUI 启动都记 `npm view 失败: env: node: No such file or directory`
   （见设计文档 §13.8）。
 - 联网测试：`make test-live` → registry head = 0.1.5-rc.2 且不降级；**冷查询 1168–1217 ms → 缓存命中 0 ms**。
@@ -140,7 +146,11 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | 启动前发现新版 dsh | 先升级 CLI（splash 显示进度），随后重启实例跑新版本 |
 | 端口被别的程序占用 | 错误页，提示改 `config.json` 的端口 |
 | `take_over_existing: false` 且是外部 Harness | 不接管：用系统浏览器打开并给出说明 |
-| 关闭窗口 / Cmd+Q | SIGTERM 进程组 → 5s → SIGKILL，并清理状态文件 |
+| 关闭窗口（红点 / ⌘W） | `AppHandle::exit(0)` → `RunEvent::ExitRequested` → SIGTERM 进程组 → 删状态文件 |
+| ⌘Q / Dock 退出 / `quit app` | tao `application_will_terminate` → `RunEvent::Exit` → 同样的清理（幂等） |
+| 退出发生在 Harness 启动途中 | `EXITING` 标志：刚起来的子进程立即停掉，不会漏成孤儿 |
+| 复用上次实例后退出 | 该实例已登记，退出时照样 SIGTERM（旧行为不登记 → 留孤儿） |
+| 强杀（SIGKILL）/ 崩溃 | 拿不到任何回调，只能靠下次启动自愈清理 |
 | 壳被强杀后再次启动 | 读取 state.json 自愈清理残留进程 |
 
 > 为什么必须接管：启动 URL 里的 launch token 是 `randomBytes(32)` 且只存在于那个进程内存中，外部无法取得；

@@ -520,3 +520,50 @@ npm registry**。实测各环节：
 先断言裸调 npm 退出码为 **127**（前提成立），再断言 `update::check` 能正常拿到 registry head。
 实测输出：`premise confirmed: plain npm exits Some(127) without node on PATH` → `live registry head = 0.1.5-rc.2 with PATH=/nonexistent-bin`。
 `make test-live` 相应改为跑全部联网测试（原先是只跑 `--test update_live`）。
+
+### 13.9 修复：退出应用不终止 Harness（2026-09-13）
+
+**现象**：退出桌面壳后 `dsh web` 仍在运行、`state.json` 仍存在，下次启动才由"自愈"路径清理。
+等于把自愈当成了正常退出路径。
+
+**根因（读框架源码定位）**：macOS 上退出有两条不同的事件链，壳只处理了其中一条。
+
+| 退出方式 | tao / Tauri 事件链 | 旧代码 |
+|---|---|---|
+| 窗口红点 / ⌘W（`on_window_event(CloseRequested)` → `AppHandle::exit(0)`） | `Message::RequestExit` → `RunEvent::ExitRequested` | ✅ 已处理 |
+| ⌘Q / Dock 退出 / `quit app`（`application_will_terminate` → `AppState::exit()`） | `Event::LoopDestroyed` → `RunEvent::Exit` | ❌ 未处理 |
+
+- Tauri 只在 `Message::RequestExit` 分支里发 `ExitRequested`（`tauri-runtime-wry/src/lib.rs:4354`）；
+  `application_will_terminate`（`tao/src/platform_impl/macos/app_delegate.rs:131`）只产生 `LoopDestroyed`，
+  它映射为 `RunEvent::Exit`（`tauri-runtime-wry/src/lib.rs:4185`）。
+- 结论：⌘Q 退出时 `shutdown()` 从未执行 —— 与"日志里只有启动没有停止、state.json 残留"完全一致。
+
+**顺带查出的第二个 bug（僵尸进程）**：`is_alive()` 用 `kill(pid, 0)` 判断存活，而**自己 fork 的子进程
+在退出后、被回收前是僵尸**，`kill(pid, 0)` 对僵尸同样成功。即使 `shutdown()` 跑起来，
+也会把 5 s grace 用满再发 SIGKILL —— 表现为"关窗口后应用卡 5 秒"。现在 unix 下先用
+`waitpid(WNOHANG)` 探（本进程的子进程会被就地回收），非本进程的子进程（上次残留、外部实例）才回退到 `kill(pid, 0)`。
+
+**实现**：
+
+- `.run()` 同时处理 `RunEvent::ExitRequested` 与 `RunEvent::Exit`；`shutdown()` 幂等，重复触发无副作用；
+- 新增 `EXITING: AtomicBool`：退出瞬间置位，启动线程在 spawn 前后各查一次（两侧都是 SeqCst，
+  因此"启动线程登记的 pid"与"退出线程取走的 pid"不可能互相漏掉）。窗口在启动途中被关掉时，
+  刚起来的 Harness 会被立即停掉，而不是漏成孤儿；
+- 复用上次实例（`state.json` pid 命中且存活）时也登记进 `LIVE`（`adopt()`）：这条路径此前完全不登记，
+  所以"复用后退出"必然留孤儿；
+- 停掉 Harness 时写日志 `stopping Harness pid N` / `Harness stopped`，让退出行为可观测。
+
+**验证**：
+
+- 新增单测 `terminate_stops_a_spawned_process_group`：真起一个独立进程组的 `sh -c "sleep 30"`，
+  断言 SIGTERM 后进程消失且耗时 < 2 s（防僵尸回归）。
+- 实机复现（macOS）：强杀旧实例 → 启动新构建（harness pid 92619）→ 用与 ⌘Q 等价的 Apple Event 退出，
+  应用日志：
+
+      [dsh-desktop] stopping Harness pid 92619
+      [dsh-desktop] Harness stopped
+
+  退出后 3080 端口释放、`state.json` 被删除；重新启动得到新 pid（92700）。
+  修复前的形态（日志只有启动、无 stopping、state.json 残留）不再出现。
+
+**仍只能靠自愈的场景**：SIGKILL 强杀、崩溃、断电 —— 任何回调都拿不到，下次启动按原有自愈路径清理。
