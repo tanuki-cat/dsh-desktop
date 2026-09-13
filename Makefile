@@ -146,3 +146,67 @@ clean:
 
 distclean: clean
 	rm -rf node_modules .pnpm-store .cargo-home $(TAURI_DIR)/gen
+# ---------------------------------------------------------------- 自带运行时（方案 §5）
+# 目标：在没有 node / dsh 的机器上双击即用。
+#   make runtime-fetch    下载官方 Node 并校验 SHASUMS256.txt
+#   make runtime-stage    组装 src-tauri/runtime/{node,dsh-prefix,tools,profile-template,THIRD-PARTY-NOTICES.md}
+#   make bundle-bundled   runtime-stage + 打包（.app 会带上整套运行时，约 490 MB）
+#   make runtime-clean    回收 staging 与下载缓存
+# staging 必须按平台各自执行：dsh 树里有平台相关的原生模块。
+NODE_VERSION      ?= 22.23.2
+DSH_VERSION       ?= 0.1.5-rc.2
+PNPM_VERSION      ?= 12.3.4
+DSHMARKET_VERSION ?= 1.45.1
+RUNTIME_DIR       := $(TAURI_DIR)/runtime
+RUNTIME_CACHE     := .runtime-cache
+NODE_ARCH         := $(shell uname -m | sed -e s/arm64/arm64/ -e s/aarch64/arm64/ -e s/x86_64/x64/)
+ifeq ($(PLATFORM),macos)
+NODE_OS           := darwin
+NODE_TARBALL      := node-v$(NODE_VERSION)-darwin-$(NODE_ARCH).tar.gz
+else
+NODE_OS           := linux
+NODE_TARBALL      := node-v$(NODE_VERSION)-linux-$(NODE_ARCH).tar.xz
+endif
+NODE_DIST_NAME    := node-v$(NODE_VERSION)-$(NODE_OS)-$(NODE_ARCH)
+NODE_BASE_URL     := https://nodejs.org/dist/v$(NODE_VERSION)
+NODE_BIN          := $(abspath $(RUNTIME_DIR))/node/bin
+
+runtime-fetch:
+	@mkdir -p $(RUNTIME_CACHE)
+	@if [ ! -f $(RUNTIME_CACHE)/$(NODE_TARBALL) ]; then \
+		echo "下载 $(NODE_TARBALL)"; \
+		curl -fsSL -o $(RUNTIME_CACHE)/$(NODE_TARBALL) $(NODE_BASE_URL)/$(NODE_TARBALL); \
+	fi
+	@curl -fsSL -o $(RUNTIME_CACHE)/SHASUMS256.txt $(NODE_BASE_URL)/SHASUMS256.txt
+	@cd $(RUNTIME_CACHE) && grep " $(NODE_TARBALL)$$" SHASUMS256.txt > .expected \
+		&& (shasum -a 256 -c .expected 2>/dev/null || sha256sum -c .expected) && rm -f .expected
+	@echo "已校验 $(NODE_TARBALL)（SHASUMS256.txt）"
+
+runtime-stage: runtime-fetch
+	@echo "组装 $(RUNTIME_DIR) …"
+	@rm -rf $(RUNTIME_DIR)/node $(RUNTIME_DIR)/dsh-prefix $(RUNTIME_DIR)/tools $(RUNTIME_DIR)/profile-template
+	@rm -rf $(RUNTIME_CACHE)/unpacked && mkdir -p $(RUNTIME_CACHE)/unpacked $(RUNTIME_DIR)
+	@tar -xf $(RUNTIME_CACHE)/$(NODE_TARBALL) -C $(RUNTIME_CACHE)/unpacked
+	@mv $(RUNTIME_CACHE)/unpacked/$(NODE_DIST_NAME) $(RUNTIME_DIR)/node
+	@echo "安装 dsh $(DSH_VERSION) 到 dsh-prefix …"
+	@PATH="$(NODE_BIN):$$PATH" $(RUNTIME_DIR)/node/bin/npm install -g --prefix $(RUNTIME_DIR)/dsh-prefix \
+		--cache $(RUNTIME_CACHE)/npm --no-fund --no-audit --loglevel=error @deepseek-ai/dsh@$(DSH_VERSION)
+	@echo "安装 pnpm $(PNPM_VERSION) 到 tools …"
+	@PATH="$(NODE_BIN):$$PATH" $(RUNTIME_DIR)/node/bin/npm install -g --prefix $(RUNTIME_DIR)/tools \
+		--cache $(RUNTIME_CACHE)/npm --no-fund --no-audit --loglevel=error pnpm@$(PNPM_VERSION)
+	@echo "生成 profile 模板（含插件市场 dshmarket@$(DSHMARKET_VERSION)）…"
+	@PATH="$(NODE_BIN):$$PATH" PNPM_STORE_DIR="$(abspath $(RUNTIME_CACHE))/pnpm-store" \
+		sh scripts/make-profile-template.sh \
+		"$(RUNTIME_DIR)/profile-template" "$(DSHMARKET_VERSION)" "$(RUNTIME_DIR)/tools/bin"
+	@xattr -cr $(RUNTIME_DIR) 2>/dev/null || true
+	@$(PYTHON) scripts/write_third_party_notices.py "$(RUNTIME_DIR)" "$(NODE_VERSION)" "$(DSH_VERSION)" "$(PNPM_VERSION)" "$(DSHMARKET_VERSION)"
+	@sh scripts/check-runtime-stage.sh "$(RUNTIME_DIR)"
+	@du -sh $(RUNTIME_DIR) 2>/dev/null || true
+
+# 打包"无需预装 node/dsh"的版本：bundle.resources 会把 runtime/ 一起塞进 .app
+bundle-bundled: runtime-stage
+	@$(MAKE) --no-print-directory bundle
+
+runtime-clean:
+	rm -rf $(RUNTIME_CACHE) $(RUNTIME_DIR)/node $(RUNTIME_DIR)/dsh-prefix $(RUNTIME_DIR)/tools $(RUNTIME_DIR)/profile-template $(RUNTIME_DIR)/THIRD-PARTY-NOTICES.md
+	@echo "已回收 staging 与下载缓存（src-tauri/runtime/README.md 保留）"

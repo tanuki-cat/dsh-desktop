@@ -3,6 +3,7 @@
 pub mod harness;
 pub mod locator;
 pub mod process;
+pub mod runtime;
 pub mod shellenv;
 pub mod update;
 pub mod window;
@@ -56,6 +57,11 @@ pub struct Config {
     /// running it and failing in a confusing way. Off by default: we warn and continue.
     #[serde(default)]
     pub require_tested_dsh: bool,
+    /// Which runtime to supervise: `auto` (use an installed one when it passes the gates,
+    /// otherwise the bundled halves), `bundled` (always the shipped runtime) or `system`
+    /// (pre-bundled behaviour, for development).
+    #[serde(default)]
+    pub runtime: runtime::Preference,
 }
 
 fn default_port() -> u16 {
@@ -115,6 +121,7 @@ impl Config {
             import_shell_env: true,
             env: BTreeMap::new(),
             require_tested_dsh: false,
+            runtime: runtime::Preference::Auto,
         };
         let _ = std::fs::create_dir_all(data_dir);
         if !path.exists() {

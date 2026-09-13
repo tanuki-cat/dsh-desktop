@@ -6,6 +6,12 @@ node_modules/
 # staged bundled runtime: keep the marker, ignore the payload
 src-tauri/runtime/*
 !src-tauri/runtime/README.md
+
+# downloaded node tarball + unpacked staging area
+.runtime-cache/
+
+# python bytecode from the staging helper scripts
+__pycache__/
 src-tauri/gen/
 
 # icon artwork scratch space

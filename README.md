@@ -79,6 +79,10 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 | `make run` | 构建后启动 | macOS 用 `open` 打开打包产物；Linux 直接跑 release 二进制 |
 | `make icons` | 由 `icon.png` 重生成 `icon.icns` | 仅 macOS（`sips` + `iconutil`）；Linux 打包直接用 png |
 | `make icon-art` | 由 `src-tauri/icons/make_icon.py` 重绘 `icon.png` | 自绘小黑鲸，需 `python3` + Pillow；改设计改脚本，不要手改 png |
+| `make runtime-fetch` | 下载官方 Node 并按 `SHASUMS256.txt` 校验 | 缓存到 `.runtime-cache/`（48 MB，可复用） |
+| `make runtime-stage` | 组装 `src-tauri/runtime/`：Node + dsh 树 + pnpm + profile 模板 + 许可清单 | 约 **520 MB**；含悬空链接/quarantine/必需文件校验 |
+| `make bundle-bundled` | `runtime-stage` + 打包 | 产出**无需预装 node/dsh** 的 `.app`（约 598 MB），本机实测可跑 |
+| `make runtime-clean` | 回收 staging 与下载缓存 | 保留 `runtime/README.md` |
 | `make clean` | 清理构建产物 | `cargo clean` |
 | `make distclean` | 连依赖缓存一起清理 | 额外删 `node_modules`、`.pnpm-store`、`.cargo-home`、`src-tauri/gen` |
 
@@ -97,11 +101,20 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
   **WebKitGTK 仍来自系统**（见后续实施计划）。
 - `make test-live` 与首次 `make bundle` 需要网络（查 registry / 拉 Tauri CLI）。
 
-### 规划中的目标（自带运行时，尚未实现）
+### 自带运行时（进行中）
 
-`runtime-fetch`（下载官方 Node 并按 `SHASUMS256.txt` 校验）、`runtime-stage`（组装 `src-tauri/runtime/`：
-Node + dsh 树 + pnpm + 许可文件）、`runtime-clean`（回收约 475 MB staging）——见
-[后续实施计划](#后续实施计划自带运行时无需预装-nodedsh) 与方案文档 §5。
+已完成并可实机复现（`feat/bundled-runtime` 分支，暂不与 main 合并）：
+
+- `make runtime-fetch / runtime-stage / runtime-clean / bundle-bundled` 四个目标全部跑通；
+- staging 自带校验：必需文件、**悬空符号链接**（会让 `tauri build` 失败）、**quarantine 属性**（会带进 .app）；
+- profile 模板由真 pnpm 生成（含插件市场 dshmarket，见方案 §2.5）；
+- 实测：`env -i PATH=/usr/bin:/bin` 下自带 node 跑自带 dsh → `0.1.5-rc.2`；
+  全新 DSH_HOME + 模板播种 → `dsh web` **6 秒**出 URL、stderr 干净、`.dsh-market` 出现；
+- 实测：`make bundle-bundled` 产出 598 MB 的 `.app`，包内 node 可直接执行、31,090 个文件。
+
+尚未接入：运行时解析已实现为纯策略（`src-tauri/src/runtime.rs` + `runtime` 配置项，含 6 个单测），
+但**还没有接进启动流程**（seed 路径解析、首启播种 profile、PATH 注入、更新落点改到 app-data、签名）。
+细节见[方案文档](docs/design-task-feat-dsh-bundled-runtime.md) §20。
 
 运行时（当前版本）需要系统中已有 `dsh` 与 `node`。
 
@@ -129,6 +142,7 @@ Node + dsh 树 + pnpm + 许可文件）、`runtime-clean`（回收约 475 MB sta
 | `update_check_interval_minutes` | `60` | 一次成功的查询结果缓存多久（0 = 每次启动都查）。查询实测约 1.2–1.9 s，缓存命中 0 ms |
 | `import_shell_env` | `true` | 启动时导入登录 shell 的环境变量（见下节）。`false` 则只用 App 自身环境 |
 | `require_tested_dsh` | `false` | CLI 版本落在已测试区间外时是否拒绝启动。默认只告警并继续（状态页标注「未测试版本」） |
+| `runtime` | `"auto"` | 运行时来源：`auto` 用系统已装的（通过门槛时），否则用自带；`bundled` 强制自带；`system` 保持旧行为（开发用） |
 | `env` | `{}` | 显式追加/覆盖传给 harness 的环境变量，优先级最高，如 `{"DEEPSEEK_API_KEY": "sk-…"}` |
 
 只要写你想改的字段即可：`port` / `workspace` 缺失会取默认值，其余字段本就有默认值。

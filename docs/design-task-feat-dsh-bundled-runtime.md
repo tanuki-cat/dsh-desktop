@@ -638,3 +638,50 @@ make runtime-clean     # 清理 staging（约 475MB）
 - 启动：`dsh web` **4 秒**输出 URL、stderr 为空、无模块解析错误，profile 内出现 `.dsh-market/`（市场已加载）。
 
 **未验证**：断网首启（§12 仍列为验收项）、从市场实际安装一个第三方插件的端到端链路。
+
+## 20. 实施进展（P1 第一步，2026-09-13，分支 `feat/bundled-runtime`）
+
+本轮把方案 P1 里"能独立验证的部分"先做掉，全部在本机真跑过。**未合并到 main**：
+自带运行时会改变发行方式，等解析接入与签名验收完成后再决定合并时机。
+
+### 20.1 已完成
+
+| 项 | 内容 | 验证 |
+|---|---|---|
+| 运行时解析策略 | 新增 `src-tauri/src/runtime.rs`：来源（Env/Seed/Shadow/System）、§2.4 的四格矩阵、
+  seed↔shadow 版本仲裁、更新落点（系统运行时 → 只提示） | 6 个单测（共 35 passed）、clippy 0 warning |
+| 配置项 | `config.json` 新增 `runtime: auto\|bundled\|system`（默认 auto） | 部分配置照常解析 |
+| `make runtime-fetch` | 按 uname 选发行版、下载、**按 SHASUMS256.txt 校验**、缓存到 `.runtime-cache/` | 实测 48 MB / 6.5 s，校验输出 `OK` |
+| `make runtime-stage` | 解包 Node → `dsh-prefix`（`npm install -g --prefix`）→ `tools`（pnpm）→ profile 模板 → 许可清单 → 校验 | 实测 **520 MB**、22 s（缓存热） |
+| profile 模板 | `scripts/make-profile-template.sh`：真 pnpm 生成含 dshmarket 的 profile（§2.5） | 模板内 dshmarket 1.45.1 + lockfile 齐全 |
+| staging 校验 | `scripts/check-runtime-stage.sh`：必需文件 + **悬空链接** + **quarantine** + 版本回显 | 实测通过对；此前探针已证明这两类问题会让构建失败/被 Gatekeeper 拦 |
+| 许可清单 | `scripts/write_third_party_notices.py`：扫描 dsh 依赖树与模板，汇总 name@version + license | 生成 `THIRD-PARTY-NOTICES.md`，UNKNOWN 条目 0 |
+| `make bundle-bundled` | staging + 打包，`bundle.resources` 把 runtime/ 塞进 .app | 产出 **598 MB** .app，31,090 文件，包内 node 可直接执行 |
+
+### 20.2 关键实测（决定后续实现方式）
+
+1. **无系统 node 也能跑**：`env -i PATH=/usr/bin:/bin` + 自带 node + 自带 dsh → `0.1.5-rc.2`；
+2. **离线首启形态成立**：全新 DSH_HOME + 模板播种 + 只用自带运行时 → `dsh web` **6 秒**输出 URL、stderr 干净、
+   `.dsh-market/` 出现（插件市场已加载）；
+3. **`npm install --prefix` 不带 `-g` 是错的**：会装成 `<prefix>/node_modules` 局部布局，
+   而 dsh 与壳都按全局布局 `<prefix>/lib/node_modules` 找包 —— staging 必须写 `-g --prefix`；
+4. **构建期缓存要独立**：staging 的 npm/pnpm 都改用 `.runtime-cache/` 下的 store（CI 可复用、不碰用户缓存）；
+5. 打包耗时：31k 文件的资源复制 + 构建 ≈ **47 s**，磁盘峰值约 1.1 GB（staging 520 MB + bundle 复制一份）。
+
+### 20.3 尚未接入（P1 剩余）
+
+- **接进启动流程**：`resource_dir()/runtime` 解析、按 `runtime.rs` 的决策选 node/dsh、日志与状态页显示来源与版本；
+- **首启播种 profile**（§2.5）：`$DSH_HOME/profiles/web` 不存在时复制 `profile-template`；
+- **PATH 与全局安装落点**（§5/§18.2）：按来源区分 PATH 顺序 + 注入 `npm_config_prefix`/`PNPM_HOME` 指向 app-data；
+- **更新落点改到 app-data**（§18.1 H1：`install_prefix` 必须可被运行时来源覆盖，否则会写只读 bundle）；
+- **平台矩阵**：`bundle.macOS.minimumSystemVersion` 提到 11.0（§18.1 H2）；Linux 侧 staging 尚未跑过；
+- **签名与公证**（§7）：需要 Developer ID；本轮产物未签名。
+
+### 20.4 复现命令
+
+```bash
+git checkout feat/bundled-runtime
+make runtime-fetch && make runtime-stage        # 约 520 MB，21 s（缓存热）
+make bundle-bundled                             # 产出带运行时的 .app（约 598 MB）
+make runtime-clean                              # 回收
+```
