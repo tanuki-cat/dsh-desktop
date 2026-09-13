@@ -140,6 +140,23 @@ endif
 icon-art:
 	$(PYTHON) $(TAURI_DIR)/icons/make_icon.py $(TAURI_DIR)/icons/icon.png 1024
 	@$(MAKE) --no-print-directory icons
+	@$(MAKE) --no-print-directory icon-ico
+
+# Windows 目标的 exe 资源需要 .ico（tauri-build 在 Windows target 下强制要求）
+icon-ico:
+	@cd $(TAURI_DIR)/icons && $(PYTHON) make_ico.py icon.ico icon.png
+
+# 实验性：交叉编译 Windows 可执行文件（只能出裸 exe：NSIS/MSI 需要在 Windows 上打包）
+#   前置：brew install mingw-w64 且 rustup target add x86_64-pc-windows-gnu
+#   注意：Windows 专用的进程监管/退出清理语义尚未实现正确（见方案文档），且自带运行时
+#         必须按平台单独 staging —— 否则会把别的平台的运行时打进包里。
+WINDOWS_TARGET ?= x86_64-pc-windows-gnu
+windows:
+	@if [ -e $(RUNTIME_DIR)/node/bin/node ] && [ ! -e $(RUNTIME_DIR)/node/bin/node.exe ]; then \
+		echo "警告：$(RUNTIME_DIR)/ 里是别的平台的运行时，会被一起打进 Windows 包；先 make runtime-clean" >&2; \
+	fi
+	$(CARGO_ENV) $(PNPM) tauri build --target $(WINDOWS_TARGET) --no-bundle
+	@echo "产物: $(TAURI_DIR)/target/$(WINDOWS_TARGET)/release/dsh-desktop.exe"
 
 clean:
 	$(CARGO_ENV) $(CARGO) clean --manifest-path $(MANIFEST)
