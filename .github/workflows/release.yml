@@ -1,0 +1,209 @@
+name: release
+
+# 由 release tag（v*，例如 v0.1.0）触发：构建 macOS / Linux 产物并附到同名 GitHub Release。
+# 手动触发（workflow_dispatch）只构建并上传 workflow artifact，不创建 Release。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preflight:
+    name: preflight
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验 tag 与各清单版本一致
+        id: check
+        run: |
+          set -euo pipefail
+          version=$(jq -r .version src-tauri/tauri.conf.json)
+          cargo_version=$(grep -m1 "^version" src-tauri/Cargo.toml | tr -d " " | cut -d= -f2 | tr -d "\"")
+          node_version=$(jq -r .version package.json)
+          echo "tauri.conf.json=$version  Cargo.toml=$cargo_version  package.json=$node_version"
+          [ "$version" = "$cargo_version" ] || { echo "::error::Cargo.toml 与 tauri.conf.json 版本不一致"; exit 1; }
+          [ "$version" = "$node_version" ] || { echo "::error::package.json 与 tauri.conf.json 版本不一致"; exit 1; }
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与清单版本 v${version} 不一致，请先改版本号再打 tag"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build ${{ matrix.suffix }}
+    needs: preflight
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false        # 一个平台失败不影响其它平台的产物
+      matrix:
+        include:
+          - os: macos-14          # Apple Silicon
+            suffix: macos-arm64
+            bundles: app
+            timeout: 60
+          # Intel 构建：macos-13 是最后一个 x64 托管镜像；若它下线，改为
+          #   os: macos-14 + 在打包前加 rustup target add x86_64-apple-darwin
+          #   并给 tauri build 传 --target x86_64-apple-darwin
+          - os: macos-13          # Intel
+            suffix: macos-x64
+            bundles: app
+            timeout: 60
+          - os: ubuntu-22.04
+            suffix: linux-x64
+            bundles: deb
+            timeout: 45
+          # arm64 runner 对公开仓库可用；若你的计划里没有，删掉下面这一项即可
+          - os: ubuntu-24.04-arm
+            suffix: linux-arm64
+            bundles: deb
+            timeout: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Linux 系统依赖（WebKitGTK 等）
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev build-essential curl wget file patchelf \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: pnpm/action-setup@v4      # 版本取自 package.json 的 packageManager
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.suffix }}
+
+      - name: 工具链自检
+        run: make doctor
+
+      - name: 格式、lint 与测试（发布门禁）
+        run: |
+          set -euo pipefail
+          make fmt
+          git diff --exit-code    # 格式不对就报错，避免带着未格式化的代码发版
+          make clippy
+          make test
+
+      - name: 打包
+        env:
+          BUNDLE_TARGETS: ${{ matrix.bundles }}
+        run: |
+          set -euo pipefail
+          make bundle BUNDLE_TARGETS="$BUNDLE_TARGETS"
+
+      - name: 整理 macOS 产物
+        if: runner.os == 'macOS'
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          set -euo pipefail
+          app="src-tauri/target/release/bundle/macos/DSH Desktop.app"
+          [ -d "$app" ] || { echo "::error::找不到 $app"; exit 1; }
+          mkdir -p dist
+          out="dist/dsh-desktop_${VERSION}_${SUFFIX}.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$out"
+          (cd dist && shasum -a 256 ./*.zip | sed "s|\./||" > "SHA256SUMS-${SUFFIX}")
+
+      - name: 整理 Linux 产物
+        if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          debs=(src-tauri/target/release/bundle/deb/*.deb)
+          [ ${#debs[@]} -gt 0 ] || { echo "::error::没有产出 .deb"; exit 1; }
+          for deb in "${debs[@]}"; do
+            cp "$deb" "dist/dsh-desktop_${VERSION}_${SUFFIX}.deb"
+          done
+          (cd dist && sha256sum ./*.deb | sed "s|\./||" > "SHA256SUMS-${SUFFIX}")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-desktop-${{ matrix.suffix }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: publish release
+    needs: [preflight, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 汇总校验和
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          cat SHA256SUMS-* > SHA256SUMS
+          rm -f SHA256SUMS-*
+
+      - name: 创建/更新 Release 并上传产物
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 引号版 heredoc：正文里的 Markdown 反引号不会被 bash 当成命令替换执行，
+          # 版本号用占位符替换（避免在这里做 shell 展开）。
+          cat > notes.md <<'MD'
+          ## DSH Desktop v__VERSION__
+
+          下载对应平台的产物即可。**当前版本需要机器已安装 node 与 dsh** —— 自带运行时的发行版仍在实施中，见 README 的"后续实施计划"。
+
+          | 平台 | 产物 |
+          |---|---|
+          | macOS arm64 | dsh-desktop___VERSION___macos-arm64.app.zip |
+          | macOS x64 | dsh-desktop___VERSION___macos-x64.app.zip |
+          | Linux x64 | dsh-desktop___VERSION___linux-x64.deb |
+          | Linux arm64 | dsh-desktop___VERSION___linux-arm64.deb |
+
+          > ⚠️ 这些构建**未签名也未公证**：macOS 首次打开请右键 →「打开」，或执行
+          > xattr -dr com.apple.quarantine "/Applications/DSH Desktop.app"。Linux 上 WebKitGTK 仍来自系统。
+
+          校验：shasum -a 256 -c SHA256SUMS（Linux 用 sha256sum -c SHA256SUMS）。
+
+          安装：macOS 解压后把 DSH Desktop.app 拖进「应用程序」；
+          Linux sudo apt install ./dsh-desktop___VERSION___linux-x64.deb。
+          MD
+          sed -i.bak "s|__VERSION__|${VERSION}|g" notes.md && rm -f notes.md.bak   # GNU/BSD sed 都可用
+          head -5 notes.md
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes-file notes.md
+          gh release upload "$TAG" dist/* --clobber
+          gh release view "$TAG" --json url --jq .url

@@ -230,6 +230,40 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
 `icon.png` 由 `src-tauri/icons/make_icon.py` 自绘生成（矢量路径 + 4× 超采样，非官方素材）。当前**未签名**：
 本机可运行；分发给别人需要 Developer ID 签名 + 公证（`codesign` / `notarytool`）。
 
+## 发布（GitHub Actions）
+
+编排文件：`.github/workflows/release.yml`。
+
+**触发**：推送形如 `v0.1.0` 的 tag（`on.push.tags: v*`）→ 构建并把产物附到同名 Release；
+也可在 Actions 页面手动 `workflow_dispatch`（只产出 workflow artifact，不创建 Release）。
+
+**矩阵**：
+
+| 运行器 | 平台标识 | 产物 |
+|---|---|---|
+| `macos-14` | `macos-arm64` | `dsh-desktop_<v>_macos-arm64.app.zip` |
+| `macos-13` | `macos-x64` | `dsh-desktop_<v>_macos-x64.app.zip` |
+| `ubuntu-22.04` | `linux-x64` | `dsh-desktop_<v>_linux-x64.deb` |
+| `ubuntu-24.04-arm` | `linux-arm64` | `dsh-desktop_<v>_linux-arm64.deb` |
+
+**流程**：`preflight`（校验 tag 与 `tauri.conf.json` / `Cargo.toml` / `package.json` 三处版本一致）→
+每平台 `make fmt` + `git diff --exit-code` + `make clippy` + `make test`（发布门禁）→ `make bundle` →
+打包并生成每平台 `SHA256SUMS-<suffix>` → `release` job 汇总成 `SHA256SUMS` 并 `gh release upload --clobber`（可重复运行）。
+
+**发版步骤**：
+
+```bash
+# 1) 三处版本号一起改（preflight 会拦住不一致的情况）
+#    src-tauri/tauri.conf.json、src-tauri/Cargo.toml、package.json
+# 2) 提交后打 tag 并推送
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+**校验下载**：`shasum -a 256 -c SHA256SUMS`（Linux 用 `sha256sum -c SHA256SUMS`）。
+
+**当前限制**：产物未签名、未公证（macOS 首次打开需右键 →「打开」，或 `xattr -dr com.apple.quarantine`），
+且需要机器已装 `node` 与 `dsh` —— 自带运行时的发行版仍在实施中（见下节）。
+按需扩展：把 dmg 加进 macOS 的 `bundles`（`app,dmg`）、AppImage 加进 Linux、以及签名/公证（需要证书 secrets，做法见自带运行时方案 §7）。
 ## 后续实施计划：自带运行时（无需预装 Node/dsh）
 
 目标：在**没有 Node、没有 dsh** 的机器上双击即用，且首次启动不依赖网络下载。
