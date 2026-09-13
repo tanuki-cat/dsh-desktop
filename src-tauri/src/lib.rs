@@ -107,19 +107,44 @@ pub fn usable_directory(path: &Path) -> bool {
     path.is_absolute() && !path.as_os_str().is_empty() && path.parent().is_some()
 }
 
+/// Drop a Windows verbatim prefix (`\\?\`, `\\?\UNC\`).
+///
+/// Rust's canonicalization returns verbatim paths on Windows, and the startup path resolves the
+/// seed through APIs that canonicalize — logged as `\\?\D:\…\node.exe` and `\\?\D:\…\bin.js`.
+/// Win32 file APIs accept them, but anything that *parses* one breaks: node's `fs.realpathSync`
+/// walked `\\?\D:\…` component-wise and died on `lstat 'D:'` (`EISDIR: illegal operation on a
+/// directory`) before the CLI ever started. The prefix exists to exceed MAX_PATH, so it is only
+/// dropped while the path still fits.
+pub(crate) fn unverbatim(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        let stripped = match text.strip_prefix(r"\\?\UNC\") {
+            Some(rest) => Some(format!(r"\\{rest}")),
+            None => text.strip_prefix(r"\\?\").map(str::to_string),
+        };
+        if let Some(stripped) = stripped {
+            if stripped.len() < 260 {
+                return PathBuf::from(stripped);
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
 /// Resolve a path against the app's own working directory.
 ///
 /// Every path we hand to the Harness must be absolute: it becomes either the child's working
 /// directory or an argv entry, and Windows resolves a relative one (a bare `PATH` entry, a
-/// drive-relative `D:tools`) against the *child's* directory instead. That mismatch is how
-/// node ended up resolving its own main module to `D:` (`EISDIR: lstat 'D:'`).
+/// drive-relative `D:tools`) against the *child's* directory instead.
 fn absolute(path: &Path) -> PathBuf {
+    let path = unverbatim(path);
     if path.is_absolute() {
-        return path.to_path_buf();
+        return path;
     }
     std::env::current_dir()
-        .map(|cwd| cwd.join(path))
-        .unwrap_or_else(|_| path.to_path_buf())
+        .map(|cwd| cwd.join(&path))
+        .unwrap_or(path)
 }
 
 fn default_import_shell_env() -> bool {
@@ -382,7 +407,10 @@ fn seed_root_for(resources: Option<&Path>) -> Option<PathBuf> {
             candidates.push(base.join("runtime"));
         }
     }
-    candidates.into_iter().find(|dir| node_in(dir).is_some())
+    candidates
+        .into_iter()
+        .map(|dir| unverbatim(&dir))
+        .find(|dir| node_in(dir).is_some())
 }
 
 /// The node binary of a runtime directory.
@@ -491,6 +519,9 @@ fn resolve_runtime(
         seed,
     })
 }
+
+/// The login-shell capture: the shell that was run, and the variables it printed.
+type EnvCapture = std::thread::JoinHandle<(String, Option<(String, BTreeMap<String, String>)>)>;
 
 /// First launch of a bundled build: install the profile template (which carries the plugin
 /// market) into the user's DSH_HOME, unless a profile is already there (plan §2.5).
@@ -608,11 +639,30 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
 
     let config = Config::load(data_dir);
     let port = config.port;
+    // The two paths every startup failure is traced back to; cheap to log, and the only way
+    // to diagnose a machine we cannot run on.
+    harness::app_log(&format!(
+        "app data dir = {} | workspace = {}",
+        data_dir.display(),
+        config.workspace.display()
+    ));
 
     // The login-shell capture costs ~160 ms and depends on nothing that follows, so it runs
     // alongside the version lookup and update check and is joined just before the child env
     // is assembled.
-    let env_capture = config.import_shell_env.then(|| {
+    // A Windows GUI process already inherits the user's variables and has no login shell to
+    // capture; asking for `/bin/zsh` there only delayed startup and changed nothing.
+    #[cfg(windows)]
+    let env_capture: Option<EnvCapture> = {
+        if config.import_shell_env {
+            harness::app_log(
+                "使用应用环境：Windows 的 GUI 进程已继承用户环境，无登录 shell 可捕获",
+            );
+        }
+        None
+    };
+    #[cfg(not(windows))]
+    let env_capture: Option<EnvCapture> = config.import_shell_env.then(|| {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         std::thread::spawn(move || {
             let imported = shellenv::import(Path::new(&shell));
@@ -859,8 +909,22 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
             prefix.push(seed.join("tools").to_string_lossy().to_string());
         }
     }
-    prefix.push("/opt/homebrew/bin".to_string());
-    prefix.push("/usr/local/bin".to_string());
+    #[cfg(target_os = "macos")]
+    {
+        // A macOS GUI app inherits launchd's PATH; Homebrew lives here.
+        prefix.push("/opt/homebrew/bin".to_string());
+        prefix.push("/usr/local/bin".to_string());
+    }
+    #[cfg(windows)]
+    {
+        // A launcher may hand us a sanitized environment; `cmd.exe` and friends still expect
+        // the system directories to be on PATH.
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            let root = PathBuf::from(root);
+            prefix.push(root.join("System32").to_string_lossy().to_string());
+            prefix.push(root.to_string_lossy().to_string());
+        }
+    }
     let merged = shellenv::merge_path(
         &prefix,
         shell_path.as_deref(),
@@ -1040,6 +1104,28 @@ mod tests {
             Some(data_dir.join("runtime/prefix"))
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verbatim_windows_paths_lose_their_prefix() {
+        #[cfg(windows)]
+        {
+            // Taken from a real failure: node's `fs.realpathSync` walked this path and died
+            // on `lstat 'D:'` before the CLI ever started.
+            assert_eq!(
+                unverbatim(Path::new(r"\\?\D:\dsh\DSH Desktop\runtime\node\node.exe")),
+                PathBuf::from(r"D:\dsh\DSH Desktop\runtime\node\node.exe")
+            );
+            assert_eq!(
+                unverbatim(Path::new(r"\\?\UNC\server\share\x")),
+                PathBuf::from(r"\\server\share\x")
+            );
+            // Past MAX_PATH the prefix is the only way to reach the file, so it stays.
+            let long = format!(r"\\?\D:\{}", "a".repeat(300));
+            assert_eq!(unverbatim(Path::new(&long)), PathBuf::from(&long));
+        }
+        // Everywhere else the helper must not touch a path.
+        assert_eq!(unverbatim(Path::new("/a/b")), PathBuf::from("/a/b"));
     }
 
     #[test]

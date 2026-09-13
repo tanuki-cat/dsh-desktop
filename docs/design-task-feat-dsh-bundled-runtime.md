@@ -715,20 +715,39 @@ make runtime-clean                              # 回收
 | 包内多一层 `dist/` | 先 `cd dist` 再打包；说明文件改 ASCII 文件名（中文名在不同解压工具里乱码） |
 | Git Bash 的 `cp -R` 在 pnpm 符号链接上失败 | 组装目录改用 tar 管道（`-h` 解引用） |
 | `npm view` 找不到 node | `npm_command()` 把 npm 所在目录前置进 PATH |
-| 启动即 `EISDIR: illegal operation on a directory, lstat` 报某个盘符 | 见下：给子进程的路径一律绝对化 |
+| 启动即 `EISDIR: illegal operation on a directory, lstat 'D:'` | 见下：`\\?\` verbatim 前缀 + Unix-only 的 PATH 合并与查找 |
 
-**EISDIR 一类问题的处理**（commit `fix(windows): 运行时路径必须绝对…`）
+**`EISDIR: lstat 'D:'` 的根因与修法**（commit `4152ca7` 与随后的 Windows 子进程环境修复）
 
-node 的 `resolveMainPath` 收到的入口脚本是 `D:`，说明我们交给子进程的某个路径是相对的（裸盘符、
-Git Bash 的 `/c/Users/...`、盘符相对的 `D:tools`）——Windows 会按**子进程**自己的目录解析它，
-于是 node 在错误的位置定位主模块。修法是在源头消灭这类路径：
+用户实测日志给出了完整证据链（`%APPDATA%\com.deepseek.dsh.desktop\logs\harness.log`）：
 
-- `home_dir()`：Windows 优先 `USERPROFILE`，并校验结果绝对、有名字，否则继续试 `HOMEDRIVE`+`HOMEPATH`；
-- `Config.workspace` / `dsh_home`：不可用则回退默认 / 忽略并记日志，相对路径按应用 cwd 绝对化；
-- `resolve_runtime()`：`node`、`dsh` 以及 `DSH_DESKTOP_NODE` / `DSH_DESKTOP_DSH` 指定的路径统一走 `absolute()`；
-- `harness::spawn()`：三个路径必须绝对，否则报出具体是哪一个，而不是让 node 抛 `EISDIR`；
-- 启动前把完整命令行、cwd、`DSH_HOME` 写进日志，便于在没有 Windows 机器时排障；
-- `locator`：Windows 下 PATH 查找补 `.exe/.cmd/.bat`（PATH 里的 `node.exe` 也能识别，否则系统安装会被判成「未安装」）。
+    [dsh-desktop] runtime: node \\?\D:\dsh\DSH Desktop\runtime\node\node.exe (bundled) + dsh \\?\D:\dsh\…\lib\bin.js (bundled) | updates: Shadow
+    [dsh-desktop] login shell env import failed (/bin/zsh); using the app environment
+    [dsh-desktop] child PATH = /opt/homebrew/bin:/usr/local/bin
+    Error: EISDIR: illegal operation on a directory, lstat 'D:'
+        at Object.realpathSync (node:fs:2749:25)
+        at toRealPath (node:internal/modules/helpers:61:13)
+        at Function._findPath (node:internal/modules/cjs/loader:760:22)
+        at resolveMainPath (node:internal/modules/run_main:39:23)
+
+三点结论（不是「workspace 里写了 D:」这么简单）：
+
+1. **`\\?\` verbatim 前缀**：种子路径经过 canonicalize，在 Windows 上带出 `\\?\D:\…`。Win32 文件 API
+   能用，但 node 的 `fs.realpathSync` 会逐组件解析它，走到 `lstat 'D:'`（盘符相对路径 = 目录）就 EISDIR。
+   `unverbatim()` 在 `absolute()` / `seed_root_for()` / `locator::real_path()` 去掉前缀（超过 MAX_PATH 时保留）。
+2. **`merge_path` 原本是 Unix-only**：`value.split(':')` 加上「必须以 `/` 开头」的过滤，在 Windows 上把整条
+   PATH 砍成只剩硬编码的 `/opt/homebrew/bin:/usr/local/bin`（与日志完全一致）——子进程既没有系统目录，
+   也没有自带 node 目录。改为 `std::env::split_paths` / `join_paths` + `is_absolute()`，按平台拼接；
+   硬编码的 Homebrew 目录改成 `#[cfg(target_os = "macos")]`，Windows 补 `%SystemRoot%` 与 `System32`。
+3. **登录 shell 与 npm 查找同样是 Unix-only**：Windows 上不该去跑 `/bin/zsh`（现直接跳过并记日志）；
+   `npm` 的裸名会命中 npm 自带的 POSIX wrapper（日志里的 `os error 193`），改为 `.exe/.cmd/.bat` 优先。
+
+顺带保留的加固（同类风险，仍然有价值）：`home_dir()` 校验（Windows 优先 `USERPROFILE`）、`workspace` /
+`dsh_home` 不可用则回退并记日志、路径绝对化、`harness::spawn()` 前置校验，以及 `app data dir = … |
+workspace = …` 和 `spawn: <完整命令行>` 两行日志——下一次失败可以直接从日志定位到具体路径。
+
+回归方式：`cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`（本机可做，覆盖所有
+`cfg(windows)` 代码），以及 CI 里 Windows runner 上的 `cargo test --lib`。
 
 排障入口：`%APPDATA%\com.deepseek.dsh.desktop\logs\harness.log`，关键字
 `runtime: node … (bundled|system) + dsh … | updates: …` 与 `spawn: …`。

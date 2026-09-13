@@ -291,30 +291,38 @@ pub fn check(npm: &Path, package: &str, wanted_tags: &[String], current: &str) -
 /// `npm` that belongs to the same installation as the resolved node.
 pub fn npm_for(node: &Path) -> Option<PathBuf> {
     if let Some(dir) = node.parent() {
-        let candidate = dir.join("npm");
-        if candidate.is_file() {
-            return Some(candidate);
+        // `bin/npm` on Unix, `npm.cmd` beside `node.exe` on Windows. The bare name is checked
+        // last: npm also ships a POSIX wrapper next to its `.cmd`, and running that fails
+        // with `os error 193`.
+        for name in ["npm.cmd", "npm.exe", "npm"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
-    if let Some(paths) = std::env::var_os("PATH") {
-        if let Some(found) = std::env::split_paths(&paths)
-            .map(|dir| dir.join("npm"))
-            .find(|p| p.is_file())
-        {
-            return Some(found);
-        }
+    if let Some(found) = crate::locator::path_lookup("npm") {
+        return Some(found);
     }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let output = Command::new(shell)
-        .args(["-lc", "command -v npm"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let candidate = PathBuf::from(text);
-    if candidate.is_file() {
-        Some(candidate)
-    } else {
+    login_shell_npm()
+}
+
+/// Last resort: ask the user's login shell where npm is. Unix only.
+fn login_shell_npm() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
         None
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let output = Command::new(shell)
+            .args(["-lc", "command -v npm"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let candidate = PathBuf::from(text);
+        candidate.is_file().then_some(candidate)
     }
 }
 

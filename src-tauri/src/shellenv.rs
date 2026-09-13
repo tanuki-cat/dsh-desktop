@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -53,21 +53,29 @@ pub fn parse_env(output: &str) -> BTreeMap<String, String> {
     }
     map
 }
-/// Relative PATH entries are dropped when merging; empty entries would mean the cwd.
+/// Merge PATH sources, first one first.
+///
+/// Splitting and joining follows the platform (`;` and drive letters on Windows, `:` and a
+/// leading slash elsewhere) — a hand-rolled `split(':')` plus a "must start with /" filter
+/// silently reduced a Windows PATH to nothing but the macOS fallback directories.
+/// Relative entries are dropped: in a child process an empty entry would mean its cwd.
 pub fn merge_path(prefix: &[String], shell_path: Option<&str>, app_path: Option<&str>) -> String {
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts: Vec<PathBuf> = Vec::new();
     let mut add = |value: &str| {
-        for part in value.split(':') {
-            if !part.is_empty()
-                && part.starts_with('/')
-                && !parts.iter().any(|existing| existing == part)
-            {
-                parts.push(part.to_string());
+        for part in std::env::split_paths(value) {
+            if part.as_os_str().is_empty() || !part.is_absolute() {
+                continue;
+            }
+            let part = crate::unverbatim(&part);
+            if !parts.contains(&part) {
+                parts.push(part);
             }
         }
     };
     for dir in prefix {
-        add(dir);
+        if !dir.is_empty() {
+            add(dir);
+        }
     }
     if let Some(value) = shell_path {
         add(value);
@@ -75,7 +83,11 @@ pub fn merge_path(prefix: &[String], shell_path: Option<&str>, app_path: Option<
     if let Some(value) = app_path {
         add(value);
     }
-    parts.join(":")
+    match std::env::join_paths(parts) {
+        Ok(joined) => joined.to_string_lossy().to_string(),
+        // A path containing `"` cannot be joined on Windows; the app's own PATH beats none.
+        Err(_) => app_path.unwrap_or_default().to_string(),
+    }
 }
 
 /// Capture the login shell's exported environment. None when the shell fails or hangs.
@@ -158,11 +170,32 @@ mod tests {
 
     #[test]
     fn merges_path_with_absolute_deduplication() {
+        // Entries and separator follow the platform: a Unix spelling is not absolute on
+        // Windows, which is how a Windows child ended up with a POSIX-only PATH.
+        let (opt, usr, local, bin, sep) = if cfg!(windows) {
+            (
+                r"C:\homebrew\bin",
+                r"C:\usr\bin",
+                r"C:\usr\local\bin",
+                r"C:\bin",
+                ";",
+            )
+        } else {
+            (
+                "/opt/homebrew/bin",
+                "/usr/bin",
+                "/usr/local/bin",
+                "/bin",
+                ":",
+            )
+        };
         let merged = merge_path(
-            &["/opt/homebrew/bin".to_string(), "/usr/bin".to_string()],
-            Some("/usr/local/bin:relative:/usr/bin:"),
-            Some("/bin"),
+            &[opt.to_string(), usr.to_string()],
+            Some(&format!("{local}{sep}relative{sep}{usr}{sep}")),
+            Some(bin),
         );
-        assert_eq!(merged, "/opt/homebrew/bin:/usr/bin:/usr/local/bin:/bin");
+        assert_eq!(merged, format!("{opt}{sep}{usr}{sep}{local}{sep}{bin}"));
+        // A relative entry never survives: in a child it would mean the child's own cwd.
+        assert!(!merged.contains("relative"));
     }
 }

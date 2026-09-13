@@ -153,12 +153,14 @@ fn find_node(launcher: &Path) -> Result<PathBuf, String> {
     )
 }
 
-fn path_lookup(name: &str) -> Option<PathBuf> {
+pub(crate) fn path_lookup(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     // Windows resolves `node` to `node.exe` and `dsh` to `dsh.cmd`; a bare name would never
     // match there, which made the system runtime look "not installed".
+    // Command extensions first: `npm` alone matches the POSIX wrapper npm ships next to
+    // `npm.cmd` on Windows, and running that fails with `os error 193`.
     #[cfg(windows)]
-    let names: Vec<String> = ["", ".exe", ".cmd", ".bat"]
+    let names: Vec<String> = [".exe", ".cmd", ".bat", ""]
         .iter()
         .map(|extension| format!("{name}{extension}"))
         .collect();
@@ -176,25 +178,29 @@ fn path_lookup(name: &str) -> Option<PathBuf> {
 }
 
 fn login_shell_lookup(name: &str) -> Option<PathBuf> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let out = Command::new(shell)
-        .args(["-lc", &format!("command -v {name}")])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if text.is_empty() {
-        return None;
-    }
-    let p = PathBuf::from(text);
-    if p.is_file() {
-        Some(p)
-    } else {
+    // A login shell is a Unix idea: on Windows the app environment and PATH are authoritative,
+    // and asking for `/bin/zsh` there only wastes time.
+    #[cfg(windows)]
+    {
+        let _ = name;
         None
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let out = Command::new(shell)
+            .args(["-lc", &format!("command -v {name}")])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let p = PathBuf::from(text);
+        p.is_file().then_some(p)
     }
 }
 
 fn real_path(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    crate::unverbatim(&canonical)
 }
 
 #[cfg(test)]
