@@ -49,6 +49,13 @@ def packages_under(root):
 
 
 def main():
+    # A Windows console defaults to a legacy code page (cp1252); these messages are UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     if len(sys.argv) != 6:
         print(__doc__, file=sys.stderr)
         return 2
