@@ -689,7 +689,8 @@ make runtime-clean     # 清理 staging（约 475MB）
 - **签名与公证**（§7）：需要 Developer ID；本轮产物未签名；
 - **构建期磁盘**：实测 tauri 会把整份 `runtime/` 复制到 `target/<profile>/runtime`（debug 下 **584 MB**），
   加上 staging 与 bundle 各一份 ⇒ 峰值约 1.7 GB，比 §6 原先估的 1.5 GB 更高；
-- **Windows 侧**：交叉编译已能出 exe（见 shell 方案相关提交），但自带运行时仍需按平台单独 staging。
+- **Windows 侧**：交叉编译已能出 exe（见 shell 方案相关提交）；自带运行时改为在 CI 的 Windows runner 上原生 staging
+  （koffi 的 postinstall 在 macOS 上跨平台 staging 会因缺 CMake 失败），已落地为 `.github/workflows/windows-portable.yml`，见 §20.6。
 
 ### 20.5 复现命令
 
@@ -699,3 +700,35 @@ make runtime-fetch && make runtime-stage        # 约 520 MB，21 s（缓存热�
 make bundle-bundled                             # 产出带运行时的 .app（约 598 MB）
 make runtime-clean                              # 回收
 ```
+
+### 20.6 Windows 免安装包（2026-09-13，第三次推进）
+
+`.github/workflows/windows-portable.yml`（`workflow_dispatch`）在 `windows-latest` 上原生 staging 并打包，
+输入 `dsh_version` / `node_version` / `build_ref`（默认 `feat/bundled-runtime`）/ `attach_to_release`。
+产物 `dsh-desktop-windows-x64-portable`（zip 182–326 MB，约 3.3 万个文件，包内最长路径 205–223 字符）。
+
+本机无法执行 PE，Windows 侧行为只能由用户实测，因此每个失败回合都在缩小假设面：
+
+| 现象 | 处置 |
+|---|---|
+| 解压报 `0x80010135`（路径太长） | 说明文件写明短路径 `D:\dsh`、`tar -xf`、7-Zip 三种方式，并追加 7z SFX 自解压包 |
+| 包内多一层 `dist/` | 先 `cd dist` 再打包；说明文件改 ASCII 文件名（中文名在不同解压工具里乱码） |
+| Git Bash 的 `cp -R` 在 pnpm 符号链接上失败 | 组装目录改用 tar 管道（`-h` 解引用） |
+| `npm view` 找不到 node | `npm_command()` 把 npm 所在目录前置进 PATH |
+| 启动即 `EISDIR: illegal operation on a directory, lstat` 报某个盘符 | 见下：给子进程的路径一律绝对化 |
+
+**EISDIR 一类问题的处理**（commit `fix(windows): 运行时路径必须绝对…`）
+
+node 的 `resolveMainPath` 收到的入口脚本是 `D:`，说明我们交给子进程的某个路径是相对的（裸盘符、
+Git Bash 的 `/c/Users/...`、盘符相对的 `D:tools`）——Windows 会按**子进程**自己的目录解析它，
+于是 node 在错误的位置定位主模块。修法是在源头消灭这类路径：
+
+- `home_dir()`：Windows 优先 `USERPROFILE`，并校验结果绝对、有名字，否则继续试 `HOMEDRIVE`+`HOMEPATH`；
+- `Config.workspace` / `dsh_home`：不可用则回退默认 / 忽略并记日志，相对路径按应用 cwd 绝对化；
+- `resolve_runtime()`：`node`、`dsh` 以及 `DSH_DESKTOP_NODE` / `DSH_DESKTOP_DSH` 指定的路径统一走 `absolute()`；
+- `harness::spawn()`：三个路径必须绝对，否则报出具体是哪一个，而不是让 node 抛 `EISDIR`；
+- 启动前把完整命令行、cwd、`DSH_HOME` 写进日志，便于在没有 Windows 机器时排障；
+- `locator`：Windows 下 PATH 查找补 `.exe/.cmd/.bat`（PATH 里的 `node.exe` 也能识别，否则系统安装会被判成「未安装」）。
+
+排障入口：`%APPDATA%\com.deepseek.dsh.desktop\logs\harness.log`，关键字
+`runtime: node … (bundled|system) + dsh … | updates: …` 与 `spawn: …`。
