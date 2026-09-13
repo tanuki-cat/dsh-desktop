@@ -92,6 +92,41 @@ DSH Desktop.app/Contents/Resources/runtime/
 
 即：**自带优先，系统兜底**；开发机上仍可用系统安装（配置可强制 `runtime: system`）。
 
+### 2.4 混合运行时：系统只装了一半怎么办（v3 补充，含实测）
+
+提议的默认策略（按"本机已装什么"决定每一半的来源）：
+
+| 本机 node | 本机 dsh | 采用 |
+|---|---|---|
+| 有 | 有 | 两者都用系统的（尊重用户既有安装） |
+| 有 | 无 | node 用系统的，dsh 用自带的 |
+| 无 | 有 | node 用自带的，dsh 用系统的 |
+| 无 | 无 | 两者都用自带的 |
+
+**可行性结论：可以，而且比预想的安全。** 原以为"混搭"会撞原生模块 ABI，实测本机 dsh 树里的原生模块
+**全部是 N-API**（`nm -u` 检查：napi 符号 23–88 个、V8 符号 0 个），N-API 跨 Node 大版本 ABI 稳定，
+所以"系统的 node + 自带的 dsh 树"（或反之）不会因为 ABI 直接崩。真正的门槛只剩两条：
+
+1. **架构必须一致**：系统 node 可能是 x64（Rosetta）而自带预编译产物是 arm64，混用会加载失败 ⇒
+   比较 `process.arch` 与自带运行时一致才允许混搭；
+2. **能力门槛，而不是版本号**：`@deepseek-ai/dsh` 的 `package.json` **没有 `engines.node` 字段**（实测），
+   所以"按 engines 判断"落空。可用的硬指标是能力探测：dsh 的 `@deepseek-ai/dsh-code-runtime-worker-thread`
+   依赖 `module.stripTypeScriptTypes()`（Node ≥ 22.13；日志里那条 `ExperimentalWarning: stripTypeScriptTypes` 就是它），
+   因此对候选 node 跑一次 `node -e "typeof require('module').stripTypeScriptTypes === 'function'"` 即可判定
+   能否使用；探测失败则该半回退到自带运行时。
+
+**必须一起定的两条规则**（否则这套策略会自我矛盾）：
+
+- **更新语义**：若采用系统 dsh，而更新仍落到自带的影子前缀，那条"更高版本优先"的规则会让更新后的核心
+  反过来盖掉用户自己的安装。建议：**使用系统 dsh 时不做自动安装**，只提示有新版（可一键切到自带运行时再更新）；
+  桌面壳永远不写用户自己的全局前缀 —— 那既可能失败（权限、pnpm/yarn 布局），也是"GUI 偷偷改我环境"的典型投诉；
+- **决策要稳定且可见**：系统运行时依赖登录 shell 探测，rc 文件改动或导入失败都会让结果在两次启动之间翻转。
+  因此：探测一次后把结论与版本写进配置/诊断，并保留手动 `runtime: system | bundled | auto` 覆盖；
+  启动日志与状态页显示 `runtime: system (node 22.23.2 / dsh 0.1.5-rc.2)` 这类信息。
+
+**代价**：支持矩阵从 1 种变成 4 种组合。建议把（系统+系统）与（自带+自带）列为受支持组合并纳入验收，
+两种混搭标注为"尽力而为"（有上面两道门槛 + 失败回退），并在 README 写明。
+
 ---
 
 ## 3. 首次启动流程
@@ -279,7 +314,7 @@ make runtime-clean     # 清理 staging（约 475MB）
 | `runtime.rs`（新） | `last-known-good` 记录与诊断输出 | 含上行 |
 | staging（Makefile） | 把 **pnpm** 一并装进前缀；子进程 PATH 注入清单 | ~15 行 |
 | `locator.rs` | 接受 `BundledRoots`，按 §2.3 顺序解析，记录来源 | ~40 行 |
-| `update.rs` | `install_prefix` 支持 app-data 目标；追加 `--cache`；**装到 `prefix.new` 后原子替换**；`engines.node` 兼容性检查 | ~50 行 |
+| `update.rs` | `install_prefix` 支持 app-data 目标；追加 `--cache`；**装到 `prefix.new` 后三步替换**；安装后回读版本核对（已实现） | ~50 行 |
 | `lib.rs` | 取 `app.path().resource_dir()` 并注入；splash 文案区分自带/系统 | ~25 行 |
 | `tauri.conf.json` | `bundle.resources`（已完成）；签名配置 | 少量 |
 | `Makefile` | `runtime-fetch / runtime-stage / runtime-clean`，`bundle` 依赖 chain；**staging 结尾做悬空链接校验**；自动生成 `THIRD-PARTY-NOTICES.md` | ~80 行 |
@@ -327,7 +362,7 @@ make runtime-clean     # 清理 staging（约 475MB）
 11. **资源复制的隐藏依赖**（v3 实测）：符号链接被解引用，绝对链接会把宿主文件搬进包 ⇒ 产物不再完全由 staging 决定，
     staging 要禁止绝对链接；悬空链接会让构建直接失败；
 12. **发行后 Node 只能随 .app 升级**：seed 只读 ⇒ Node 安全补丁要发新版桌面壳；文档需给出 Node 版本矩阵与升级节奏，
-    诊断页/日志要显示 bundled 的 node 与 dsh 版本（目前只显示来源）；`engines.node` 不满足时应阻止更新并提示"需要更新桌面壳"；
+    诊断页/日志要显示 bundled 的 node 与 dsh 版本（目前只显示来源）；node 能力探测不通过时应阻止更新并提示"需要更新桌面壳"（`engines.node` 不存在，见 §2.4）；
 13. **app-data 沉淀**：更新过的前缀（289 MB+）会长期留在应用数据目录，需要"重置运行时"入口或文档化的清理方式。
 
 ---
@@ -382,6 +417,9 @@ make runtime-clean     # 清理 staging（约 475MB）
 | 10 | P2 | 构建耗时未知（只有磁盘预算） | §5 补实测：20k 文件复制 + 打包 3.8 s，25k 约 4–5 s |
 | 11 | P3 | 卸载/清理路径未写 | §13 增 app-data 沉淀风险与"重置运行时"建议 |
 | 12 | P3 | App Translocation 未评估 | §7 说明"不写 bundle"天然免疫，并加入验收 |
+| 13 | P1 | v2 计划"按 `engines.node` 检查兼容性"**落空**：`@deepseek-ai/dsh` 的 package.json 没有该字段（实测） | §2.4 改为**能力探测**（`module.stripTypeScriptTypes`，Node ≥ 22.13），§11/§13 同步修正 |
+| 14 | 新增 | "本机装了一半怎么办"没有策略 | §2.4 给出混合运行时决策矩阵 + 可行性实测（原生模块**全是 N-API**，跨大版本 ABI 稳定）+ 架构/能力两道门槛 |
+| 15 | P0 | 采用系统 dsh 时，影子前缀的更新会被"更高版本优先"反过来盖掉用户自己的安装 | §2.4 明确：**用系统运行时时不自动安装**（只提示），桌面壳永不写用户的全局前缀 |
 
 **本轮实测明细**（可复现）：
 
