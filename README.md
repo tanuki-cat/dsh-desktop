@@ -28,8 +28,8 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - 生命周期：退出即 SIGTERM 进程组（5s 后 SIGKILL）并删除 state.json —— 关闭窗口（`RunEvent::ExitRequested`）
   与 ⌘Q / Dock 退出（`RunEvent::Exit`）两条事件链都处理；复用的上次实例也登记，退出时一并停掉
 - 启动失败即收尾：等待 URL 超时或窗口创建失败时，先停掉刚起的进程再报错，不留"假失败 + 端口被占"
-- 看护线程：启动成功后继续 `wait` 子进程，Harness 意外退出会弹回状态页报错、清掉 state.json（应用不静默变死页面）
-- 残留自愈：只有强杀/崩溃这类拿不到回调的场景才靠下次启动清理；state.json 0600，且**只有记录的 pid 仍监听记录的端口**时才发信号（否则只清文件，避免 pid 复用误杀无关进程组）
+- 看护线程：启动成功后继续 `wait` 子进程，Harness 意外退出会清掉 state.json、销毁已无意义的 Harness 窗口并弹回状态页报错（应用不静默变死页面）；状态页是终点，关闭它即退出应用
+- 残留自愈：只有强杀/崩溃这类拿不到回调的场景才靠下次启动清理；state.json 0600。记录的 pid 仍监听记录的端口时才发信号；仍服务**本次端口**的记录会保留，让启动流程直接复用而不是重启；pid 已不拥有该端口时，只有 reparent 到 init 且命令行含 `--profile web`/`dsh` 的残留才会被清理（pid 复用不误杀）
 - 安全：Harness 窗口零 capability、导航限定当次 authority、外链与 `window.open` 只把 `http`/`https` 交系统浏览器（`file:`、自定义 scheme 记 `external scheme blocked` 后丢弃）
 - 下载：`on_download` 落盘到 `~/Downloads`，同名文件自动加 `-1`/`-2` 后缀（不静默覆盖）；
   附件上传由 wry 的 `runOpenPanel` 原生处理
@@ -47,12 +47,13 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - 退出路径实机复现（2026-09-13，macOS）：⌘Q 等价的 Apple Event 退出后，日志出现
   `stopping Harness pid 92619` / `Harness stopped`，3080 端口释放、`state.json` 删除；
   修复前只处理红点关闭（`ExitRequested`），⌘Q 走的是 `RunEvent::Exit`，清理从未执行。
-- 离线测试：`cargo test` **43 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
+- 离线测试：`cargo test` **47 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
-  缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口不重复安装"、npm PATH 前缀、沉默对端探针超时、
+  缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口与跨窗口都不重复安装"、npm PATH 前缀、沉默对端探针超时、
   package.json 版本解析、部分/损坏 config.json 处理、workspace / dsh_path 回退不改文件、HOME 缺失不回落 `/`、
-  进程组终止与僵尸进程识别、外链 scheme 白名单、页面加载重试判定矩阵、自愈进程身份校验、
-  更新前停止模式、日志运行中轮转与备份份数、日志句柄共享、spawn 路径校验点名、
+  进程组终止与僵尸进程识别、外链 scheme 白名单、页面加载重试判定矩阵、自愈三分支与
+  "Keep ⇒ 进程组终止"的组合断言、孤儿残留的 `ps` 判定、更新前停止模式、
+  日志运行中轮转与备份份数、日志句柄共享、计数器不提前轮转、spawn 路径校验点名、
   下载重名避让、URL 解析兜底、CLI 版本区间判定）。
 - 权限：`config.json`（`env` 字段可能放 API Key）与 `state.json` 均为 0600；旧版本留下的 0644 文件会在下次启动时被就地收紧（实机已确认）。
 - 更新链路的失败证据也来自实机日志：修复前每次 GUI 启动都记 `npm view 失败: env: node: No such file or directory`
@@ -82,7 +83,7 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 | `make doctor` | 检查工具链与平台依赖 | Linux 用 `pkg-config` 查 `webkit2gtk-4.1` / `gtk+-3.0` / `libsoup-3.0` 并给出 Debian/Fedora/Arch 安装命令；macOS 提示装 Xcode CLT |
 | `make check` | `cargo check --all-targets` | 与 CI 口径一致 |
 | `make fmt` / `make fmt-check` / `make clippy` | 格式化 / 只检查格式（CI 门禁用，不改工作区）/ lint（`clippy -D warnings`） | |
-| `make test` | 离线单元测试（当前 **43** 个） | 不联网 |
+| `make test` | 离线单元测试（当前 **47** 个） | 不联网 |
 | `make test-live` | 联网集成测试（全部） | 自动设 `DSH_DESKTOP_LIVE_TESTS=1`：查真实 registry、对比冷/热缓存耗时，并在「PATH 里没有 node」的模拟 GUI 环境下验证 npm 仍可运行 |
 | `make dev` | 运行 debug 版 | 等价 `cargo run --manifest-path src-tauri/Cargo.toml` |
 | `make build` | 编译 release 可执行文件 | 产物 `src-tauri/target/release/dsh-desktop` |
@@ -181,15 +182,15 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | ⌘Q / Dock 退出 / `quit app` | tao `application_will_terminate` → `RunEvent::Exit` → 同样的清理（幂等） |
 | 退出发生在 Harness 启动途中 | `EXITING` 标志：刚起来的子进程立即停掉，不会漏成孤儿 |
 | 复用上次实例后退出 | 该实例已登记，退出时照样 SIGTERM（旧行为不登记 → 留孤儿） |
-| 强杀（SIGKILL）/ 崩溃 | 拿不到任何回调，只能靠下次启动自愈清理 |
+| 强杀（SIGKILL）/ 崩溃 | 拿不到任何回调；下次启动先自愈：仍在服务本次端口的记录保留下来交给复用分支，其余情况清掉残留与记录 |
 | 启动等待 URL 超时 / 窗口创建失败 | 停掉刚起的子进程 → 状态页报错（不会留下占着端口的半启动实例） |
-| 启动成功后 Harness 意外退出 | 看护线程发现退出 → 重新弹出状态页显示退出码与最近输出、清 state.json |
-| 窗口首次加载失败（端口尚未开始应答等瞬时竞争） | 20 s 内没等到加载完成、且端口已不再以 Harness 身份应答 → 退避重试同一 token URL，最多 3 次；仍失败弹状态页说明可重新启动。端口仍健康时不重试，避免打断正在进行的加载 |
+| 启动成功后 Harness 意外退出 | 看护线程发现退出 → 清 state.json → 销毁 Harness 窗口 → 状态页显示退出码与最近输出（关闭状态页即退出应用） |
+| 窗口首次加载失败 | 20 s 内没有收到"加载开始"事件（导航根本没起来，无论端口是否健康）→ 退避重试同一 token URL，最多 3 次；已经开始加载则一律不打扰。次数用尽且端口也不再服务才弹状态页；端口仍健康时只记日志，不在事件不投递的环境里给正常应用弹错误页 |
 | 页面里的非 http/https 链接（`file:`、自定义 scheme…） | 不交给系统：日志记 `external scheme blocked: <scheme> (...)` 后丢弃 |
 | 有新版 dsh 但端口上是外部实例且不允许接管 | 跳过本次更新（不重写别人正在用的树），实例继续服务，日志记 `update deferred` |
 | 下载同名文件 | 自动改名 `name-1.ext`，不覆盖已有文件 |
 | 关闭状态页（启动失败时） | 直接退出应用（此时没有 Harness 窗口，不会留下无窗口进程）；应用自己移除该窗口走 `destroy`，不触发这条 |
-| 壳被强杀后再次启动 | 读取 state.json 自愈清理残留进程 |
+| 壳被强杀后再次启动 | 读取 state.json：残留进程仍在服务本次端口 → 复用它（保留会话）；否则自愈清理后再自启 |
 
 > 并发边界：壳只保证**自己这个端口**上不会同时跑两个实例（接管 + single-instance 插件）。`dsh_home` 为 `null` 时
 > 共用 `~/.dsh`，你在终端另开一个同 profile 的 `dsh` 仍会与壳并发读写同一份会话存储 —— 需要严格隔离就把 `dsh_home`
@@ -234,6 +235,7 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | 启动 harness 到拿到 URL | 1–4 s | 由 `dsh web` 自身决定，首启（初始化 profile）更久，超时 90 s / 30 s |
 
 日志写入是每行一次 `write(2)`（无缓冲）：单次会话通常只有几十行，有意不做缓冲，以免崩溃时丢日志。
+轮转由内存字节计数判定，不额外 `stat`；计数在打开日志时以文件实际大小 seed，所以上次遗留的超大文件仍会在下次写入前轮转。
 
 ## 打包成 .app
 ```bash

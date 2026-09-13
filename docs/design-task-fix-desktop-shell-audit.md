@@ -10,6 +10,9 @@
 > 本文是**审查结论 + 修复任务清单**，不修改方案文档本身（它记录的是当时的决策与实测，按文档生命周期规则保持原样）。
 > 修复落地后把结果回写到"处理状态"列。2026-09-13 已完成修复，逐项结果与新增测试见 §16；
 > 方案文档中确属"实现与设计不符"的两处事实性描述（§5 看护方式、§4 步骤 8/9 的落地范围）已就地加注修正。
+>
+> **复核（2026-09-13，commit `d379428` + `7905ae8`）**：11 项修复逐条核验通过，测试与 lint 结果已独立复跑确认；
+> 复核中新发现 6 项（其中 1 项是首轮审查漏掉的既有缺陷，由本次 #3 的改动暴露）——见 **§17**，均**未修**。
 
 ---
 
@@ -383,3 +386,137 @@ make test-live   # 3 passed（registry head=0.1.5-rc.2；冷查询 1179 ms / 缓
 > §13 提到的旧路径缓存这次确实会挡住构建：`failed to read plugin permissions: … Applications/Scripts/dsh-desktop/…`。
 > 只清 `-p dsh-desktop` 不够（报错文件在 `tauri` 的 build 输出里）；本次先清 `tauri` / `tauri-build` /
 > `dsh-desktop` 三个包，输出显示连带删掉 4.9 GB（等于全量重建）后才通过。换工作区路径后直接 `cargo clean` 最省事。
+
+---
+
+## 17. 复核结论（2026-09-13，对 `d379428` + `7905ae8`）
+
+独立复跑验证：`cargo test` **43 passed / 0 failed**（另含 3 个联网用例通过）、
+`cargo clippy --all-targets -- -D warnings` **0 warning** —— 与 §16.4 的记录一致。
+
+### 17.1 11 项修复的核验结论
+
+| # | 核验 |
+|---|---|
+| 1 | `may_open` 只放行 http/https；`open_external` 先 `Url::parse` 再判，解析失败也记日志 —— 正确 |
+| 2 | `should_self_heal` 判据与测试矩阵正确 —— 正确（副作用见 §17.2 的 N1 / N2） |
+| 3 | `stop_mode` 判定正确 —— 正确，但生产路径走不到 `ProcessGroup`（见 N1） |
+| 4 | `attempted` 字段带 `#[serde(default)]`、`match` 守卫顺序正确、旧缓存兼容用例到位 —— 正确（残留见 N4） |
+| 5 | `repair()` 只改内存不写文件、`validate_paths` 点名配置项、`spawn:` 与 `app data dir` 日志 —— 正确 |
+| 6 | `home_workspace` 回落 `temp_dir()` —— 正确 |
+| 7 | `dsh_path` 位于 `DSH_DESKTOP_DSH` 之后、PATH 之前，优先级有单测 —— 正确 |
+| 8 | 按 §16.2 的取舍部分实现 —— 可用，但重试条件的方向存疑（见 N3） |
+| 9 | 运行中判定 + 3 份轮转 —— 正确；**并顺带修掉了首轮审查没发现的真问题**：`init_app_log` 与 `spawn` 原先各开一个文件句柄，轮转后其中一个会继续写被改名的旧文件，`LOGGERS` 注册表按路径共享句柄解决了它 |
+| 10 | `resources` 已删，`runtime/README.md` 区分了 main 与分支 —— 正确 |
+| 11 | `fmt-check` + `#[cfg(windows)] compile_error!` —— 正确 |
+
+方案文档的三处改动是**加注 + 日期**（"2026-09-13 修正/落地"），保留原决策文字、未改写成相反结论，
+符合文档生命周期规则。
+
+### 17.2 新发现（均未修）
+
+| # | 级别 | 问题 | 位置 | 性质 | 处理（2026-09-13） |
+|---|---|---|---|---|---|
+| N1 | P1 | `ours` 恒为 `None`：复用分支与 `StopMode::ProcessGroup` 都是死代码 | `lib.rs:443` / `315` / `587` | 既有缺陷（首轮漏掉），被 #3 暴露 | **已修**：`SelfHeal` 三分支，能复用的记录保留；`ours` 非空时的重启走进程组 |
+| N2 | P2 | 不监听端口的残留不再被清理 | `lib.rs:427-443` | #2 的副作用 | **已修**：`ps -p <pid> -o ppid=,command=` 命中"父进程为 1 且命令行含 `--profile web`/`dsh`"才发信号 |
+| N3 | P2 | 重试条件与最可能的故障模式相反 | `window.rs` `load_outcome` | #8 的取舍方向 | **已修**：改以 `PageLoadEvent::Started` 为判据，并保留"端口健康时不报错页"的护栏 |
+| N4 | P2 | 缓存窗口过期后仍会重试一次无效安装 | `update.rs::check_cached` | #4 的残留 | **已修**：`carried_attempt` 跨窗口保留标记，只有新版本才重开 |
+| N5 | P3 | 日志每写一行多一次 `metadata()` syscall | `harness.rs::rotate_if_oversized` | #9 的代价 | **已修**：`Logger.written` 字节计数器，仅 open 时 seed 一次 stat |
+| N6 | P3 | 两处错误页文案"关闭本窗口即退出应用"与实际不符 | `window.rs:24-30` 与两条 `show_failure` | 既有 + 新增同款 | **已修**：`show_failure` 先 `destroy()` Harness 窗口，文案自洽 |
+
+#### N1（P1）：`ours` 恒为 `None`，"复用上次实例"是死代码
+
+`start()` 步骤 1 在自愈之后**无条件** `process::clear_state(data_dir)`（`lib.rs:443`），
+而两处"是不是自己上次启动的实例"的判断都靠 `read_state`：
+
+- `stop_instance_before_update`（`lib.rs:315`）
+- 探测/接管分支（`lib.rs:587`）
+
+状态文件在同一次启动的前几十毫秒已经被删掉，所以两处的 `ours` 恒为 `None`。后果：
+
+1. README 的「端口上是本应用上次启动的实例（state.json 对得上且存活）→ 直接复用」与方案 §13.1/§13.2
+   描述的**复用分支永远不会执行**；`lib.rs:599` 的 `adopt()` 是死代码；每次崩溃后重启都必然重新拉起
+   harness，而不是复用仍然健康的实例；
+2. 本次新增的 `stop_mode(ours.is_some())` 因此恒返回 `PidOnly` —— `ProcessGroup` 分支只有单测覆盖，
+   等于 #3 的修复在生产里只跑了一半（好在方向是安全的那一半）。
+
+`git log -S "process::clear_state(data_dir);"` 显示这个无条件清理从初始提交 `88820f0` 就在，
+即方案 §13.2 那句"下次启动走复用分支"是**推断而非实测**。
+
+**修法**：步骤 1 区分三种情况，而不是一律删文件 ——
+
+- 记录失效（pid 已死、或 pid 不再拥有记录的端口）→ 只删文件；
+- 记录有效且**发了信号**（自愈成功）→ 删文件；
+- 记录有效、仍在服务、且端口就是本次要用的端口 → **保留文件**，跳过终止，交给 §3c 的复用分支决定
+  （复用 or 因 `just_updated` 重启）。
+
+**回归**：把上面三分支抽成纯函数（例如 `self_heal_action(state, listener, alive, port) -> Action`），
+补一个覆盖"有效且在服务 ⇒ Keep"的用例；并加一条断言确保 `stop_mode` 在该路径下能返回 `ProcessGroup`。
+
+#### N2（P2）：不监听端口的残留不再被清理
+
+新判据要求 `listener == Some(state.pid)`。一个卡在启动中、尚未 `bind` 端口的残留 harness 现在：
+自愈不杀它（不是监听者），后续探测也看不见它（`probe` = `Closed` ⇒ 直接新起一个），于是永久成为孤儿。
+窗口很小（harness 很早 bind），但这是 #2 换来的确定性代价。
+
+**修法**：给自愈加一条次要判据 —— 进程命令行含 `--profile web` 且父进程已消失（macOS/Linux 可用
+`ps -p <pid> -o ppid=,command=`），命中则同样按"我们的残留"处理。
+
+#### N3（P2）：重试条件与最可能的故障模式相反
+
+`load_outcome` 只在"端口已不再以 Harness 身份应答"时重试。但本文 §8 描述的空白窗口场景
+（WebView 初始化抖动、首次导航失败）通常伴随**端口是健康的** —— 这时代码走 `Settled`，
+空白窗口原样留着，等于没覆盖它要解决的那个场景。反过来，端口真的死了时重新导航同一个 URL 也不会成功，
+而且 `watch_harness` 会同时弹出"Harness 已退出"，两个线程抢同一个状态页（后写的覆盖先写的）。
+
+**修法**：改用 `PageLoadEvent::Started` 作为区分信号 ——
+
+- 20 s 内连 `Started` 都没到 ⇒ 导航根本没开始，无论端口是否健康都值得重新 `navigate`；
+- `Started` 到了但 `Finished` 没到 ⇒ 确实在加载中，保持现在的"不打扰"；
+- 端口不服务且 `watch_harness` 已经报过错 ⇒ 不重复弹状态页（两条路径共用一个"已报告"标志）。
+
+#### N4（P2）：缓存窗口过期后仍会重试一次无效安装
+
+`check_cached` 在走网络查询时把 `attempted` 重置为 `None`（"新查询开新窗口"），
+所以 npm 布局不对的机器每隔 `update_check_interval_minutes`（默认 60 分钟）仍会完整来一遍：
+停掉正在跑的 harness → 重建约 289 MB 依赖树 → 发现版本没变。
+
+**修法**：新查询时若 `installed` 与 `latest` 都与旧条目相同，则**保留** `attempted`；
+只有 `latest` 变化（真的有新版本）才清空。
+
+#### N5（P3）：日志每写一行多一次 syscall
+
+`rotate_if_oversized` 在**每次 `write` 前**都 `std::fs::metadata(&self.path)`，
+把方案 §13.6 认可的"每行一次 syscall"变成两次；harness 流式输出时是双倍。
+
+**修法**：在 `Logger` 里累计已写字节数，只有计数越过 `limit` 时才 `metadata()` 复核并轮转
+（进程重启后由首次写入时的一次 stat 兜底，`an_oversized_file_rotates_before_the_next_line` 用例继续有效）。
+
+#### N6（P3）：错误页文案与实际行为不符
+
+`create_splash` 的 `CloseRequested` 只在 **HARNESS 窗口不存在**时 `exit(0)`（`window.rs:24-30`），
+而两条会弹状态页的失败路径触发时，harness 窗口都还在：
+
+- `lib.rs::watch_harness`（Harness 意外退出，既有）；
+- `window.rs::watch_first_load` 的 `LoadOutcome::Report`（本次新增，沿用了同样的文案）。
+
+两处都写着"关闭本窗口即退出应用"，实际关掉状态页什么也不会发生，用户面对的仍是那个死窗口。
+
+**修法**：这两条路径在 `show_failure` 之前 `destroy()` harness 窗口（此时页面已无意义），
+文案即自洽；或给状态页加一个"失败态"标志，处于该状态时关闭即 `exit(0)`。
+
+### 17.3 顺带（非缺陷）
+
+- `pnpm-lock.yaml` 有 101 行**未提交**改动：新版 pnpm 把 `packageManager` 自举成
+  `packageManagerDependencies` + `@pnpm/exe.*` 写进了锁文件。不影响 CI（发布门禁已不再 `git diff --exit-code`），
+  但每次本地 `pnpm install` 都会重现 —— 建议一次性提交或明确决定忽略。
+- `mailto:` 目前也被 `may_open` 拦下（只记日志）。方案 §7 原话只提 https，所以实现合规；
+  但 agent 输出里的邮件链接会静默失效，值得确认是否要放行。
+
+### 17.4 建议顺序
+
+1. **N1** —— 它同时让 #3 的修复在生产里真正生效，且恢复 README/方案承诺的复用行为；
+2. **N6 + N3** —— 一起改：失败路径的窗口归属与文案是同一件事；
+3. **N4 / N2 / N5** —— 收尾，各自独立。
+
+> 上述顺序已执行完毕，记录见 §17.5。
