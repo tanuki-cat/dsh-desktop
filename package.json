@@ -1,0 +1,15 @@
+{
+  "name": "dsh-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Tauri shell that supervises dsh web and hosts it in the system WebView",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "cargo:check": "cargo check --manifest-path src-tauri/Cargo.toml",
+    "cargo:test": "cargo test --manifest-path src-tauri/Cargo.toml"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

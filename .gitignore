@@ -1,0 +1,9 @@
+target/
+.cargo-home/
+.pnpm-store/
+node_modules/
+
+# staged bundled runtime: keep the marker, ignore the payload
+src-tauri/runtime/*
+!src-tauri/runtime/README.md
+src-tauri/gen/

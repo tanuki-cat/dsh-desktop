@@ -1,0 +1,28 @@
+[package]
+name = "dsh-desktop"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "Tauri shell that supervises `dsh web` and hosts it in the system WebView"
+license = "BSD-3-Clause"
+
+[lib]
+name = "dsh_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "dsh-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

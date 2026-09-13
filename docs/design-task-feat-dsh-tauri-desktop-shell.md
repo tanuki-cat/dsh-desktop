@@ -1,0 +1,450 @@
+# DeepSeek Harness Tauri 桌面壳实施方案（v2 · 已按实现核对）
+
+> 本文随 dsh-desktop 仓库分发；在该仓库中，文中的 dsh-desktop/ 即仓库根目录。
+
+> 取代 v1 附件 `deepseek-harness-tauri-desktop-plan.md`。本文保留 v1 的架构决策，修正其与实现不符或有遗漏的部分，
+> 并对每条关键假设标注**实测**或**文档/代码核实**的结果。
+>
+> 核对基准：`@deepseek-ai/dsh` **0.1.5-rc.2**（`/opt/homebrew/lib/node_modules/@deepseek-ai/dsh`），macOS 实测环境。
+
+---
+
+## 0. 相对 v1 的修正清单
+
+| # | v1 的说法 | 核对结果 | v2 的结论 |
+|---|---|---|---|
+| 1 | locator 只需找到 `dsh` | `dsh` 的真实文件 `lib/bin.js` 首行是 `#!/usr/bin/env node`；GUI 启动的进程 PATH 不含 `/opt/homebrew/bin`（**实测 exit 127**：`env: node: No such file or directory`） | 必须**同时解析 node**，并用 `<node> <dsh 真实 js>` 启动，不要依赖 shebang |
+| 2 | 未提工作目录 | README：“The invoking directory is the default workspace root” | 必须显式设置 `current_dir`（= agent workspace），默认 `$HOME` 且可配置、可记忆 |
+| 3 | stdout URL 行一定存在 | `printUrl` 是 web profile 的 config（默认 true），可被 `$DSH_HOME/cordis.patch.yml` 关掉；**实测关掉后进程正常运行但 stdout 完全为空** | 启动时用 launcher 级 `--patch` 覆盖强制 `printUrl: true`（**实测有效**），并设置 URL 超时 |
+| 4 | launcher 参数 | **实测**：`--patch` 放在 app flag（`--no-open --port 0`）之后会被当成 app 参数，报 `error: unknown option '--patch'` | launcher flag 必须全部写在 app flag **之前** |
+| 5 | token 是一次性的，Rust 不能碰 | **实测**：token URL 可重复访问（两次都是 `303 See Other`），303 带 `Set-Cookie`（`HttpOnly; SameSite=Strict; Max-Age=30d`）与 `location: /` | 仍由 WebView 首次导航；但**失败可安全重试 token URL** |
+| 6 | 未讨论重启后的会话恢复 | **实测**：cookie 载荷含 `"authority":"127.0.0.1:<port>"`，而 `--port 0` 每次端口不同 | 每次启动都必须使用**当次** token URL；不得复用上次 cookie 或直接打开根路径 |
+| 7 | 未提已有实例 | `--port 0` 保证每次新起一个 harness；用户可能已有 CLI/Automator 起的 `dsh web` | 增加“实例策略”一节（隔离 `DSH_HOME` 或检测提示） |
+| 8 | macOS/Linux 只覆盖正常退出 | 无 Job Object 等价物；Tauri 崩溃/被强杀会留下 node 进程 | 增加状态文件 + 下次启动自愈清理 |
+| 9 | 未提与 Electron 桌面版的关系 | `lib/bin.js` 有 `rejectElectronProfile`：`profile "desktop" is managed exclusively by the Electron application` | 明确边界：本方案是轻量替代壳，只用 `web` profile，禁用 `desktop` 名 |
+| 10 | WebView 能力只提外链 | 附件上传、下载、`window.open` 均未覆盖 | 增加 WebView 集成清单（含不需 capability 的说明） |
+| 11 | 日志直接落盘 | URL 行**含 token** | 日志脱敏 + 轮转 |
+| 12 | 验收清单缺项 | — | 增补：休眠唤醒、首启、崩溃残留、多显示器/缩放 |
+
+---
+
+## 1. 目标与范围（沿用 v1）
+
+用 **Tauri 2 + 系统 WebView** 给 `dsh web` 提供一个桌面窗口，不修改 Harness、不复制前端、不重实现业务逻辑。
+
+四项职责：启动 Harness → 捕获访问 URL → 系统 WebView 打开 → 管理子进程生命周期。
+
+---
+
+## 2. 已核对的 Harness 事实（后续设计全部基于这些事实）
+
+**F1 启动与参数**
+- `--port 0` 官方支持：`--help` 文案为 “listen port; pass 0 to let the OS pick a free one”，`dsh-host-webserver` 中 `port: z.natural().max(65535)`，`get port()` 注释 “the OS-assigned value when config.port is 0”。**实测**绑定 `127.0.0.1:59753` / `59887` 等随机端口。
+- `--host 0.0.0.0` 被明确拒绝（**实测** exit 1，提示 “intentionally not supported yet for safety”）。
+- launcher flag（`--profile`/`--patch`/`--from-default-profile`）必须在 app flag 之前；第一个未识别 token 之后的参数全部转交 app（**实测**）。
+
+**F2 就绪信号**
+- URL 行由 `console.log` 输出，即 **stdout**（**实测** stdout 有、stderr 为空），且仅在 loader settled 后播报，每个 root 一次（`ANNOUNCED_ROOTS` 去重）。
+- **实测**：web profile 为 `patchReload: live`，运行中新增 home patch 后**没有**再次播报，进程保持存活 ⇒ **不能用“等待重新播报”做恢复**；恢复路径改为重试当前 URL。仍建议持续读 stdout（写日志/诊断），但不要依赖它。
+
+**F3 认证模型**
+- `GET <token URL>` → `303 See Other` + `Set-Cookie: dsh-auth-<hash>=v1.<payload>.<sig>; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict` + `location: /`。
+- 带 cookie → `200`；**无 cookie → 401**；**Host 非法 → 401**。
+- cookie payload 含 `authority: 127.0.0.1:<port>`；签名密钥持久化在 `DSH_HOME` 的 credential store 中
+  ⇒ **同一 host:port 下 cookie 跨进程重启仍有效**（**实测**：旧 cookie 访问重启后的新进程 → `200`，无 cookie → `401`）。
+- `launchToken` 是 `encodeBase64Url(randomBytes(32))` 并按进程缓存在内存 Map 中（**代码核实**）
+  ⇒ **其它进程启动的实例，外部无法恢复其 token**，只能用它自己打印的那条 URL。
+- 无 cookie 探测的特征响应（**实测**）：`401` + body `dsh web authentication required; reopen the URL printed by dsh web.` —— 可作为"端口上是否是 harness"的无副作用探针。
+
+**F4 进程与运行环境**
+- `dsh` 的 shebang：`#!/usr/bin/env node`；PATH 无 node 时 **exit 127**。
+- `SIGTERM` → 优雅退出（**实测** 2 秒内退出且端口释放）。
+- 冷启动（全新 `DSH_HOME`，从模板初始化 web profile）**实测 4 秒**，无需 pnpm 安装。
+- **现实注意**：本机 `~/.dsh/profiles/web/package.json` 显示已装第三方插件（`dshmarket`、`dsh-better-sidebar`、`dsh-dream-skin`）且 `patchReload: live`。真实 profile 自带 `node_modules`，桌面壳若改用独立 `DSH_HOME` 会得到“干净但没有这些插件”的环境 —— 该取舍需写进 §6。
+- 工作目录 = 调用目录 = 默认 workspace root（README）。
+
+**F5 名空间**
+- `--profile desktop` 被 CLI 拒绝（Electron 专属）；自定义 profile 名必须是非 shipped 的名字。
+
+---
+
+## 3. 架构（v2）
+
+```text
+DSH Desktop (Tauri 2)
+├── Rust Supervisor
+│   ├── locator      → 解析 dsh 真实 js 路径 + node 路径
+│   ├── spawn        → node <dsh.js> --profile web --patch <overlay> --no-open --port 0
+│   ├── 持续读 stdout/stderr → 日志(脱敏) + 环缓冲 + URL 事件
+│   ├── 状态文件      → pid / port / cwd（崩溃自愈）
+│   └── lifecycle    → 进程组 SIGTERM → 5s → SIGKILL
+└── System WebView（Harness 页面：无任何 Tauri capability）
+```
+
+**不新增 Tauri ↔ Harness IPC，不给远程页面 capability**（v1 的核心安全决策，保留）。
+
+---
+
+## 4. 启动时序（修正版）
+
+| 步 | 动作 | 失败处理 |
+|---|---|---|
+| 1 | Tauri single-instance：已有窗口则 focus | — |
+| 2 | 读状态文件，若上次的 pid 仍存活且命令行匹配 → SIGTERM 清理（自愈） | 清理失败则记日志继续 |
+| 3 | locator：`DSH_DESKTOP_DSH` 环境变量 → 记忆路径 → PATH → 常见目录 → login shell（`/bin/zsh -lc 'command -v dsh'`，**实测可用**） | 找不到 → 错误页 + “选择 dsh 路径…” |
+| 4 | `realpath` 解析 symlink 得 `dsh.js`；定位 node：`dsh` 同目录优先 → PATH → login shell（**实测** 两条路径都拿到 `/opt/homebrew/bin/node`） | 找不到 node → 错误页明确提示“缺 node” |
+| 5 | 确定 workspace：记忆值 → 用户选择 → `$HOME` | — |
+| 6 | 写 overlay 文件（强制 `printUrl: true`），启动进程（独立进程组） | spawn 失败 → 错误页 |
+| 7 | 持续读 stdout/stderr；解析 URL 行 | 超时（首启 90s / 常态 30s）→ 错误页 + 最近 200 行日志 |
+| 8 | 创建主窗口加载 token URL | 加载失败 → 允许**重试同一 URL**（token 非一次性，实测） |
+| 9 | 不依赖重新播报：窗口加载失败就重试同一 token URL（**实测可重复使用**） | 连续失败 → 重启 harness 取新 URL |
+| 10 | 退出/崩溃 → 清理状态文件 | — |
+
+**启动命令（关键修正）**
+
+```rust
+// launcher flags 必须全部在 app flags 之前
+let child = Command::new(&node_path)                 // 不用 dsh 的 shebang
+    .arg(&dsh_js_path)                               // realpath 后的 lib/bin.js
+    .args(["--profile", "web"])
+    .arg("--patch").arg(&overlay_path)               // 强制 printUrl
+    .args(["--no-open", "--port", "0"])
+    .current_dir(&workspace)                          // 必须显式指定
+    .env("DSH_HOME", &dsh_home)                       // 见 §6 实例策略
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .process_group(0)                                 // Unix：独立进程组
+    .spawn()?;
+```
+
+**端口策略权衡（v2.1 修正）**
+
+- `--port 0`：永不冲突，但每次 authority 都变 ⇒ **放弃 cookie 复用与"接管上次实例"的能力**。
+- **固定端口**（如默认 3080）：authority 稳定 ⇒ 首次兑换过 cookie 后，**后续启动可直接加载根路径、无需 token**（实测 cookie 跨重启有效），也才能"接管"自己上次启动且仍存活的实例。
+- 建议：默认固定端口 + 冲突时走 §6 的探测分支（占用者是 harness → 复用/接管；是别的程序 → 提示换端口）。
+
+**overlay 文件（实测可覆盖 printUrl；注意 patch 会替换整行 config，必须写全）**
+
+```yaml
+- id: web-runtime
+  config:
+    openBrowser: !!js ctx.webStartup.openBrowser
+    printUrl: true
+    surfaceContext: true
+    trustedHosts: !!js ctx.webStartup.trustedHosts
+```
+
+**URL 解析（对 LAN 后缀健壮）**
+
+```rust
+// 行形如：dsh web: http://127.0.0.1:59753/?token=xxx[ (LAN: http://10.0.0.5:59753/?token=xxx)]
+fn parse_dsh_url(line: &str) -> Option<Url> {
+    let rest = line.split_once("dsh web:")?.1;
+    let raw = rest.split_whitespace().next()?;   // 关键：只取第一个 token，丢掉 "(LAN: ...)"
+    let url = Url::parse(raw).ok()?;
+    (url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && url.query().is_some())
+        .then_some(url)
+}
+```
+
+---
+
+## 5. 进程生命周期（修正版）
+
+- **正常退出**：向进程组发 SIGTERM → 等 5s → SIGKILL；实测 harness 2s 内优雅退出。
+- **崩溃孤儿（macOS/Linux）**：Tauri 被强杀时子进程会存活。壳在 `App Data/dsh-desktop/state.json` 记录 `{pid, port, cwd, startedAt}`，**下次启动先自愈清理**；同时启动后每 30s 校验一次子进程存活。
+- **Windows**：V1 用 `taskkill /PID <pid> /T /F`；正式版换 Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）。
+- **单实例**：`tauri-plugin-single-instance` 只保证“一个壳”，不代表“一个 harness”，需与 §6 一起看。
+
+---
+
+## 6. 实例策略与插件保留（v1 缺失，含实测）
+
+前提事实：**第三方插件装在 profile 里**（`$DSH_HOME/profiles/web/`），不在 DSH_HOME 本身。本机实测该 profile 内容：
+
+```text
+~/.dsh/profiles/web/
+├── package.json          # dependencies: dshmarket ^1.45.1 / dsh-better-sidebar ^0.18.1 / dsh-dream-skin ^8.30.1
+├── cordis.patch.yml      # 该 profile 的用户 patch
+├── cordis.yml            # 每次 boot 由 prepareProfile 重写
+├── node_modules/         # pnpm 安装的插件依赖树（102 项）
+├── pnpm-lock.yaml / pnpm-workspace.yaml
+└── .dsh-market/          # 插件自身的状态（market）
+```
+
+因此“保留插件”= 保留这份 profile。`--port 0` 意味着桌面壳每次新起一个 harness，需要在下面三条路里选：
+
+### 方案 A：共用 `~/.dsh`（推荐，零配置）
+
+桌面壳不设置 `DSH_HOME`。插件、market 状态、sessions、credentials、settings 全部天然保留，无迁移成本。
+
+- 代价：桌面壳起的 harness 与 CLI/Automator 起的 harness 共享同一份 `~/.dsh`。**同时运行**时属于未声明支持的并发场景（各自写自己的 session 文件没问题，但 `profiles/web/cordis.yml`、`settings.yaml`、插件状态文件是共享可写文件）。
+- 缓解：桌面壳启动前检测是否已有其它 harness 在跑（扫描 `dsh` 进程 / 常见端口），有则提示并默认不新开。
+
+### 方案 B：独立 DSH_HOME + 共享 profile 依赖（**已实测可行**）
+
+在独立 home 里只放三样东西，`node_modules` 软链到真实 profile：
+
+```text
+~/.dsh-desktop/profiles/web/
+├── package.json              # 从 ~/.dsh 复制
+├── cordis.patch.yml          # 从 ~/.dsh 复制
+├── node_modules -> ~/.dsh/profiles/web/node_modules   # 软链，插件与依赖树共享
+└── cordis.yml                # 由独立 home 自己生成
+```
+
+**实测**（`DSH_HOME=<隔离目录> dsh --profile web --dump-config`）：配置树 551 行，`dshmarket` / `dsh-better-sidebar` / `dsh-dream-skin` 三个插件全部加载；`cordis.yml` 写在隔离 home 内，真实 profile 未被写入。
+
+- 收益：插件与依赖树共享（无重复安装、无版本漂移），而 sessions / storages / credentials / settings 隔离。
+- 注意：插件写在 **profile 目录**的状态（如 `.dsh-market`）与写在 **DSH_HOME 根**的状态（如 `dream-skin.json`）不会自动共享，需要各自配置一次；必要时把这两处也软链到隔离 home。
+- 插件升级仍由 CLI 在真实 profile 执行即可，桌面壳通过软链自动看到新版本；两侧的 `pnpm-lock.yaml` 会各自存在（不影响运行）。
+
+### 方案 C：独立 DSH_HOME + 重装插件
+
+在隔离 home 执行 `dsh plugin --profile web add dshmarket dsh-better-sidebar dsh-dream-skin`（官方 pnpm 转发路径）。干净但代价最大：依赖磁盘 ×2、版本会各自主张、market/skin 需重新配置。
+
+### 方案 A 的检测与“使用正在运行的实例”（v2.1 补充，含实测）
+
+**检测（可行）**：候选端口 = 桌面壳自己记录的端口 + 默认 3080 + 监听中的 `dsh` 进程端口；对每个端口 `GET http://127.0.0.1:<port>/`：
+
+| 响应 | 含义 | 动作 |
+|---|---|---|
+| `401` + body 含 `dsh web authentication required` | 确认是 harness，且当前 WebView 无 cookie | 走“复用/接管”分支 |
+| `200` | harness 已接受当前 WebView 的 cookie | 直接复用 |
+| 其它 | 端口被别的程序占用 | 提示换端口 |
+
+**复用的三种情形**：
+
+1. **自己的 WebView 数据目录里已有该 authority 的 cookie**（固定端口 + 同一 `DSH_HOME`）→ **可以直接复用**：加载根路径即可，无需 token（实测 cookie 跨进程重启有效；有效期 30 天）。
+2. **桌面壳自己启动、仍存活的实例** → 复用它需要 token URL：把当次 URL 写入状态文件（0600、退出即删）即可直接复用；token 可重复使用（实测）。安全权衡：token 等同完整控制权，建议默认关闭该行为并提供开关。
+3. **其它进程（CLI / Automator）启动的实例** → **无法复用**（launchToken 每进程随机且不落盘）。可提供三个动作：
+   - **用系统浏览器打开** `http://127.0.0.1:<port>/`（该浏览器已有 cookie 时直接可用，例如用户长期使用的 3080）；
+   - **停止它并接管**：按端口定位监听进程 → 校验是 node/dsh → `SIGTERM` → 等待 → `SIGKILL`（与 §5 同一套逻辑），然后由桌面壳启动；
+   - **仍然新开一个**：需明确提示“两个 harness 共享 `~/.dsh` 属未声明支持”。
+
+**cookie 失效时的恢复**：若探测到 `401` 且无可用 token（cookie 过期/被清理），唯一出路是**重启 harness 以取得新的 URL**——因此桌面壳必须在“接管”分支里具备重启能力。
+
+### 共同约束
+
+无论哪种：**不要**尝试复用另一个进程的会话——其 cookie 绑定对方的 `authority`（host:port），且没有对方的 token；每次启动都必须用当次新 URL。
+
+---
+
+## 7. 安全与 WebView 集成（修正版）
+
+- Harness 窗口：**零 capability**；页面无法访问 `invoke`/fs/shell/process。
+- 导航限制：只允许 `http://127.0.0.1:<当次端口>`；其他 `https` 链接在 Rust 侧用 opener 打开系统浏览器（**Rust 侧调用不受前端 capability 约束**）。
+- Splash 窗口：本地资源，需要 `core:event:default`（监听启动状态）——v1 的 `capabilities/splash.json` 不能为空。
+- 需实测确认（本机 WebView 行为，非文档结论）：
+  - `<input type=file>`（附件上传）是否直接可用；
+  - 下载（GUI 里的 Download）是否需要在窗口上处理 download 事件；
+  - `window.open`/新窗口请求的拦截路径。
+- 剪贴板：`http://127.0.0.1` 属 secure context，`navigator.clipboard` 可用，无需额外 capability。
+
+---
+
+## 8. 日志（修正版）
+
+- stdout/stderr 双写：文件 + 内存环缓冲（最近 200 行，用于错误页）。
+- **URL 行脱敏**：日志中把 `token=...` 替换为 `token=***`，避免凭证长期留档。
+- 文件轮转：单文件 5MB × 3 份。
+
+---
+
+## 9. 平台差异
+
+| 平台 | 必做 | 备注 |
+|---|---|---|
+| macOS | 签名 + 公证（对外分发）；用 `process_group` 管理；关注 TCC：子进程的文件访问会以宿主 App 身份触发授权弹窗 | TCC 行为需实机确认 |
+| Windows | `cmd.exe /D /S /C` 起 `.cmd`；`CREATE_NO_WINDOW`；`taskkill /T` | 后续 Job Object |
+| Linux | 声明 WebKitGTK 运行依赖 | — |
+
+---
+
+## 10. 验收清单（含实施后状态）
+
+启动/窗口/单实例/安全/日志（沿用 v1）之外：
+
+| 验收项 | 状态 |
+|---|---|
+| PATH 中无 node 时也能启动（locator 解析 node） | ✅ 已实现，单测覆盖软链+node 解析（未单独剥离 PATH 跑 GUI） |
+| workspace 正确 | ✅ 实机：config 默认 `$HOME`，state.json 记录 cwd；切换 UI 未做 |
+| 用户 patch 关掉 `printUrl` 时仍能拿到 URL | ✅ overlay 生效（真实 dsh 实测） |
+| 首启 90s / 常态 30s 超时给出可诊断错误页 | ✅ 已实现，未触发过 |
+| Tauri 被 `kill -9` 后重启：残留 harness 被自愈清理 | ✅ 已实现，待实机演练确认 |
+| 同屏已有 CLI `dsh web` | ✅ **实机验证**：接管成功（§13.2） |
+| WebView 内 token→cookie 与会话可用 | ✅ **实机验证**（§13.2） |
+| dsh 核心升级（检查 + 安装 + 重启生效） | ✅ 单测 + 联网集成测试；实机升级待下次发版确认 |
+| 下载落盘 `~/Downloads`、外链/新窗走系统浏览器 | ✅ 已实现，待点击确认 |
+| 附件上传（`<input type=file>`） | ✅ wry 原生实现，待点击确认 |
+| 打包为 `.app` | ✅ 已产出并核验 Info.plist/图标 |
+| 合盖休眠再唤醒 | ⚠️ 不适用/待确认：harness 是壳的子进程，随壳一起挂起唤醒 |
+| 多显示器/缩放切换 | ⚠️ 待实测 |
+| 签名与公证 | ❌ 未做（对外分发必需） |
+
+---
+
+## 11. 待验证项（实施后状态）
+
+1. ~~WKWebView 对 token→cookie 的处理~~ → ✅ 已实机验证（§13.2）。
+2. `<input type=file>` / 下载 / `window.open` 的默认行为 → 已按 Tauri 2.11 的
+   `on_new_window` / `on_download` 与 wry 的 `runOpenPanel` 实现，**待点击确认**。
+3. macOS TCC 授权归因（子进程访问用户目录时的弹窗归属）→ 未验证。
+4. 运行中 reload（新增/修改 patch）对已建立 WebView 会话的影响 → 实测不会重新播报 URL；会话是否受影响仍未验证。
+
+---
+
+## 12. 实施顺序（修正版）
+
+全部完成（对应 `dsh-desktop/src-tauri/src/`）：
+
+1. ✅ Tauri Vanilla 项目 + single-instance（`lib.rs`）
+2. ✅ locator（dsh **+ node**，含 login shell 兜底）（`locator.rs`）
+3. ✅ spawn（launcher flag 顺序、cwd、`--patch` overlay、process group）（`harness.rs`）
+4. ✅ 持续读 stdout/stderr + URL 解析（含 LAN 后缀）+ 超时（`harness.rs`）
+5. ✅ `WebviewUrl::External` 动态窗口 + 导航限制 + 外链/新窗走系统浏览器 + 下载落盘（`window.rs`）
+6. ✅ 状态文件 + 自愈清理（`process.rs`）
+7. ✅ 退出清理（SIGTERM → SIGKILL；Windows `taskkill /T /F`）
+8. ✅ Splash + 错误页（Rust 侧 eval 更新，页面零权限）
+9. ✅ 日志脱敏 + 5MB 轮转（`harness.rs`）
+10. ✅ dsh 核心升级：检查 + 安装 + 重启生效（`update.rs`，§13.4）
+11. ✅ 打包 `.app`（`icons/icon.icns` + `bundle.targets=["app"]`）
+
+仍然不做：插件管理 UI、模型管理 UI、Tauri ↔ Harness IPC、打包 Node/Harness、自定义 UI、
+签名与公证、Windows Job Object。
+
+---
+
+## 13. 实施状态（本次已落地并验证）
+
+包位置：`dsh-desktop/`（与本文同目录）。
+
+已实施：locator（dsh + node，含 login shell 兜底）、启动（launcher flag 顺序 / cwd / overlay / 进程组）、
+stdout+stderr 持续读取、token 脱敏、URL 解析（LAN 后缀健壮）、探测与复用、状态文件与残留自愈、
+退出清理（SIGTERM→SIGKILL）、Splash/错误页、导航限制、外链走系统浏览器、日志轮转、单实例。
+
+验证证据：
+
+- `cargo check --all-targets`：通过，无告警。
+- `cargo test`：**6 passed**（URL 解析含 LAN 后缀、拒绝非 127.0.0.1、拒绝对话行、token 脱敏、
+  状态文件往返、locator 穿软链解析 `dsh.js` 并解析到 `node`）。
+- 所有 §2 的实测结论均来自本机真实运行（隔离 `DSH_HOME`，未触碰 `~/.dsh`）。
+
+实施期新增发现（本文原未覆盖）：
+
+1. Tauri **2.11** 的 `app.security` 已无 `dangerousRemoteDomainIpcAccess` 字段（`tauri-build` 会报
+   `unknown field`）；等价约束是"没有任何 capability 覆盖 Harness 窗口"，已按此实现，
+   `capabilities/splash.json` 只作用于 splash。
+2. `tauri::generate_context!()` 要求 `src-tauri/icons/icon.png` 存在，即使 `bundle.active=false`。
+3. 关窗语义：macOS 默认关窗不退出进程，实现里显式把 `CloseRequested` 绑定为 `app.exit(0)`，
+   否则会出现"关窗后 harness 仍在跑"——正是本方案要避免的情况。
+
+未在本机验证（需实机 GUI 会话）：WebView 内 token→cookie 流程、附件上传/下载/`window.open`、
+macOS TCC 授权归因。
+
+### 13.1 首次实机运行暴露的问题与修正（已改）
+
+现象：桌面壳窗口显示 `dsh web authentication required; reopen the URL printed by dsh web.`
+
+原因：检测到 3080 上已有外部 Harness 时，实现直接加载了**无会话的根 URL**（探测请求不带 cookie，必然 401），
+且 `create_harness` 随即关闭 splash，把解释文字一起关掉。
+
+修正（已实现并重新通过 `cargo check`）：
+
+1. 区分"自己上次启动的实例"与"外部实例"：前者用 state.json 的 pid 与端口监听者比对，命中则**复用**（cookie 对同一
+   authority 仍有效，实测跨重启 200）。
+2. 外部实例一律**接管**：先用 401 特征确认是 Harness（不误杀未知进程）→ 用 `lsof -tiTCP:<port>` 取监听者 PID →
+   只对该 PID 发 `SIGTERM`（不用进程组，避免连带杀掉用户终端）→ 等端口释放 → 自己启动拿新 token → 开窗。
+3. 新增配置 `take_over_existing`（默认 true）；置 false 时改为用系统浏览器打开并给出说明。
+4. 关闭窗口前不再提前关闭 splash；只有拿到**带 token 的 URL**后才创建 Harness 窗口。
+
+### 13.2 实机验证结论（2026-09-13）
+
+用户实机运行通过，核对痕迹如下：
+
+| 检查项 | 结果 |
+|---|---|
+| 3080 监听者 | `node 73596`，即桌面壳自己启动的实例（对外部实例的**接管**成功） |
+| `state.json` | `{pid: 73596, port: 3080, cwd: /Users/wangzy}`，与监听者一致 ⇒ 下次启动走**复用**分支 |
+| 日志脱敏 | `token=***`，明文 token 0 行 |
+| WebView 会话 | token→cookie 在 WKWebView 内成功，会话列表、文件卡片、输入框均正常 |
+
+据此 §11 的待验证项 1（WKWebView 内的 token→cookie 处理）**已关闭**；附件上传/下载/`window.open`/
+TCC 归因仍待验证。
+
+### 13.3 缺失部分补齐（2026-09-13）
+
+| 项 | 处理 |
+|---|---|
+| 外链 / `window.open` | `on_new_window` → 记录日志 + `open_external` + `NewWindowResponse::Deny`（远程内容永不开 Tauri 新窗） |
+| 下载 | `on_download`：`Requested` 时把目的地改到 `~/Downloads/<原文件名>`，`Finished` 记日志；`DownloadEvent` 为 `#[non_exhaustive]`，已加兜底分支 |
+| 附件上传（`<input type=file>`） | wry 已实现 `webView:runOpenPanelWithParameters:`（WKWebView 原生面板），**无需 capability**，仅待实机点击确认 |
+| 壳侧事件日志 | 新增 `harness::init_app_log` / `app_log`，与 Harness 输出写同一份日志并统一 token 脱敏 |
+| 打包 `.app` | 生成 `icons/icon.icns`（sips + iconutil，10 档尺寸）；`bundle.active=true`、`targets=["app"]`、`macOS.minimumSystemVersion=10.15`；构建命令 `pnpm tauri build --bundles app` |
+| 开机自启 | 走系统"登录项"，不需要代码 |
+| 签名/公证 | 未做：对外分发必需，本机运行不需要 |
+| Windows Job Object | 仍为 TODO（当前 `taskkill /T /F`），无法在 macOS 验证 |
+
+生成 / 验证：`cargo check --all-targets` 无告警、`cargo test` 6 passed。
+
+### 13.4 dsh 核心升级（新增，2026-09-13）
+
+新增 `src-tauri/src/update.rs`，把启动脚本里验证过的升级策略搬进壳：
+
+- 版本比较：自实现 semver（含 prerelease 排序），纯函数、6 个单测覆盖
+  （`1.2.10 > 1.2.9`、`1.0.0 > 1.0.0-rc.1`、`rc.2 > rc.1 > alpha.2`、畸形输入拒绝）。
+- 取版本：`npm view <pkg> dist-tags --json` → 在配置的 tag 列表里取最高版本（默认 `latest,next`），从不降级。
+- 安装：`npm install -g --no-fund --no-audit <pkg>@<具体版本>`；npm 从 node 同目录解析（GUI 无 Homebrew PATH），
+  并在 npm 全局前缀 ≠ CLI 实际位置时带 `--prefix` —— 与启动脚本一致。
+- 时序：**更新在探测之前**；更新成功则强制重启实例（否则复用旧进程仍跑旧二进制）。
+- 可见性：检查/安装/失败都写进 `logs/harness.log`；splash 显示"正在检查 dsh 更新…/发现新版本…"。
+- 配置：`auto_update`（默认 true）、`update_tags`（默认 `["latest","next"]`）。
+
+验证：`cargo test` **12 passed**（6 原有 + 6 版本比较）；另加一个联网集成测试
+`tests/update_live.rs`（默认跳过，设 `DSH_DESKTOP_LIVE_TESTS=1` 才跑），实测本机 registry head =
+**0.1.5-rc.2**，且 99.0.0 判为已是最新（不降级）。
+
+### 13.5 构建入口与 Linux 支持（2026-09-13）
+
+**Makefile**（`dsh-desktop/Makefile`，141 行）统一了构建入口，并用 `uname -s` 分平台：
+
+- 目标：`help`（默认）、`doctor`、`check`、`fmt`、`clippy`、`test`、`test-live`、`dev`、`build`、
+  `bundle`（`bundle` 依赖 `node-deps` 自动 `pnpm install`）、`run`、`icons`、`clean`、`distclean`；
+- 平台：macOS → `--bundles app`（产物 `.../macos/DSH Desktop.app`），Linux → `--bundles deb`
+  （可 `BUNDLE_TARGETS=appimage|rpm` 覆盖）；其他平台在解析阶段直接报错；
+- `doctor` 在 Linux 上用 `pkg-config` 检查 `webkit2gtk-4.1` / `gtk+-3.0` / `libsoup-3.0`，
+  并打印 Debian/Fedora/Arch 三家的安装命令；macOS 提示 Xcode CLT；
+- `CARGO_HOME` / `PNPM_STORE` 可覆盖且默认留空（沙箱/CI 重定向缓存用，不影响日常）。
+
+**Linux 可移植性修复**：`listener_pid` 原先只用 `lsof`，而不少发行版不预装它，会让"接管外部实例"
+直接失败。现在改为 `lsof` → `ss -ltnpH 'sport = :PORT'`（iproute2，通常自带）回退，
+解析函数 `parse_ss_pid` 抽出并有单测。
+
+验证：`make help` / `make doctor` / `make -n bundle` / `make check` / `make test` 均在本机跑通，
+`make test` = **13 passed**。Linux 分支未在 Linux 机器上实测（环境限制）。
+
+### 13.6 启动延迟优化（2026-09-13）
+
+性能审查的结论：这份代码是进程编排 + I/O，CPU/内存没有热点；唯一有量级的是**每次启动都联网查一次
+npm registry**。实测各环节：
+
+| 环节 | 实测 | 处理 |
+|---|---|---|
+| `npm view ... dist-tags` | **1.875 s**（挂起时最长等 fetch 超时） | 加缓存 + 超时压到 8 s |
+| login shell 兜底 `zsh -lc` | 16 ms | 不动（收益 < 复杂度） |
+| `node <dsh.js> --version` | 103 ms | 不动 |
+| 端口探针 | 12 ms | 不动 |
+| Ring/Logger 互斥、日志写入 | 低频、每行一次 syscall | 不动（无缓冲是有意为之，崩溃时要能立刻落盘） |
+
+实现：
+
+- 新增 `update::Cache { checked_at, installed, latest }`，落在 `<app-data>/update-check.json`；
+  `is_fresh(now, installed, interval)` 的规则：已安装版本变了即失效；**查询失败只缓存 5 分钟**；
+  `interval = 0` 表示每次启动都查（等价旧行为）。
+- 抽出纯函数 `judge(latest, current)`，让"新查询"和"缓存答案"走同一套判定。
+- `check_cached(...)` 作为唯一入口；命中缓存时记一条 `update check: cached answer`。
+- `FETCH_TIMEOUT_MS = 8_000` 取代原来的 25 s。
+- 配置新增 `update_check_interval_minutes`（默认 60，serde default 兼容旧 config.json）。
+
+验证：`cargo test` **16 passed**（新增 judge 判定、缓存新鲜度、缓存落盘往返）；
+联网集成测试新增"冷/热对比"，实测 **cold = 1168 ms（真实查询）→ warm = 0 ms（缓存）**，且两次结论一致。

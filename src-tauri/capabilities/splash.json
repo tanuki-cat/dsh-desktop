@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "splash",
+  "description": "Only the local splash window gets core permissions; the Harness window gets none.",
+  "windows": ["splash"],
+  "permissions": ["core:default"]
+}

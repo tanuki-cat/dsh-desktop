@@ -1,0 +1,1 @@
+{"splash":{"identifier":"splash","description":"Only the local splash window gets core permissions; the Harness window gets none.","local":true,"windows":["splash"],"permissions":["core:default"]}}
