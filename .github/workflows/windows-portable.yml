@@ -16,8 +16,8 @@ on:
         description: 随包附带的 Node 版本
         required: false
         default: 22.23.2
-      ref:
-        description: 从哪个分支/标签构建（自带运行时的实现目前在 feat/bundled-runtime）
+      build_ref:
+        description: 从哪个分支标签构建（自带运行时的实现目前在 feat/bundled-runtime）
         required: false
         default: feat/bundled-runtime
       attach_to_release:
@@ -39,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.build_ref }}
 
       - uses: pnpm/action-setup@v4      # 版本取自 package.json 的 packageManager
       - uses: actions/setup-node@v4
