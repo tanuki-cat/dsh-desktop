@@ -117,7 +117,8 @@ jobs:
           tar -chf - -C src-tauri/runtime . | tar -xf - -C "$app/runtime"
           test -f "$app/runtime/node/node.exe" || { echo "::error::运行时拷贝不完整"; exit 1; }
 
-          cat > "$app/使用说明.txt" <<TXT
+          # 文件名用 ASCII：中文文件名在不同解压工具里容易乱码（内容仍是中文）
+          cat > "$app/README.txt" <<TXT
           DSH Desktop（Windows 免安装版）
 
           1) 解压后双击 "DSH Desktop\dsh-desktop.exe" 即可，不要单独移动 exe。
@@ -130,7 +131,9 @@ jobs:
           里面会写明用的是自带运行时还是系统安装（runtime: node … (bundled) …）。
           TXT
 
-          7z a -tzip "dist/dsh-desktop_${VERSION}_windows-x64-portable.zip" "dist/DSH Desktop" >/dev/null
+          # 在 dist 里打包：否则 7z 会把 "dist/DSH Desktop/…" 整条相对路径写进压缩包，
+          # 解压后多一层 dist 目录。
+          (cd dist && 7z a -tzip "dsh-desktop_${VERSION}_windows-x64-portable.zip" "DSH Desktop" >/dev/null)
           ls -lh dist
 
       - uses: actions/upload-artifact@v4
