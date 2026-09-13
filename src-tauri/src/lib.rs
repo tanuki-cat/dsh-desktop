@@ -189,6 +189,69 @@ pub fn run() {
         });
 }
 
+/// May the instance currently owning the port be stopped so an update can rewrite the CLI tree
+/// it serves from? Node loads modules lazily, so updating a live tree breaks the running
+/// Harness on its next `require()` — the tree must not be touched while it is in use.
+fn may_stop_before_update(
+    probe: &harness::Probe,
+    is_ours: bool,
+    take_over_existing: bool,
+) -> Result<(), String> {
+    match probe {
+        harness::Probe::Closed => Ok(()),
+        harness::Probe::Other => Err("端口被其它程序占用，跳过本次更新".to_string()),
+        _ if is_ours || take_over_existing => Ok(()),
+        _ => Err("端口上是外部 Harness，且 take_over_existing=false，跳过本次更新".to_string()),
+    }
+}
+
+/// Stop whatever Harness owns the port, so the install cannot rewrite the tree it is serving
+/// from. Returns Err with the reason when the instance must be left alone.
+fn stop_instance_before_update(
+    app: &AppHandle,
+    data_dir: &Path,
+    port: u16,
+    config: &Config,
+) -> Result<(), String> {
+    let probe = harness::probe(port);
+    if matches!(probe, harness::Probe::Closed) {
+        return Ok(());
+    }
+    let owner = harness::listener_pid(port);
+    let ours = process::read_state(data_dir)
+        .map(|state| state.pid)
+        .filter(|pid| Some(*pid) == owner && process::is_alive(*pid));
+    may_stop_before_update(&probe, ours.is_some(), config.take_over_existing)?;
+
+    let Some(pid) = owner else {
+        return Err(format!(
+            "端口 {port} 上已有 Harness，但无法确定它的进程（lsof 不可用），跳过本次更新"
+        ));
+    };
+    window::set_status(
+        app,
+        "更新前先停止正在运行的 Harness…",
+        &format!("pid {pid}"),
+    );
+    process::terminate(pid, TERMINATE_GRACE);
+    let deadline = std::time::Instant::now() + TERMINATE_GRACE;
+    while !matches!(harness::probe(port), harness::Probe::Closed) {
+        if std::time::Instant::now() > deadline {
+            return Err(format!(
+                "停止 pid {pid} 后端口 {port} 仍被占用，跳过本次更新"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if ours.is_some() {
+        process::clear_state(data_dir);
+    }
+    harness::app_log(&format!(
+        "stopped Harness pid {pid} before updating the CLI"
+    ));
+    Ok(())
+}
+
 /// Forget a supervised pid without signalling it (used when the process is already gone).
 fn disown(pid: u32) {
     let mut guard = LIVE.lock().unwrap();
@@ -313,26 +376,41 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                             &format!("v{from} -> v{to}"),
                         );
                         harness::app_log(&format!("update available: {from} -> {to}, installing"));
-                        let prefix = update::install_prefix(&location.dsh_js);
-                        match update::install(&npm, update::PACKAGE, &to, prefix.as_deref()) {
+                        // npm rewrites the CLI tree in place. Anything serving from it must be
+                        // stopped first, or the live session breaks on its next lazy require().
+                        // A deferred update only skips the install: startup continues and the
+                        // instance keeps running (its tree was never touched).
+                        match stop_instance_before_update(app, data_dir, port, &config) {
+                            Err(reason) => harness::app_log(&format!(
+                                "update deferred, keeping v{from}: {reason}"
+                            )),
                             Ok(()) => {
-                                version = locator::version(&location).unwrap_or_else(|| to.clone());
-                                if version == from {
-                                    // npm installed the package somewhere other than where this
-                                    // CLI lives (custom prefix, pnpm/yarn/volta layout), so the
-                                    // supervised binary is unchanged. Say so instead of claiming
-                                    // an update and restarting the Harness for nothing.
-                                    harness::app_log(&format!(
-                                        "update installed but the supervised CLI is still {from}; check npm global prefix"
-                                    ));
-                                } else {
-                                    just_updated = true;
-                                    harness::app_log(&format!("dsh updated: {from} -> {to}"));
+                                let prefix = update::install_prefix(&location.dsh_js);
+                                match update::install(&npm, update::PACKAGE, &to, prefix.as_deref())
+                                {
+                                    Ok(()) => {
+                                        version = locator::version(&location)
+                                            .unwrap_or_else(|| to.clone());
+                                        if version == from {
+                                            // npm installed the package somewhere other than where
+                                            // this CLI lives (custom prefix, pnpm/yarn/volta layout),
+                                            // so the supervised binary is unchanged. Say so instead of
+                                            // claiming an update and restarting for nothing.
+                                            harness::app_log(&format!(
+                                                "update installed but the supervised CLI is still {from}; check npm global prefix"
+                                            ));
+                                        } else {
+                                            just_updated = true;
+                                            harness::app_log(&format!(
+                                                "dsh updated: {from} -> {to}"
+                                            ));
+                                        }
+                                    }
+                                    Err(reason) => harness::app_log(&format!(
+                                        "update failed, keeping v{from}: {reason}"
+                                    )),
                                 }
                             }
-                            Err(reason) => harness::app_log(&format!(
-                                "update failed, keeping v{from}: {reason}"
-                            )),
                         }
                     }
                     update::Status::UpToDate { version: current } => {
@@ -577,6 +655,20 @@ fn fail(app: &AppHandle, status: &str, detail: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_only_stops_an_instance_it_is_allowed_to_stop() {
+        use harness::Probe;
+        // Nothing running: update freely.
+        assert!(may_stop_before_update(&Probe::Closed, false, false).is_ok());
+        // Someone else owns the port: never install over it.
+        assert!(may_stop_before_update(&Probe::Other, false, true).is_err());
+        // Our own leftover instance may always be stopped.
+        assert!(may_stop_before_update(&Probe::HarnessNoSession, true, false).is_ok());
+        // A foreign Harness only with explicit permission.
+        assert!(may_stop_before_update(&Probe::HarnessNoSession, false, true).is_ok());
+        assert!(may_stop_before_update(&Probe::HarnessNoSession, false, false).is_err());
+    }
 
     #[test]
     fn partial_configs_parse_and_broken_ones_are_not_overwritten() {

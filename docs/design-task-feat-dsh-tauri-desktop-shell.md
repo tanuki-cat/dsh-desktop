@@ -685,3 +685,32 @@ npm 会把包装到别处：实际运行的仍是旧版，日志却写 `dsh upda
 终端里另跑同 profile 的 `dsh` 仍会并发写会话存储。README 的「行为」节已写明该边界与 `dsh_home` 隔离选项。
 
 验证：`cargo test` **28 passed**（新增版本区间判定与 URL 兜底两组用例）、`make clippy` 0 warning。
+
+### 13.13 修复：更新会重写正在服务中的 CLI 树（2026-09-13）
+
+**问题（自查 + 实验确认）**：更新检查与安装排在"检测实例"之前，所以当端口上已经有实例在跑
+（用户自己起的 CLI，或强杀后 state.json 丢失的残留）时，`npm install -g` 会**一边原地重写它正在服务的那棵树、
+一边让它继续工作**。node 是按需懒加载的，树被换掉之后运行中的进程下一次 `require()` 就会失败 ——
+这正是"更新期间损坏会话"的真实来源。
+
+**实验**（macOS，node 22.23.2）：
+
+```bash
+node -e "setTimeout(() => require('/tmp/tree-demo/mod.js'), 1500)" &
+sleep 0.4 && rm -rf /tmp/tree-demo            # 模拟"树被换走"
+# => lazy require FAILED: MODULE_NOT_FOUND
+```
+
+**修复**：把"停实例"提到安装之前，并抽出一个纯函数承载策略（可单测）：
+
+- `may_stop_before_update(probe, is_ours, take_over_existing)`：端口空闲 → 放行；端口被非 Harness 占用 → 拒绝；
+  是自家实例、或允许接管的外部实例 → 放行；外部实例且 `take_over_existing=false` → 拒绝；
+- `stop_instance_before_update()`：按策略判定后 SIGTERM 目标进程组、等端口释放（复用 `TERMINATE_GRACE`），
+  成功后清掉过期的 state.json，并记一条 `stopped Harness pid N before updating the CLI`；
+- **拒绝时跳过本次更新**（不是跳过启动）：记 `update deferred, keeping vA: …`，随后照常走检测/接管/启动流程，
+  实例完全不受影响；
+- 启动状态页按顺序显示：检查更新 → 发现新版本 → **更新前先停止正在运行的 Harness…** → 更新中。
+
+**验证**：新增单测 `update_only_stops_an_instance_it_is_allowed_to_stop` 覆盖策略矩阵（空闲 / 他人占用 / 自家残留 /
+允许接管的外部实例 / 不允许接管的外部实例），`cargo test` **29 passed**、`make clippy` 0 warning。
+真实更新路径需要 registry 有新版本才能触发，本轮只做策略级验证。

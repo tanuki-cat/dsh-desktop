@@ -42,7 +42,7 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - 退出路径实机复现（2026-09-13，macOS）：⌘Q 等价的 Apple Event 退出后，日志出现
   `stopping Harness pid 92619` / `Harness stopped`，3080 端口释放、`state.json` 删除；
   修复前只处理红点关闭（`ExitRequested`），⌘Q 走的是 `RunEvent::Exit`，清理从未执行。
-- 离线测试：`cargo test` **28 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析、
+- 离线测试：`cargo test` **29 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析、
   6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、缓存落盘往返、
   npm PATH 前缀、沉默对端探针超时、package.json 版本解析、部分/损坏 config.json 处理、
   进程组终止与僵尸进程识别、下载重名避让、URL 解析兜底、CLI 版本区间判定）。
@@ -173,6 +173,7 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | 强杀（SIGKILL）/ 崩溃 | 拿不到任何回调，只能靠下次启动自愈清理 |
 | 启动等待 URL 超时 / 窗口创建失败 | 停掉刚起的子进程 → 状态页报错（不会留下占着端口的半启动实例） |
 | 启动成功后 Harness 意外退出 | 看护线程发现退出 → 重新弹出状态页显示退出码与最近输出、清 state.json |
+| 有新版 dsh 但端口上是外部实例且不允许接管 | 跳过本次更新（不重写别人正在用的树），实例继续服务，日志记 `update deferred` |
 | 下载同名文件 | 自动改名 `name-1.ext`，不覆盖已有文件 |
 | 关闭状态页（启动失败时） | 直接退出应用（此时没有 Harness 窗口，不会留下无窗口进程）；应用自己移除该窗口走 `destroy`，不触发这条 |
 | 壳被强杀后再次启动 | 读取 state.json 自愈清理残留进程 |
@@ -190,13 +191,17 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 1. 需要联网时：`npm view @deepseek-ai/dsh dist-tags --json` → 在 `update_tags` 里取版本号最高者
    （fetch 超时压到 **8 s**，离线时快速回退而不是等 npm 默认的 25 s）；
 2. 与已安装版本做 semver 比较（`rc.2 > rc.1 > alpha.2`，正式版高于同号预发布版），**从不降级**；
-3. 有新版则 `npm install -g --no-fund --no-audit @deepseek-ai/dsh@<解析出的具体版本>`；
+3. **先把正在使用这棵 CLI 树的实例停掉**：npm 是原地重写依赖树，而 node 按需懒加载模块 ——
+   树被换走后运行中的 harness 下一次 `require()` 会直接 `MODULE_NOT_FOUND`（实测）。所以先 SIGTERM 停实例、
+   等端口释放，再安装；不能停时（外部实例且 `take_over_existing=false`、或拿不到 PID）**跳过本次更新**并记日志，
+   实例不受任何影响；
+4. 有新版则 `npm install -g --no-fund --no-audit @deepseek-ai/dsh@<解析出的具体版本>`；
    npm 取自 node 同目录，且 npm 全局前缀 ≠ CLI 实际位置时自动带 `--prefix`；
-4. 所有 npm 子进程都在 PATH 最前面插入 npm 所在目录：npm 是 `#!/usr/bin/env node` 脚本，
+5. 所有 npm 子进程都在 PATH 最前面插入 npm 所在目录：npm 是 `#!/usr/bin/env node` 脚本，
    而 GUI 启动的壳只有 launchd 的 PATH（不含 node），不这样处理会直接 `exit 127`（详见设计文档 §13.8）；
-5. 安装后**回读一次 CLI 版本**：版本没变说明 npm 装到了别的前缀（自定义 prefix、pnpm/yarn 布局），
+6. 安装后**回读一次 CLI 版本**：版本没变说明 npm 装到了别的前缀（自定义 prefix、pnpm/yarn 布局），
    此时只记日志、不谎报成功、也不为一次无效更新重启实例；
-6. 刚更新过 → 强制重启实例（否则复用旧进程仍跑旧二进制）。
+7. 刚更新过 → 强制重启实例（否则复用旧进程仍跑旧二进制）。
 
 结果写入日志：`dsh is up to date` / `update available: A -> B` / `dsh updated: A -> B` / `update failed, keeping vA`。
 
