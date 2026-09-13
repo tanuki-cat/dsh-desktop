@@ -803,3 +803,27 @@ workspace = …` 和 `spawn: <完整命令行>` 两行日志——下一次失�
 
 顺带记录一处**未修**的既有缺口：§4 要求更新时追加 `--cache <app-data>/runtime/npm-cache` 复用依赖树缓存，
 `update::install()` 目前没有传（每次更新重新下载整棵依赖树）。它不影响合并安全性，留待后续。
+
+---
+
+## 22. 全平台自带运行时构建（2026-09-13，`main`）
+
+§20.4 记的两项遗留本轮补齐：**Linux 侧 staging 与打包**、以及**发行版只出精简包**。
+`release.yml` 的每个 macOS/Linux 平台现在都先出精简版，再出 `-bundled` 的自带运行时版；
+Windows 继续复用 `windows-portable.yml` 的免安装包（它本身就是自带运行时）。
+
+| 改动 | 内容 |
+|---|---|
+| 交叉编译 staging | `Makefile` 的 `NODE_ARCH` 改为跟随 `TARGET` 的第一段（`x86_64-apple-darwin` → `x64`）；`TARGET` 含 `windows` 时 `NODE_OS` 取 `win`，解包按平台走 `tar` / `unzip`。此前在 arm64 runner 上打 x64 包会 stage **arm64** 的 node，产物装到目标机上直接起不来 |
+| 产物 | 每平台两种：`…_<suffix>.app.zip` / `.deb`（精简版，需自备 node/dsh）与 `…_<suffix>-bundled.app.zip` / `-bundled.deb`（自带运行时，压缩后约 150–330 MB）；同平台两种产物写进同一份 `SHA256SUMS-<suffix>`，`release` 任务照旧合并成一份 |
+| 打包顺序 | 先 `make bundle`，把精简版挪进 `thin/`，再 `make bundle-bundled`。第二遍构建会覆盖同名产物，顺序颠倒会丢掉精简版 |
+| CI 依赖 | 新增 `actions/setup-python@v5`（`write_third_party_notices.py` 需要 python3）；macOS 超时 60→90 分钟、Linux 45→75 分钟（staging + 两份产物 + 500 MB 级资源复制） |
+| 兜底断言 | macOS 断言 `Contents/Resources/runtime/node/bin/node` 存在；Linux 断言自带运行时版 `.deb` 至少是精简版的 3 倍（deb 内部路径由打包器决定，用体积比代替路径断言）。两者都是为了拦住「`bundle.resources` 没生效、安静发出一个只有壳的 `-bundled` 包」 |
+
+已做的验证：`make -n runtime-stage TARGET=x86_64-apple-darwin` 显示下载并校验
+`node-v22.23.2-darwin-x64.tar.gz`（本机不带 `TARGET` 时是 `darwin-arm64`）；`make -n bundle-bundled` 的
+tauri 调用同时带上 `--target` 与 `--config`（resources + `minimumSystemVersion` 11.0）；两个 workflow 通过
+YAML 解析；本机用假目录跑通「挪走精简版 → 再打自带运行时版 → 生成校验和」的分支逻辑，并验证体积比闸门在
+劣化（bundled 与精简版一样大）时会失败。
+
+**未验证**：CI 上尚未实跑（要等下一次 tag 触发），Linux 侧（x64/arm64）也还没在真机上启动过。
