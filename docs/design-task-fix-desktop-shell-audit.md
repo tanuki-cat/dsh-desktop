@@ -11,8 +11,15 @@
 > 修复落地后把结果回写到"处理状态"列。2026-09-13 已完成修复，逐项结果与新增测试见 §16；
 > 方案文档中确属"实现与设计不符"的两处事实性描述（§5 看护方式、§4 步骤 8/9 的落地范围）已就地加注修正。
 >
-> **复核（2026-09-13，commit `d379428` + `7905ae8`）**：11 项修复逐条核验通过，测试与 lint 结果已独立复跑确认；
-> 复核中新发现 6 项（其中 1 项是首轮审查漏掉的既有缺陷，由本次 #3 的改动暴露）——见 **§17**，均**未修**。
+> **第一轮复核（2026-09-13，commit `d379428` + `7905ae8`）**：11 项修复逐条核验通过，测试与 lint 结果已独立复跑确认；
+> 复核中新发现 6 项（其中 1 项是首轮审查漏掉的既有缺陷，由本次 #3 的改动暴露）——见 **§17.2**。
+>
+> **第二轮复核（2026-09-13，commit `82006f4` + `faa6fb3`）**：N1–N6 已修，逐条核验见 **§17.5**；
+> 其中 N2 的实现只在 macOS 成立（Linux 的 systemd 用户会话下判据不满足），留作 R1。
+>
+> **R1 已修（2026-09-13，见 §17.6.2）**：父进程判据不再假设 pid 1，改为"父进程已消失或由会话监督者接管"；
+> R2 改以 README 说明恢复路径、R3 保留为安全网、R4 已在 README 补排障说明。N1–N6 的落地记录见 §17.6.1，
+> 最新验证：`make test` **49 passed**。
 
 ---
 
@@ -413,7 +420,7 @@ make test-live   # 3 passed（registry head=0.1.5-rc.2；冷查询 1179 ms / 缓
 方案文档的三处改动是**加注 + 日期**（"2026-09-13 修正/落地"），保留原决策文字、未改写成相反结论，
 符合文档生命周期规则。
 
-### 17.2 新发现（均未修）
+### 17.2 新发现（2026-09-13 已全部修复，核验见 §17.5）
 
 | # | 级别 | 问题 | 位置 | 性质 | 处理（2026-09-13） |
 |---|---|---|---|---|---|
@@ -520,3 +527,131 @@ make test-live   # 3 passed（registry head=0.1.5-rc.2；冷查询 1179 ms / 缓
 3. **N4 / N2 / N5** —— 收尾，各自独立。
 
 > 上述顺序已执行完毕，记录见 §17.5。
+
+---
+
+### 17.5 第二轮复核（2026-09-13，对 commit `82006f4` + `faa6fb3`）
+
+独立验证：`cargo test` **47 passed / 0 failed**（含 3 个联网用例）、
+`cargo clippy --all-targets -- -D warnings` **0 warning**、`cargo fmt --check` 通过 —— 与提交说明一致。
+
+> `faa6fb3` 的提交说明称"新增 §17.5"，但实际只落进了 §17.2 的"处理"列与 §17.4 末尾那行指针；
+> 本节由这次复核补齐。
+
+#### 17.5.1 N1–N6 核验结论
+
+| # | 结论 | 依据 |
+|---|---|---|
+| N1 | **正确** | `self_heal_action` 的四种输入组合都判对（`!alive`→Clear、`listener≠pid`→按身份、`listener==pid` 且端口相同→Keep、端口不同→Terminate）；`Config::load` 前移以取得本次端口是必要的。关键在于 `Keep` 保留 state.json 之后，`stop_instance_before_update`（`lib.rs:315`）与检测分支（`lib.rs:587`）的 `ours` 才可能非空 —— **#3 的 `StopMode::ProcessGroup` 这才真正可达**。单测里 `assert_eq!(stop_mode(ours), StopMode::ProcessGroup)` 把这条链路钉住了 |
+| N2 | **macOS 正确，Linux 基本不生效** | 见 R1 |
+| N3 | **正确，且比建议更稳** | 判据换成 `Started` 后，"端口健康 + 导航根本没起来"这个最常见的空白窗口场景会重试；"已开始加载"一律不打扰。额外加的护栏——次数用尽时若端口仍健康**只记日志不弹错误页**——挡住了"某些环境根本不投递 page-load 事件 ⇒ 对着正常应用弹错误页"的误报，这是建议里没有的 |
+| N4 | **正确** | `carried_attempt` 的三种情况（同版本保留 / 查询失败保留 / 新版本清空）都对，`suppress` 在新查询路径上也算了；端到端用例用一个假 npm 脚本跑完整 `check_cached`，验证的是行为而不是实现 |
+| N5 | **正确** | 计数器在 `with_limit` 里用一次 `metadata` seed，保住了"上次遗留的超大文件在下次写入前轮转"；计数的读写都在 file 互斥锁内，`Relaxed` 足够；`line.len() + 1` 与 `writeln!` 的实际字节数一致 |
+| N6 | **正确** | `FAILURE_SHOWN` 幂等 + 先 `destroy()`（不是 `close()`，不会被误认成用户退出）Harness 窗口，"关闭状态页即退出应用"这句话现在成立 |
+
+#### 17.5.2 R1（P2，2026-09-13 已修，见 §17.6.2）：N2 的身份判据在 Linux 上不成立
+
+**位置**：`src-tauri/src/lib.rs::looks_like_our_harness`
+
+```rust
+ppid.trim() == "1" && command.contains("--profile web") && command.contains("dsh")
+```
+
+macOS 上孤儿确实被 launchd（pid 1）收养，判据成立。但 **Linux 桌面会话里 `systemd --user` 是
+child subreaper**：从 `.desktop` 启动的应用跑在 `app-*.scope` 下，壳被强杀后 harness 会被 reparent 到
+`systemd --user` 的 pid（几百到几千），**不是 1**。于是这条判据在典型 Linux 桌面上恒为 false ——
+N2 想清理的"活着但不再监听端口的残留"在 Linux 上仍会永久留成孤儿。
+
+失败方向是安全的（绝不误杀），所以级别是 P2 而不是 P1；但等于该修复只在 macOS 生效。
+
+**修法**：把"父进程是 init"放宽成"**父进程不是本应用**" —— `ppid == 1`，或 ppid 对应的进程已不存在，
+或其命令行不含 `dsh-desktop`。命令行匹配（`--profile web` + `dsh`）本身已经是很强的证据：
+pid 来自本应用自己的 state.json，再撞上一个无关的 `dsh web` 进程的概率极低。
+
+**回归**：`looks_like_our_harness` 已是纯函数，补两个用例即可（systemd 风格的非 1 ppid 应判为"是我们的"；
+ppid 指向仍存活的 `dsh-desktop` 时应判为"不是"）。
+
+#### 17.5.3 观察项（非缺陷，记录备查）
+
+- **R2：复用路径现在真的可达了，它的 cookie 依赖也从纸面变成现实。**
+  复用分支加载的是不带 token 的根 URL（`lib.rs:587` 一带），靠 WebView 数据目录里那张 30 天有效的 cookie。
+  清过应用数据、或距上次成功登录超过 30 天时，会直接显示 `dsh web authentication required`，
+  而新的加载看护线程发现不了（401 页面本身是"加载成功"的）。概率低（复用只发生在崩溃后的下一次启动），
+  要兜底的话最省事的是复用前用 Tauri 的 cookie API 查该 authority 是否有 cookie，没有就走重启。
+- **R3：`Some(pid) if just_updated => terminate（进程组）` 分支目前不可达。**
+  更新成功的前提是 `stop_instance_before_update` 已经停掉实例并清了 state.json，所以到检测步骤时
+  `ours` 必然是 None。留作安全网无害，但不要把它当成已验证路径。
+- **R4：`attempted` 标记对同一版本是永久的。**
+  用户手工修好 npm 全局前缀后，在出现更高版本之前壳不会再尝试安装。日志里
+  `update <v> was already attempted and changed nothing` 是唯一线索，删掉 `update-check.json` 即可复位 ——
+  值得在 README 的排障小节补一句。
+
+#### 17.5.4 仍未执行的验证
+
+§14 最后一条（实机断言）依旧未跑。第二轮改动又新增了两条值得实机确认的行为，一并记在这里：
+
+- 强杀桌面壳 → 残留 harness 仍在服务同一端口 → 重新启动应走**复用**分支（日志出现
+  `state.json 记录的 Harness pid … 仍在端口 … 服务，交给复用分支处理`），会话不中断；
+- Linux 上强杀桌面壳后，残留 harness 的 `ps -o ppid=` 实际是什么（用来确认 R1 的判断）。
+
+---
+
+### 17.6 修复记录补遗与 R1（2026-09-13）
+
+> `faa6fb3` 的提交说明称"新增 §17.5"，但那次编辑只落了 §17.2 的处理列与 §17.4 末尾那行指针，正文没有进去
+> （复核意见属实）。N1–N6 的落地记录在此补上，编号让给复核节。
+
+#### 17.6.1 N1–N6 落地（commit `82006f4`）
+
+| # | 落地方案 | 位置 |
+|---|---|---|
+| N1 | 步骤 1 改为纯函数 `self_heal_action(state, listener, alive, port, looks_ours) -> {Clear, Terminate, Keep}`：pid 已死或已不再拥有记录端口 → `Clear`；记录仍拥有端口但本次端口不同 → `Terminate`；记录仍服务**本次要用的端口** → `Keep`（保留 state.json，交给 §3c 复用）。`Config::load` 因此提到自愈之前（需要本次端口）。§3c 的 `ours` 分支拆成"复用 / 更新后重启 / 外部接管"三条，其中自家实例的重启改用 `process::terminate`（进程组），不再落进外部路径的 `terminate_pid` | `lib.rs` |
+| N2 | 新增 `looks_like_our_orphan(pid)` 与两条判定：命令行含 `--profile web` + `dsh`，且父进程不再拥有它（R1 修法见 §17.6.2）；`ps` 不可用时按无关进程处理并记日志 | `lib.rs` |
+| N3 | `LoadSignals { started, finished }` 取代单一标志；`load_outcome(attempt, attempts, window_alive, started, port_serving)`：窗口已关或 `Started` 已到 → 不打扰；从未 `Started` → 重试；次数用尽且端口仍在服务 → 只记日志，只有端口也不再服务才 `Report` | `window.rs` |
+| N4 | 新增纯函数 `carried_attempt(previous, latest)`：新查询拿到同一版本（或查询失败）时保留旧的 `attempted`，只有版本变化才清空；`Checked.attempted` 在网络路径上同样生效 | `update.rs` |
+| N5 | `Logger` 增加 `written: Arc<AtomicU64>`，写入成功时自增；轮转改读计数器，仅在 `with_limit`（`open` 的唯一实现）里 stat 一次做 seed | `harness.rs` |
+| N6 | `show_failure` 幂等（首个失败页胜出，`FAILURE_SHOWN`）并先 `destroy()` Harness 窗口：`destroy` 不触发 `CloseRequested`，应用不会因此退出；用户关闭状态页时 `HARNESS` 已不存在，`create_splash` 的 `exit(0)` 生效 | `window.rs` |
+
+#### 17.6.2 R1 修复：父进程判据不再假设 pid 1
+
+```rust
+enum Parent { Gone, Supervisor, Live }
+
+fn classify_parent(ppid: u32) -> Parent             // ppid == 0 -> Gone
+fn is_session_supervisor(command: &str) -> bool     // launchd | systemd | init
+fn looks_like_our_harness(output: &str, parent: Parent) -> bool
+```
+
+- `ps -p <ppid> -o command=` 无输出 ⇒ `Gone`（父进程已消失，macOS 与 Linux 崩溃后都是这一种）；
+- 命令行含 `launchd` / `systemd` / `init` ⇒ `Supervisor`（macOS 的 launchd；Linux 桌面上收养孤儿的 `systemd --user` subreaper）；
+- 其余活着的进程（终端 shell、另一个 `dsh-desktop`）⇒ `Live`；`ps` 失败等无法判定时也按 `Live` 处理（安全侧）；
+- 判定合并为：命令行匹配 **且** 父进程不是 `Live`；
+- 两次 `ps` 都带 `-ww`：识别用的参数排在长 node 路径之后，部分 `ps`（如某些 procps 构建）在输出不是终端时
+  仍可能按终端宽度截断，macOS 的 `ps` 文档则明确"非终端输出时列宽不限"，加 `-ww` 对两边都成立；
+- `ps` 本身不可用（受限环境）时按"不是我们的"处理并记日志：失败的代价是不清理，而不是误杀。
+
+**与 §17.5.2 建议的差异**：建议把判据放宽成"父进程不是本应用"，这会一并放行"父进程是用户终端 shell 的
+`dsh web`" —— 而"重启后低位 pid 被用户自己起的 `dsh web` 占用"正是 pid 复用误杀最可能的形态。
+因此实现保留了"必须无人拥有"这一性质：父进程仍是一个活着的非监督者进程时一律不发信号，
+只有"父进程已消失或由会话监督者接管"才算我们的残留。Linux 场景照常修好，安全性没有下降。
+
+**新增单测**：`session_supervisors_are_recognized_on_both_platforms`（launchd / `systemd --user` / init 判为监督者，
+终端 shell 与 `dsh-desktop` 命令行判为否）、`ps_rows_keep_the_command_line_intact`（`ppid=,command=` 的列填充与命令内空格）、
+`only_an_unowned_dsh_web_counts_as_our_leftover` 改为 `Parent::Gone` / `Supervisor` 均判是、`Parent::Live` 判否。
+
+#### 17.6.3 观察项的处理
+
+- **R2（复用依赖 cookie）**：本轮不实现（需要 cookie API 加一条可重入的重启流程，见 §17.5.3 的判断），
+  改为在 README 的行为注里写清恢复路径：出现 `dsh web authentication required` 时退出应用再启动。
+- **R3（`Some(pid) if just_updated` 分支不可达）**：保留为安全网，按复核意见不当成已验证路径（已核对：
+  更新成功的前提是 `stop_instance_before_update` 已停实例并清 state.json，故该分支确实到不了）。
+- **R4（`attempted` 对同一版本永久）**：README 的"dsh 核心升级"一节补了排障说明（删 `<app-data>/update-check.json` 复位）。
+
+#### 17.6.4 验证
+
+```text
+make fmt-check   # 通过
+make clippy      # clippy --all-targets -D warnings，0 warning
+make test        # 49 passed / 0 failed（R1 新增 2 个用例）
+make test-live   # 3 passed（registry head=0.1.5-rc.2，冷查询 ~2.3 s / 缓存 0 ms）
+```
