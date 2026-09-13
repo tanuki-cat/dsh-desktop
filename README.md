@@ -215,7 +215,7 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
 
 目标：在**没有 Node、没有 dsh** 的机器上双击即用，且首次启动不依赖网络下载。
 
-完整方案：[`docs/design-task-feat-dsh-bundled-runtime.md`](docs/design-task-feat-dsh-bundled-runtime.md)（v2，含实测数据与修订记录）。
+完整方案：[`docs/design-task-feat-dsh-bundled-runtime.md`](docs/design-task-feat-dsh-bundled-runtime.md)（**v3**，含实测数据与两轮修订记录）。
 
 已经用原型验证过的关键结论（方案据此成立）：
 
@@ -226,14 +226,18 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
 | harness **不写自己的安装树** | 安装树被修改文件数 = **0** ⇒ 只读 seed 成立 |
 | dsh 树可整体搬迁 | 复制到任意 prefix 后照常启动 |
 | 镜像 `bundle.resources` | 已在本仓库配置并实测（空 glob 会让构建失败） |
+| 资源复制保真 | mode 与代码签名**保留**；**符号链接被解引用**，悬空链接会让 `tauri build` 直接失败 |
+| 签名后 Node 可运行 | 必须 `--preserve-metadata=entitlements`：丢掉 JIT entitlements 时 `node` 启动即 `Trace/BPT trap: 5` |
 
 代价与做法（摘要）：
 
 - 解压后约 **490 MB**（Node 187 + dsh 树 289 + 壳 11），分发包约 150–250 MB；
 - **只读 seed + 可写影子前缀**：seed 放在 `Contents/Resources/runtime/`，dsh 核心更新落到
   `app-data/runtime/prefix`（不写签名的 bundle）；
-- 实施前必须先落 4 项 P0：**回退/last-known-good、seed 与前缀的版本仲裁、随包 pnpm（否则插件装不了）、
-  按平台 staging（12 个原生模块）**；
+- 实施前必须先落 4 项 P0：**回退/last-known-good、seed 与前缀的版本仲裁、pnpm 随包分发（否则离线装不了插件）、
+  按平台 staging（12 个原生模块）**；另有两项在 v3 实测中升级为 P0：**签名保留 entitlements**、
+  **staging 校验悬空符号链接**；
+- 首启更新策略待定：默认 `auto_update` 会在首启就下载整棵依赖树，与"离线首启"的宣传冲突（方案 §4 给了两个选项）；
 - 分阶段：P1 macOS arm64（无 node 可跑）→ P2 签名公证 → P3 Linux x64/arm64 → P4 universal/Windows/自更新。
 
 ## 开机自启

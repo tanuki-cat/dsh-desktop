@@ -3,8 +3,9 @@
 > 目标：在**没有预装 Node.js 和 DeepSeek Harness** 的机器上，双击即用。
 > 上游设计：[`design-task-feat-dsh-tauri-desktop-shell.md`](./design-task-feat-dsh-tauri-desktop-shell.md)（其 §22 已把本方案列为 V2）。
 >
-> **v2（review 后修订）**：补齐回退、版本仲裁、pnpm、按平台 staging 等 11 项（§15 修订记录）；下载本文所指的"离线首启"
-> 仍是**待断网实测**的设计目标，不是已验证结论。
+> **v3（第二轮 review 后修订）**：把纸面风险改成实测结论 —— 签名必须保留 Node 的 JIT entitlements（否则 node 直接崩溃）、
+> 资源复制会解引用符号链接、悬空链接会让构建失败、`rename` 无法覆盖非空目录、pnpm 不能装在被整体替换的前缀里等 12 项
+> （§16）。"离线首启"仍是**待断网实测**的目标，不是已验证结论。
 > 本文所有数字与机制均为本机实测（macOS 14/15 arm64，`@deepseek-ai/dsh` 0.1.5-rc.2）。
 
 ---
@@ -56,6 +57,8 @@ DSH Desktop.app/Contents/Resources/runtime/
 │   └── LICENSE               # Node 许可（MIT）
 ├── dsh-prefix/               # 按 npm 全局前缀布局的 dsh 安装树
 │   └── lib/node_modules/@deepseek-ai/dsh/{lib,node_modules,package.json,LICENSE}
+├── tools/                    # 随包分发的 pnpm 前缀（离线装插件的前提，见 §4）
+│   └── bin/pnpm
 └── THIRD-PARTY-NOTICES.md    # Node / npm / dsh 及依赖的许可汇总
 ```
 
@@ -65,7 +68,8 @@ DSH Desktop.app/Contents/Resources/runtime/
 ~/Library/Application Support/com.deepseek.dsh.desktop/    (Linux: ~/.local/share/…)
 ├── config.json               # 现有配置
 ├── runtime/
-│   ├── prefix/               # dsh 更新落点（npm --prefix 目标）
+│   ├── prefix/               # dsh 更新落点（npm --prefix 目标），更新时会被整体替换
+│   ├── tools/                # pnpm 的**更新落点**（可选；随包已带一份，不随 dsh 更新被替换）
 │   └── npm-cache/            # 更新用 npm 缓存，避免重复下载 289MB 依赖树
 ├── update-check.json         # 现有更新检查缓存（§13.6）
 └── logs/harness.log
@@ -93,7 +97,7 @@ DSH Desktop.app/Contents/Resources/runtime/
 ## 3. 首次启动流程
 
 1. 解析运行时（§2.3），日志记录来源（`runtime: bundled / system`）与版本；
-2. 确保 `app-data/runtime/{prefix,npm-cache}` 存在（`create_dir_all`，幂等）；
+2. 确保 `app-data/runtime/{prefix,tools,npm-cache}` 存在（`create_dir_all`，幂等）；
 3. 更新检查（现有逻辑）→ 需要更新时走 §4；
 4. 用 `Resources/runtime/node/bin/node` 启动 `<dsh 树>/lib/bin.js --profile web --patch <overlay> --no-open --port <固定端口>`；
 5. 其余（探测/接管/窗口/退出回收）不变。
@@ -113,18 +117,33 @@ DSH Desktop.app/Contents/Resources/runtime/
 
 解析顺序（§2.3）会让更新后的版本自动生效；结合现有"更新后强制重启实例"的规则，更新在同一轮启动内完成。
 
+**首启的更新策略（review 后补）**：自带 seed 若低于 registry head，而 `auto_update` 默认 true，
+第一次启动就会下载并安装整棵依赖树（约 289 MB / 数十 MB 压缩流量）。建议：
+
+- 首启只**提示**有新版、把自动安装推迟到用户确认或第二次启动之后；
+- 或在 `config.json` 增加 `auto_update_first_launch`（默认 false），把"首启不下载"变成显式契约；
+- 无论选哪种，验收里要写清"首启流量预期"，避免"离线可用"的宣传被一次静默更新打破。
+
 **更新失败与回滚**（review 后补）：
 
-- npm 安装到**临时目录** `app-data/runtime/prefix.new`，成功后原子替换 `prefix`（`rename`），
-  避免半成品前缀破坏下次启动；
+- npm 安装到**临时目录** `app-data/runtime/prefix.new`，成功后替换 `prefix`：
+  **`rename` 不能覆盖非空目录**（实测 `ENOTEMPTY: Directory not empty`），所以是三步：
+  `rename(prefix → prefix.old)` → `rename(prefix.new → prefix)` → 删除 `prefix.old`。
+  两步之间崩溃会短暂没有前缀，正好由 §2.3 的回退路径兜底（这是回退必须存在的原因之一）；
+  旧前缀保留到删除前，运行中的实例不会因为文件被换走而立刻失效；
 - 若替换后启动失败 → 依 §2.3 的"回退"用 seed 启动，并保留坏掉的前缀供诊断；
 - 记录 `last-known-good`（树 + 版本 + 时间），提供"恢复上次可用版本"的路径。
 
 **第三方插件（pnpm）**（review 后补，干净机器上的真实缺口）：
 
 - 官方 Node 发行版只带 `corepack` 与 `npm`，**没有 pnpm**，而 `dsh plugin add …` 是转发给 pnpm 的；
-- 因此 staging 时要把 pnpm 一并装进 `app-data/runtime/prefix`（`npm i -g pnpm`），并把该前缀的 `bin`
-  注入 harness 子进程的 `PATH`（与 §5 的 PATH 策略一致）；
+- **pnpm 必须随包分发（seed 里的 `Resources/runtime/tools`）**：装到 app-data 意味着干净机器首启仍要联网，
+  与"离线首启"目标直接冲突（v2 把装 pnpm 写成 staging 动作却指向 app-data，是第二处内部矛盾）；
+- `app-data/runtime/tools` 只作为**可选更新落点**：解析时优先它、没有就用 seed；
+- **不能装进 `prefix`**：该前缀在每次 dsh 更新时被整体替换（见上），pnpm 会在第一次核心更新后消失；
+- PATH 注入顺序：`app-data/runtime/tools/bin` → `Resources/runtime/tools/bin` → `Resources/runtime/node/bin`；
+- 同时把 pnpm 的 store/config 也钉在 app-data（`pnpm_config_store_dir`、`PNPM_HOME`），
+  避免它往 `~/Library/pnpm` 或用户主目录乱写，"卸载"时能一次清干净；
 - 不这样做时，自带发行版的 marketplace 插件将无法安装 —— 必须在文档里显式声明。
 
 ---
@@ -133,7 +152,7 @@ DSH Desktop.app/Contents/Resources/runtime/
 
 ```bash
 make runtime-fetch     # 按 uname/arch 下载官方 Node，并校验 SHASUMS256.txt
-make runtime-stage     # 组装 src-tauri/runtime/{node,dsh-prefix,THIRD-PARTY-NOTICES.md}
+make runtime-stage     # 组装 src-tauri/runtime/{node,dsh-prefix,tools,THIRD-PARTY-NOTICES.md}
 make bundle            # 打包（依赖 runtime-stage）；resources 已配置
 make runtime-clean     # 清理 staging（约 475MB）
 ```
@@ -147,11 +166,24 @@ make runtime-clean     # 清理 staging（约 475MB）
 - **staging 必须按平台各自执行**：树里含 12 个平台相关的原生模块（`pty`/`conpty`/`koffi`/`sharp-darwin-*`/`system`），
   macOS 上 stage 的树不能用于 Linux，反之亦然；CI 需 per-platform runner（macOS arm64/x64、Linux x64/arm64），
   不建议依赖 `npm install --os/--cpu` 跨平台产原生二进制；
-- **子进程 PATH 策略**（review 后补）：启动 harness 时把 `Resources/runtime/node/bin` 与
+- **子进程 PATH 策略**（review 后补）：启动 harness 时把 `app-data/runtime/tools/bin`、`Resources/runtime/tools/bin`、`Resources/runtime/node/bin` 与
   `app-data/runtime/prefix/bin` 前置进 PATH，使插件安装、MCP server、agent 执行的 `node`/`npm`/`pnpm`
   与壳内运行时一致；该决策要写进日志与诊断页，避免"为什么我的命令用的不是登录 shell 的 node"变成暗坑；
 - `tauri.conf.json` 已加 `"resources": ["runtime/**/*"]`，且 `src-tauri/runtime/README.md` 作为**非空保证**存在
   （glob 匹配为空会导致 `tauri build` 失败，已实测）；
+- **staging 必须校验符号链接**（实测教训）：`tauri build` 遇到**悬空链接直接失败** ——
+  `failed to bundle project: resource path ... does not exist`，make 退出码 2。
+  所以 `runtime-stage` 结尾要跑一次 `find -L <stage> -type l`：非空即失败并打印清单；
+  依赖树里的 `node_modules/.bin/*` 是相对链接（正常），绝对链接与悬空链接都要拦下；
+- **资源复制会解引用符号链接**（实测）：相对链接 `bin/npm -> ../lib/node_modules/npm/bin/npm-cli.js` 会变成
+  同内容、同 mode 的普通文件；绝对链接会把**宿主文件**原样复制进包（实测把宿主 node 的 67 KB 启动器搬了进去，
+  哈希一致）。因此 staging 里不要出现指向宿主机的绝对链接，且要知道 Node 官方发行版的 `bin/npm`、`npx`、
+  `corepack` 都是 `#!/usr/bin/env node` 脚本 —— 解引用后仍然要求 PATH 上有 node，
+  这正是 PATH 注入的硬性理由；
+- **`THIRD-PARTY-NOTICES.md` 应自动生成**：72 个依赖手写许可清单必然过期，
+  建议 staging 时用 `license-checker --json`（或等价工具）汇总，并把 Node/npm 自带的 LICENSE 一并收集；
+- **构建耗时不是问题**（实测）：20,000 个文件的资源复制 + 打包共 **3.8 s**（sys 3.2 s），
+  折算 25,412 文件的 dsh 树约 4–5 s；瓶颈仍是磁盘占用（§6）而不是时间；
 - `make clean` 不动 staging，`make runtime-clean` 才删（避免每次改代码都重下 48MB）。
 
 ---
@@ -180,16 +212,33 @@ make runtime-clean     # 清理 staging（约 475MB）
 
 - `.app` 内所有 Mach-O 都必须签名且同一 Team ID：**Node 二进制 + 12 个原生模块**
   （`pty.node`、`conpty.node`、`koffi.node`、`sharp-darwin-*.node`、`system.node` 等）；
-- Node 官方二进制不是我们的签名，需要 `codesign --force --options runtime --timestamp` 重新签；
+- Node 官方二进制不是我们的签名，需要重新签 —— 但**必须保留它的 entitlements**：
+  官方 node（v22.23.2 darwin-arm64）带 hardened runtime 与
+  `com.apple.security.cs.allow-jit`、`allow-unsigned-executable-memory`、
+  `allow-dyld-environment-variables`、`disable-executable-page-protection`（TeamIdentifier=HX7739G8FX）；
+  **实测：只写 `codesign --force --options runtime -s - node` 会丢掉这些 entitlements，node 一启动就是
+  `Trace/BPT trap: 5`（exit=133）**；加上 `--preserve-metadata=entitlements` 后 `node -e` 正常（exit=0）。
+  正确命令：`codesign --force --options runtime --timestamp --preserve-metadata=entitlements -s …`，
+  或显式提供 entitlements plist —— 二者选一但必须做，并把 `node -e "console.log(1)"` 纳入签名后冒烟；
+  12 个 `.node` 原生模块同理（多为库，但同样不要改动它们的 entitlements）；
 - 顺序：`runtime-stage` → 对 `runtime/` 里的 Mach-O 逐个签名 → `tauri build`（签 app 壳）→ 公证 + `stapler`；
 - 验证命令（必须纳入 CI 与验收）：
   `codesign --verify --deep --strict -vvv "DSH Desktop.app"`、
   `spctl -a -vvv "DSH Desktop.app"`、`xcrun stapler validate "DSH Desktop.app"`；
-- **复制保真**：`tauri build` 把 `runtime/` 复制进 bundle 时必须保留 mode/xattr 与已有签名，
-  构建后要抽验（`codesign -dv` 对 node 与 2~3 个 `.node` 抽查）；任何"复制后再改文件"都会让封装签名失效；
+- **复制保真实测结论（v3 补）**：
+
+  | 属性 | 结果 |
+  |---|---|
+  | 可执行位（mode） | **保留**：755 的脚本复制后仍 755、可直接执行 |
+  | 代码签名 | **保留**：ad-hoc 签过的 Mach-O 复制后 `codesign --verify` 仍 valid（内容逐字节一致） |
+  | 符号链接 | **丢失**：被解引用成实体文件（详见 §5） |
+
+  构建后仍要抽验（`codesign -dv` 对 node 与 2~3 个 `.node` 抽查）；任何"复制后再改文件"都会让封装签名失效；
 - **签名后置校验必须紧跟 bundle 步骤**：`codesign --verify --deep --strict` → `spctl -a -vvv` →
   `xcrun stapler validate`，任一失败即视为构建失败（CI 门禁）；
 - **不要在签名的 bundle 内写入**——这正是 §2.2/§4 把更新落到 app-data 的原因。
+  附带好处：未公证的 .app 从 DMG 直接运行时 macOS 会启用 **App Translocation**（从随机只读路径启动），
+  本方案因为从不写 bundle 而天然不受影响；验收可直接在"下载后双击"的场景下做。
 
 ---
 
@@ -233,7 +282,9 @@ make runtime-clean     # 清理 staging（约 475MB）
 | `update.rs` | `install_prefix` 支持 app-data 目标；追加 `--cache`；**装到 `prefix.new` 后原子替换**；`engines.node` 兼容性检查 | ~50 行 |
 | `lib.rs` | 取 `app.path().resource_dir()` 并注入；splash 文案区分自带/系统 | ~25 行 |
 | `tauri.conf.json` | `bundle.resources`（已完成）；签名配置 | 少量 |
-| `Makefile` | `runtime-fetch / runtime-stage / runtime-clean`，`bundle` 依赖 chain | ~60 行 |
+| `Makefile` | `runtime-fetch / runtime-stage / runtime-clean`，`bundle` 依赖 chain；**staging 结尾做悬空链接校验**；自动生成 `THIRD-PARTY-NOTICES.md` | ~80 行 |
+| staging 签名脚本 | 逐个 Mach-O 重签，**带 `--preserve-metadata=entitlements`**；签名后跑 `node -e` 冒烟 | ~25 行 |
+| `runtime.rs`（新） | pnpm 用独立的 `runtime/tools` 前缀（不随 dsh 更新替换），PATH 注入两份 | 含上行 |
 
 ---
 
@@ -250,7 +301,13 @@ make runtime-clean     # 清理 staging（约 475MB）
 - [ ] **插件安装可用**：干净机器上能装 marketplace 插件（验证 pnpm 已随包/staging 就位）；
 - [ ] **回退演练**：人为破坏 app-data 前缀（删 `lib/bin.js`）后仍能用 seed 启动；
 - [ ] **版本仲裁**：把 app-data 前缀替换成旧版本时，启动应选用 seed 里更高的版本；
-- [ ] **更新中断演练**：更新过程被 kill 后，下次启动仍可用（`prefix.new` 原子替换生效）。
+- [ ] **更新中断演练**：更新过程被 kill 后，下次启动仍可用（`prefix → prefix.old → prefix` 三步替换生效）；
+- [ ] **签名后冒烟**：签名完成、打包之后，直接执行 bundle 内的 `node -e "console.log(1)"` 退出码为 0
+      （v3 实测：漏掉 entitlements 时这里是 `Trace/BPT trap: 5`）；
+- [ ] **pnpm 存活**：完成一次 dsh 核心更新（整棵前缀被替换）后，marketplace 插件仍能安装；
+- [ ] **悬空链接**：staging 里人为放一个悬空链接 → `runtime-stage` 必须报错退出，而不是等到 `tauri build` 才失败；
+- [ ] **首启流量**：干净机器首启的网络流量符合策略（默认不应静默下载整棵依赖树）；
+- [ ] **App Translocation**：从"下载的 DMG"直接双击运行（不拖进 /Applications）也能正常启动。
 
 ---
 
@@ -265,6 +322,13 @@ make runtime-clean     # 清理 staging（约 475MB）
 7. **版本仲裁实现错**：仲裁规则写错会让"更新了 .app 却跑旧核心"或反之；需专门测试覆盖（§12）。
 8. **构建期磁盘峰值**：约 1.5 GB（staging + bundle 复制 + 构建产物），CI 配额不足会表现为构建失败。
 9. **跨平台 staging**：原生模块绑定平台，任何"在 macOS 上产出 Linux 包"的捷径都不成立。
+10. **签名丢 entitlements**（v3 实测，已给出修法）：漏掉 `--preserve-metadata=entitlements` 的 node 在签名后必然崩溃，
+    而且**只在真机运行签名产物时才发现** —— 必须把 `node -e` 冒烟纳入 CI，不能只看 `codesign --verify` 通过；
+11. **资源复制的隐藏依赖**（v3 实测）：符号链接被解引用，绝对链接会把宿主文件搬进包 ⇒ 产物不再完全由 staging 决定，
+    staging 要禁止绝对链接；悬空链接会让构建直接失败；
+12. **发行后 Node 只能随 .app 升级**：seed 只读 ⇒ Node 安全补丁要发新版桌面壳；文档需给出 Node 版本矩阵与升级节奏，
+    诊断页/日志要显示 bundled 的 node 与 dsh 版本（目前只显示来源）；`engines.node` 不满足时应阻止更新并提示"需要更新桌面壳"；
+13. **app-data 沉淀**：更新过的前缀（289 MB+）会长期留在应用数据目录，需要"重置运行时"入口或文档化的清理方式。
 
 ---
 
@@ -272,6 +336,8 @@ make runtime-clean     # 清理 staging（约 475MB）
 
 | 阶段 | 范围 | 产出 |
 |---|---|---|
+| P0（半天） | **先做失败快验证**：staging 里放一个签名过的 Mach-O + 一个符号链接，跑通 `tauri build` →
+  解引用行为、mode/签名保真、悬空链接报错（本轮已实测，实施时按结论搭 CI 门禁即可） | 已具备，无需再验证 |
 | P1 | macOS arm64：`runtime-fetch/stage` + 解析顺序 + 更新落点 | 可在无 node 的 Mac 上双击运行的 `.app`（未签名） |
 | P2 | 签名 + 公证 + 干净虚拟机验收 | 可分发（本机与受信任渠道） |
 | P3 | Linux x64/arm64（deb + AppImage） | 两条命令产出的安装包 |
@@ -296,3 +362,33 @@ make runtime-clean     # 清理 staging（约 475MB）
 | 11 | P2 | AppImage 只读挂载与 strip 风险 | §9/§8 标注为待实测（只读挂载与设计兼容） |
 
 新增的已核实事实（本轮实测）：**harness 对自己的安装树 0 写入**，证据见 §0 表格 —— 这是"只读 seed"成立的前提。
+
+## 16. 修订记录（v3，第二轮 review 后）
+
+本轮把上一版留作"待实测"的几项直接做了实验（macOS 14/15 arm64，Node v22.23.2-darwin-arm64，Tauri 2.11.5），
+并把结论写回正文。**其中前两项会让产物直接不可用**：
+
+| # | 级别 | 问题 | 处理 |
+|---|---|---|---|
+| 1 | P0 | 按 v2 字面执行 `codesign --force --options runtime` 会丢 Node 的 JIT entitlements，**实测 node 启动即 `Trace/BPT trap: 5`（exit=133）** | §7 改为必须 `--preserve-metadata=entitlements`（或显式 plist），并加 `node -e` 冒烟验收 |
+| 2 | P0 | pnpm 位置有两处矛盾：装在被整体替换的 `prefix` 里（第一次核心更新后消失）、且落点在 app-data（干净机器首启仍要联网，与"离线首启"冲突） | §2.1/§2.2 让 pnpm **随包分发**到 `Resources/runtime/tools`，app-data 的 `tools` 只作可选更新落点；§4 明确职责与 PATH 顺序 |
+| 3 | P0 | 悬空符号链接会让 `tauri build` 直接失败（实测 `resource path … does not exist`） | §5 要求 `runtime-stage` 做 `find -L -type l` 校验；§12 加验收 |
+| 4 | P1 | `rename` 不能覆盖非空目录（实测 ENOTEMPTY），"原子替换"不成立 | §4 改为三步替换并说明中间态由回退兜底 |
+| 5 | P1 | 资源复制会解引用符号链接，绝对链接把宿主文件搬进包 | §5 记录实测行为与禁令；§13 增风险项 |
+| 6 | P1 | 复制保真只有"必须保留"的要求，没有结论 | §7 给出实测表：mode 保留、签名保留、符号链接丢失 |
+| 7 | P1 | 首启可能静默下载整棵依赖树（`auto_update` 默认 true） | §4 增首启更新策略；§12 增"首启流量"验收 |
+| 8 | P2 | Node 只能随 .app 升级、`engines.node` 不满足时无动作定义 | §13 增风险项，明确"阻止更新 + 提示更新桌面壳" |
+| 9 | P2 | `THIRD-PARTY-NOTICES.md` 手写必然过期 | §5 改为 staging 时自动生成 |
+| 10 | P2 | 构建耗时未知（只有磁盘预算） | §5 补实测：20k 文件复制 + 打包 3.8 s，25k 约 4–5 s |
+| 11 | P3 | 卸载/清理路径未写 | §13 增 app-data 沉淀风险与"重置运行时"建议 |
+| 12 | P3 | App Translocation 未评估 | §7 说明"不写 bundle"天然免疫，并加入验收 |
+
+**本轮实测明细**（可复现）：
+
+- 官方 node entitlements：`codesign -d --entitlements -` → allow-jit / allow-unsigned-executable-memory /
+  allow-dyld-environment-variables / disable-executable-page-protection，flags `0x10000(runtime)`；
+- 重签对照：去掉 entitlements → `node -e` 退出 133（Trace/BPT trap: 5）；保留 → 退出 0；
+- 资源复制探针：755 脚本 → 仍 755 且可执行；相对链接 → 同内容普通文件；绝对链接 → 复制宿主目标（哈希一致）；
+  悬空链接 → `tauri build` 失败；ad-hoc 签名的 Mach-O → 复制后 `codesign --verify` 仍 valid；
+- 20,000 文件（78 MB）资源复制 + 打包：3.845 s（sys 3.185 s）；
+- `rename(dir_a, dir_b)`（b 非空）→ `OSError: Directory not empty`。
