@@ -78,6 +78,12 @@ pub struct Config {
     /// prefix.
     #[serde(default)]
     pub system_updates: runtime::SystemUpdates,
+    /// Keep the plugin market (`dshmarket`) in the profile current, the same way the CLI itself
+    /// is kept current: check the dist-tags, stop the instance using the profile, install, and
+    /// restart so the new plugin is what loads. It rewrites files in the profile
+    /// (`package.json` + lockfile), which is why it has its own switch next to `auto_update`.
+    #[serde(default = "default_auto_update")]
+    pub auto_update_plugins: bool,
 }
 
 fn default_port() -> u16 {
@@ -238,6 +244,7 @@ impl Config {
             require_tested_dsh: false,
             runtime: runtime::Preference::Auto,
             system_updates: runtime::SystemUpdates::Install,
+            auto_update_plugins: true,
         };
         // The same repair a loaded file gets, so the value seeded here is already usable
         // (a `HOME` that is relative or gone would otherwise become the workspace).
@@ -1207,6 +1214,109 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                         ));
                     }
                 }
+            }
+        }
+    }
+
+    // 3b3) The plugin market lives in the user profile rather than in the CLI tree, but it ages
+    //      the same way: check the dist-tags, stop the instance that is using the profile, install,
+    //      and let the new plugin load. `auto_update_plugins` turns the whole step off.
+    if config.auto_update && config.auto_update_plugins {
+        let profile_dir = home.join("profiles").join("web");
+        if update::declares_plugin(&profile_dir, update::MARKET_PLUGIN) {
+            match update::installed_plugin(&profile_dir, update::MARKET_PLUGIN) {
+                // Declared but not installed: installing it is a repair, not an update, and the
+                // user may be mid-way through their own plugin surgery.
+                None => harness::app_log(&format!(
+                    "{} 已声明但未安装，跳过自动更新",
+                    update::MARKET_PLUGIN,
+                )),
+                Some(current) => match update::npm_for(&resolved.node) {
+                    None => harness::app_log("找不到 npm，跳过插件市场更新检查"),
+                    Some(npm) => {
+                        let interval = config.update_check_interval_minutes;
+                        let checked = update::check_plugin_cached(
+                            &npm,
+                            update::MARKET_PLUGIN,
+                            &config.update_tags,
+                            &current,
+                            data_dir,
+                            interval,
+                        );
+                        match checked.status {
+                            update::Status::UpdateAvailable { to, .. } if checked.attempted => {
+                                harness::app_log(&format!(
+                                    "plugin {} {to} was already attempted and changed nothing; not installing again",
+                                    update::MARKET_PLUGIN
+                                ));
+                            }
+                            update::Status::UpdateAvailable { from, to } => {
+                                window::set_status(
+                                    app,
+                                    "正在更新插件市场…",
+                                    &format!("v{from} -> v{to}"),
+                                );
+                                harness::app_log(&format!(
+                                    "plugin update available: {} {from} -> {to}, installing",
+                                    update::MARKET_PLUGIN
+                                ));
+                                // Same hazard as a core update: pnpm rewrites profile
+                                // node_modules in place and a running harness would break on its
+                                // next lazy require().
+                                match stop_instance_before_update(app, data_dir, port, &config) {
+                                    Err(reason) => harness::app_log(&format!(
+                                        "plugin update deferred, keeping v{from}: {reason}"
+                                    )),
+                                    Ok(()) => match update::install_plugin(
+                                        &resolved.node,
+                                        &resolved.dsh_js,
+                                        "web",
+                                        update::MARKET_PLUGIN,
+                                        &to,
+                                        config.dsh_home.as_deref(),
+                                    ) {
+                                        Ok(()) => {
+                                            let after = update::installed_plugin(
+                                                &profile_dir,
+                                                update::MARKET_PLUGIN,
+                                            )
+                                            .unwrap_or_default();
+                                            if after == from {
+                                                // pnpm wrote the package somewhere the profile
+                                                // does not load it from: report and remember the
+                                                // attempt instead of retrying on every launch.
+                                                update::mark_plugin_attempt_ineffective(
+                                                    data_dir, &to,
+                                                );
+                                                harness::app_log(&format!(
+                                                    "plugin installed but the profile still loads {} {from}",
+                                                    update::MARKET_PLUGIN
+                                                ));
+                                            } else {
+                                                just_updated = true;
+                                                harness::app_log(&format!(
+                                                    "plugin updated: {} {from} -> {after}",
+                                                    update::MARKET_PLUGIN
+                                                ));
+                                            }
+                                        }
+                                        Err(reason) => harness::app_log(&format!(
+                                            "plugin update failed, keeping v{from}: {reason}"
+                                        )),
+                                    },
+                                }
+                            }
+                            update::Status::UpToDate { version } => harness::app_log(&format!(
+                                "plugin {} is up to date: {version}",
+                                update::MARKET_PLUGIN
+                            )),
+                            update::Status::Skipped => {}
+                            update::Status::Failed { reason } => harness::app_log(&format!(
+                                "plugin update check failed, keeping v{current}: {reason}"
+                            )),
+                        }
+                    }
+                },
             }
         }
     }

@@ -384,6 +384,80 @@ pub fn install(
     Err(format!("npm install 失败: {tail}"))
 }
 
+/// The plugin market this shell keeps current alongside the CLI.
+///
+/// It is a profile's only installation entry (the bundled template ships it, plan §2.5), so a
+/// stale copy is the difference between "you can install plugins" and "you cannot".
+pub const MARKET_PLUGIN: &str = "dshmarket";
+
+/// The version of `package` installed in a dsh profile, when it is there.
+///
+/// A profile is a pnpm project: `node_modules/<package>/package.json` is what the CLI loads,
+/// while the range in the profile's own `package.json` is only the user's intent.
+pub fn installed_plugin(profile_dir: &Path, package: &str) -> Option<String> {
+    let manifest = read_package_json(&profile_dir.join("node_modules").join(package))?;
+    let version = manifest.get("version")?.as_str()?.trim();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_string())
+    }
+}
+
+/// Does the profile still declare `package`? A plugin the user removed must not be reinstalled
+/// by the updater.
+pub fn declares_plugin(profile_dir: &Path, package: &str) -> bool {
+    read_package_json(profile_dir)
+        .and_then(|manifest| manifest.get("dependencies")?.get(package).cloned())
+        .is_some()
+}
+
+fn read_package_json(dir: &Path) -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Add or update a plugin through the CLI's own plugin command.
+///
+/// `dsh plugin --profile <name> add <package>@<version>` forwards to pnpm inside the profile
+/// directory, so the CLI owns the profile layout and the pnpm invocation; the shell only decides
+/// *when* to run it (after the instance was stopped, exactly like a core update).
+pub fn install_plugin(
+    node: &Path,
+    dsh_js: &Path,
+    profile: &str,
+    package: &str,
+    version: &str,
+    dsh_home: Option<&Path>,
+) -> Result<(), String> {
+    let mut command = Command::new(node);
+    command
+        .arg(dsh_js)
+        .arg("plugin")
+        .arg("--profile")
+        .arg(profile)
+        .arg("add")
+        .arg(format!("{package}@{version}"))
+        // The CLI forwards to pnpm, another `#!/usr/bin/env node` script: node's directory has
+        // to lead PATH for the same reason `npm` needs it (see `npm_path`).
+        .env("PATH", npm_path(node, std::env::var_os("PATH").as_deref()));
+    if let Some(home) = dsh_home {
+        command.env("DSH_HOME", home);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("无法执行 dsh plugin: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let tail: String = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .take(5)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Err(format!("dsh plugin add 失败: {tail}"))
+}
+
 /// Cached outcome of one registry query, so most launches skip the ~1.9s network round trip.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Cache {
@@ -434,18 +508,35 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Where the core CLI's cached registry answer lives.
 pub fn cache_path(data_dir: &Path) -> PathBuf {
     data_dir.join("update-check.json")
 }
 
+/// The plugin check keeps its own file: a plugin answer must not consume the core's cache
+/// window (or the other way round), and the two compare different installed versions.
+pub fn plugin_cache_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("plugin-check.json")
+}
+
 pub fn read_cache(data_dir: &Path) -> Option<Cache> {
-    let raw = std::fs::read_to_string(cache_path(data_dir)).ok()?;
-    serde_json::from_str(&raw).ok()
+    read_cache_at(&cache_path(data_dir))
 }
 
 pub fn write_cache(data_dir: &Path, cache: &Cache) -> std::io::Result<()> {
-    std::fs::create_dir_all(data_dir)?;
-    std::fs::write(cache_path(data_dir), serde_json::to_vec_pretty(cache)?)
+    write_cache_at(&cache_path(data_dir), cache)
+}
+
+fn read_cache_at(path: &Path) -> Option<Cache> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_cache_at(path: &Path, cache: &Cache) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(cache)?)
 }
 
 /// Result of a cache-aware check.
@@ -468,8 +559,45 @@ pub fn check_cached(
     data_dir: &Path,
     interval_minutes: u64,
 ) -> Checked {
+    check_cached_at(
+        &cache_path(data_dir),
+        npm,
+        package,
+        wanted_tags,
+        current,
+        interval_minutes,
+    )
+}
+
+/// The same check against the plugin cache file (the plugin market, see [`MARKET_PLUGIN`]).
+pub fn check_plugin_cached(
+    npm: &Path,
+    package: &str,
+    wanted_tags: &[String],
+    current: &str,
+    data_dir: &Path,
+    interval_minutes: u64,
+) -> Checked {
+    check_cached_at(
+        &plugin_cache_path(data_dir),
+        npm,
+        package,
+        wanted_tags,
+        current,
+        interval_minutes,
+    )
+}
+
+fn check_cached_at(
+    cache_file: &Path,
+    npm: &Path,
+    package: &str,
+    wanted_tags: &[String],
+    current: &str,
+    interval_minutes: u64,
+) -> Checked {
     let now = now_secs();
-    let previous = read_cache(data_dir);
+    let previous = read_cache_at(cache_file);
     if let Some(cache) = previous.as_ref() {
         if cache.is_fresh(now, current, interval_minutes) {
             let status = match cache.latest.as_deref() {
@@ -499,8 +627,8 @@ pub fn check_cached(
         &status,
         Status::UpdateAvailable { to, .. } if attempted.as_deref() == Some(to.as_str())
     );
-    let _ = write_cache(
-        data_dir,
+    let _ = write_cache_at(
+        cache_file,
         &Cache {
             checked_at: now,
             installed: current.to_string(),
@@ -531,11 +659,20 @@ pub fn carried_attempt(previous: Option<&Cache>, latest: Option<&str>) -> Option
 /// Remember that installing `latest` did not change the CLI this shell runs, so the cached
 /// answer is reported but not installed again.
 pub fn mark_attempt_ineffective(data_dir: &Path, latest: &str) {
-    let Some(mut cache) = read_cache(data_dir) else {
+    mark_attempt_in(&cache_path(data_dir), latest);
+}
+
+/// The plugin counterpart of [`mark_attempt_ineffective`].
+pub fn mark_plugin_attempt_ineffective(data_dir: &Path, latest: &str) {
+    mark_attempt_in(&plugin_cache_path(data_dir), latest);
+}
+
+fn mark_attempt_in(cache_file: &Path, latest: &str) {
+    let Some(mut cache) = read_cache_at(cache_file) else {
         return;
     };
     cache.attempted = Some(latest.to_string());
-    let _ = write_cache(data_dir, &cache);
+    let _ = write_cache_at(cache_file, &cache);
 }
 
 impl std::fmt::Display for Version {
@@ -826,6 +963,94 @@ mod tests {
         .unwrap();
         let third = check_cached(npm, PACKAGE, &tags, "0.1.5-rc.1", &dir, 60);
         assert!(!third.attempted, "only the attempted version is suppressed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_market_plugin_is_read_from_the_profile_it_would_load() {
+        let dir = std::env::temp_dir().join("dsh-desktop-plugin-profile-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let plugin = dir.join("node_modules").join(MARKET_PLUGIN);
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"dsh-profile-web","dependencies":{"dshmarket":"^1.45.1"}}"#,
+        )
+        .unwrap();
+        std::fs::write(plugin.join("package.json"), r#"{"version":"1.46.1"}"#).unwrap();
+
+        assert!(declares_plugin(&dir, MARKET_PLUGIN));
+        // The installed version (what the CLI loads) wins over the range in the profile.
+        assert_eq!(
+            installed_plugin(&dir, MARKET_PLUGIN).as_deref(),
+            Some("1.46.1")
+        );
+
+        std::fs::remove_file(plugin.join("package.json")).unwrap();
+        assert_eq!(installed_plugin(&dir, MARKET_PLUGIN), None);
+
+        // A plugin the user removed must not be reinstalled by the updater.
+        std::fs::write(dir.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        assert!(!declares_plugin(&dir, MARKET_PLUGIN));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_plugin_check_keeps_its_own_cache_window() {
+        let dir = std::env::temp_dir().join("dsh-desktop-plugin-cache-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(cache_path(&dir), plugin_cache_path(&dir));
+
+        // The core cache holds an update for the CLI; the plugin window is separate.
+        write_cache(
+            &dir,
+            &Cache {
+                checked_at: now_secs(),
+                installed: "0.1.5-rc.1".into(),
+                latest: Some("0.1.5-rc.2".into()),
+                attempted: None,
+            },
+        )
+        .unwrap();
+        let core_before = std::fs::read_to_string(cache_path(&dir)).unwrap();
+
+        std::fs::write(
+            plugin_cache_path(&dir),
+            serde_json::to_vec(&Cache {
+                checked_at: now_secs(),
+                installed: "1.45.1".into(),
+                latest: Some("1.46.1".into()),
+                attempted: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        // A fresh plugin answer is served from the plugin file without touching the network
+        // (`npm` here does not exist) and without consuming the core answer.
+        let checked = check_plugin_cached(
+            Path::new("/nonexistent/npm"),
+            MARKET_PLUGIN,
+            &["latest".to_string()],
+            "1.45.1",
+            &dir,
+            60,
+        );
+        assert!(checked.cached);
+        assert_eq!(
+            checked.status,
+            Status::UpdateAvailable {
+                from: "1.45.1".into(),
+                to: "1.46.1".into()
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache_path(&dir)).unwrap(),
+            core_before,
+            "the core cache must not be touched by a plugin check"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

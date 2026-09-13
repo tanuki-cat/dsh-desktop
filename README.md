@@ -32,7 +32,8 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - 安全：Harness 窗口零 capability、导航限定当次 authority、外链与 `window.open` 只把 `http`/`https` 交系统浏览器（`file:`、自定义 scheme 记 `external scheme blocked` 后丢弃）
 - 下载：`on_download` 落盘到 `~/Downloads`，同名文件自动加 `-1`/`-2` 后缀（不静默覆盖）；
   附件上传由 wry 的 `runOpenPanel` 原生处理
-- **dsh 核心升级**：每次启动查 registry（默认取 `latest`+`next` 最高版本），有新版就装并重启实例；
+- **升级**：每次启动查 registry（默认取 `latest`+`next` 最高版本）—— dsh 核心有新版就装并重启实例；
+  profile 里的插件市场 `dshmarket` 走同一套机制（自己的缓存窗口，装完同样重启让新插件生效）；
   npm 子进程显式带上 node 所在目录的 PATH（否则 GUI 启动下 `#!/usr/bin/env node` 必然 exit 127）
 - 打包：`pnpm tauri build --bundles app` → `DSH Desktop.app`
 
@@ -176,6 +177,7 @@ Windows 免安装包实机验证通过），`main` 上未实施，见下方"后�
 | `dsh_home` | `null` | `null` 表示共用 `~/.dsh`（插件/设置/会话全保留）；指向别的目录则隔离 |
 | `take_over_existing` | `true` | 端口被外部 Harness 占用时，停止它并接管；`false` 则改用系统浏览器打开 |
 | `auto_update` | `true` | 启动时检查并安装 dsh 新版本 |
+| `auto_update_plugins` | `true` | 同时也把 profile 里的插件市场（`dshmarket`）更新到 registry 上的最新版；它会改写你 profile 的 `package.json`/锁文件，所以单独一个开关 |
 | `update_tags` | `["latest","next"]` | 取其中最高版本；只跟正式版就写 `["latest"]` |
 | `update_check_interval_minutes` | `60` | 一次成功的查询结果缓存多久（0 = 每次启动都查）。查询实测约 1.2–1.9 s，缓存命中 0 ms |
 | `import_shell_env` | `true` | 启动时导入登录 shell 的环境变量（见下节）。`false` 则只用 App 自身环境 |
@@ -216,6 +218,7 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | 端口上是本应用上次启动的实例（state.json 对得上且存活） | 直接复用（cookie 对同一 authority 仍有效，实测跨重启有效） |
 | 端口上是**别人**启动的 Harness（CLI / Automator） | **接管**：401 特征确认身份 → 对该 PID 发 SIGTERM → 等端口释放 → 自启拿新 token |
 | 启动前发现新版 dsh | 先升级 CLI（splash 显示进度），随后重启实例跑新版本 |
+| 启动前发现新版插件市场 | 先停实例 → `dsh plugin --profile web add dshmarket@<版本>` → 重启实例（`auto_update_plugins: false` 可关） |
 | 端口被别的程序占用 | 错误页，提示改 `config.json` 的端口 |
 | `take_over_existing: false` 且是外部 Harness | 不接管：用系统浏览器打开并给出说明 |
 | 关闭窗口（红点 / ⌘W） | `AppHandle::exit(0)` → `RunEvent::ExitRequested` → SIGTERM 进程组 → 删状态文件 |
@@ -266,6 +269,20 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 
 结果写入日志：`dsh is up to date` / `update available: A -> B` / `dsh updated: A -> B` / `update failed, keeping vA` /
 `update A was already attempted and changed nothing; not installing again`。
+
+### 插件市场（`dshmarket`）的自动更新
+
+核心之外，这个壳还会保持 profile 里的插件市场为最新 —— 它是新机器唯一的插件安装入口：
+
+- 同一个 registry 检查（`update_tags`、`update_check_interval_minutes`），答案缓存在**自己的**
+  `<app-data>/plugin-check.json`，与核心的 `update-check.json` 互不干扰；
+- 只在该 profile 的 `package.json` **声明了** `dshmarket` 时才动手（你自己删掉的插件不会被装回来），
+  比较的是 `node_modules/dshmarket/package.json` 里的**实际安装版本**，不是范围；
+- 有新版时走与核心相同的顺序：**先停实例**（pnpm 原地重写 profile 的 `node_modules`，运行中的
+  harness 下次 lazy require 会崩）→ `dsh plugin --profile web add dshmarket@<版本>`（CLI 自己转发 pnpm，
+  属于你的 profile 文件会被改写）→ 回读版本 → 本轮重启实例让新插件生效；
+- 装了但版本没变（pnpm 写到了别处）只记日志，并把这次尝试写进缓存，同一版本不重复装；
+- 不想要就设 `"auto_update_plugins": false`（核心的 `auto_update` 不受影响）。
 
 **排障**：手工修好 npm 全局前缀（或换安装方式）后，壳在出现更高版本前不会再尝试安装 —— 日志里那句
 `already attempted and changed nothing` 是唯一线索，删掉 `<app-data>/update-check.json` 即可复位。
