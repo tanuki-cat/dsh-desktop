@@ -9,6 +9,10 @@ name: windows-portable
 # 两种触发方式共用同一份实现：
 #   * workflow_dispatch —— 手动出包，产物作为 workflow artifact（可选附加到已有 Release）；
 #   * workflow_call    —— 由 release.yml 在打 tag 时调用，产物交给它的 release 任务统一发布。
+#
+# 分支策略：自带运行时只存在于长期分支 feat/bundled-runtime（**暂不合并到 main**），Windows 免安装包
+# 目前是该分支唯一的对外产物。工作流文件留在 main 上只是为了能随时手动触发 —— 构建的是 build_ref
+# 指向的分支代码（默认就是 feat/bundled-runtime）。用 main 当 build_ref 只会得到一份用不上的 runtime/。
 on:
   workflow_dispatch:
     inputs:

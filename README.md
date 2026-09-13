@@ -5,8 +5,13 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 
 > 许可证：MIT（见 `LICENSE`）。
 >
-> 当前版本仍**要求系统已装 `node` 与 `dsh`**。让目标机器无需预装这两者的发行方案
-> （自带 Node + dsh 核心）已规划完成，见 [后续实施计划](#后续实施计划自带运行时无需预装-nodedsh)。
+> 当前版本（`main`）仍**要求系统已装 `node` 与 `dsh`**。让目标机器无需预装这两者的发行方案
+> （自带 Node + dsh 核心）已在 `feat/bundled-runtime` 分支落地，见 [后续实施计划](#后续实施计划自带运行时无需预装-nodedsh)。
+>
+> **分支策略**：`feat/bundled-runtime` 是**长期分支，暂不合并到 `main`**。它当前的对外用途是构建与发布
+> **Windows 免安装版**（见 [Windows 免安装包](#windows-免安装包手动触发)）：工作流挂在 `main` 上以便随时手动触发，
+> 但构建的是该分支的代码。macOS/Linux 的自带运行时也在这个分支上验证。合并时机另行决定；
+> 合入前不要把分支改动同步回 `main`。
 
 设计依据：[`docs/design-task-feat-dsh-tauri-desktop-shell.md`](docs/design-task-feat-dsh-tauri-desktop-shell.md)
 （正文为设计，实施偏差与验证证据见其 §13.1–13.4）。
@@ -55,11 +60,15 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 
 **待实机点击确认**：附件上传、下载、`window.open` 实际效果、macOS TCC 授权归因。
 
-**平台**：构建入口只覆盖 macOS 与 Linux（其他平台在 Makefile 解析阶段直接报错）。Windows 分支代码保留但**未支持也未验证**：
-那里的存活探测恒为真，`terminate` 会白等满 grace，要移植得先换成 `OpenProcess` + `GetExitCodeProcess`。
+**平台**：`make` 的构建入口只覆盖 macOS 与 Linux（其他平台在解析阶段直接报错）。
+Windows 由 `feat/bundled-runtime` 分支支持并**已实机验证**（CI 原生 staging + 免安装包，
+`process.rs` 的存活探测已换成 `OpenProcess` + `GetExitCodeProcess`），但**不在 `main` 上** ——
+见 [Windows 免安装包](#windows-免安装包手动触发)。本机可用 `cargo clippy --target x86_64-pc-windows-gnu`
+对 `cfg(windows)` 代码做回归（只检查类型与 lint，不能运行 PE）。
 
 **未做**：签名与公证（对外分发必需）、多 workspace 切换 UI；
-**自带运行时（打包 Node/dsh）已规划未实施**，见下方"后续实施计划"。
+**自带运行时（打包 Node/dsh）已在 `feat/bundled-runtime` 分支实现**（macOS `.app` 实测可跑、
+Windows 免安装包实机验证通过），`main` 上未实施，见下方"后续实施计划"。
 
 ## 构建（Makefile，支持 macOS 与 Linux）
 
@@ -103,7 +112,8 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 
 ### 自带运行时（进行中）
 
-已完成并可实机复现（`feat/bundled-runtime` 分支，暂不与 main 合并）：
+已完成并可实机复现，全部在 **`feat/bundled-runtime`** 分支上（**长期分支，暂不合并到 `main`**；
+Windows 免安装版也由它构建，见 [Windows 免安装包](#windows-免安装包手动触发)）：
 
 - `make runtime-fetch / runtime-stage / runtime-clean / bundle-bundled` 四个目标全部跑通；
 - staging 自带校验：必需文件、**悬空符号链接**（会让 `tauri build` 失败）、**quarantine 属性**（会带进 .app）；
@@ -121,7 +131,10 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
   `PNPM_HOME` 指向可写前缀；核心更新只落到 `app-data/runtime/prefix`，用系统安装时只提示不安装；
 - 想看效果：`DSH_DESKTOP_RUNTIME_PREFERENCE=bundled|system|auto` 可覆盖 `config.json` 的 `runtime`。
 
-尚未做：带自带的 **GUI 实机验证**、`minimumSystemVersion` 提到 11.0、签名与公证、Linux 侧 staging。
+**Windows 免安装包已实机验证通过**（2026-09-13：解压到 `D:\dsh` 双击即启动，自带 node + dsh 拉起 Web GUI，
+插件市场与会话内工具调用正常）。
+
+尚未做：macOS 自带运行时的 **GUI 实机验证**、`minimumSystemVersion` 提到 11.0、签名与公证、Linux 侧 staging。
 细节见[方案文档](docs/design-task-feat-dsh-bundled-runtime.md) §20。
 
 运行时（当前版本）需要系统中已有 `dsh` 与 `node`。
@@ -254,16 +267,30 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
 
 ## Windows 免安装包（手动触发）
 
+**这个包只由 `feat/bundled-runtime` 分支产出**：工作流文件挂在 `main` 上（这样 Actions 页面随时能触发），
+默认构建的却是 `build_ref` 指向的分支代码。该分支是长期分支、**暂不合并到 `main`**；`main` 上没有自带运行时，
+即使跑同一个工作流也只会得到一份用不上的 `runtime/`。
+
 工作流：`.github/workflows/windows-portable.yml` —— 在 Actions 页面 **Run workflow** 手动触发（`workflow_dispatch`），
 在 `windows-latest` 上**原生** stage 运行时，产出 `dsh-desktop_<版本>_windows-x64-portable.zip`：
 内含 `DSH Desktop/dsh-desktop.exe` + `WebView2Loader.dll` + `runtime/`（Node + dsh + pnpm + 插件市场模板 + 许可清单），
-目标机器**无需安装任何东西**。
+目标机器**无需安装任何东西**。另附同名 `.exe`（7z 自解压包，双击解压，绕开资源管理器解压的 260 字符路径限制）
+与 `SHA256SUMS-windows-x64`。
 
 | 输入 | 默认 | 说明 |
 |---|---|---|
 | `dsh_version` | `0.1.5-rc.2` | 随包附带的 dsh 版本 |
 | `node_version` | `22.23.2` | 随包附带的 Node 版本 |
+| `build_ref` | `feat/bundled-runtime` | 从哪个分支/tag 构建（自带运行时只在该分支上） |
 | `attach_to_release` | 空 | 填一个已存在的 Release tag 就把 zip 一并传上去；留空只作为 workflow artifact |
+
+**打 tag 发版**：`release.yml` 的 `windows-portable` 任务用 `workflow_call` 复用同一份实现
+（`build_ref` 传 tag 名），所以**在 `feat/bundled-runtime` 上打 tag** 就能把 Windows 包和 macOS/Linux 产物
+一起发出去；`main` 的 `release.yml` 没有这个任务。
+
+**实机验证（2026-09-13，run 34752267176 的产物）**：Windows 11 解压到 `D:\dsh` 后双击即启动，
+自带 Node 22.23.2 + dsh 0.1.5-rc.2 拉起 Web GUI，首启播种的插件市场可用，会话内
+`glob`/`write`/`read`/`grep`/`edit`/`patch`/`todo_write`/`present` 正常。
 
 **为什么必须在 Windows 上 stage**：在 macOS 上用 `npm install --os=win32 --cpu=x64` 装 dsh 时，koffi 的平台包
 `@koromix/koffi-win32-x64` 不会被装进依赖树（npm 的 `--os/--cpu` 对全局安装的依赖树不生效），于是 postinstall
@@ -280,9 +307,10 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
 | 运行器 | 平台标识 | 产物 |
 |---|---|---|
 | `macos-14` | `macos-arm64` | `dsh-desktop_<v>_macos-arm64.app.zip` |
-| `macos-13` | `macos-x64` | `dsh-desktop_<v>_macos-x64.app.zip` |
+| `macos-14`（交叉 `x86_64-apple-darwin`） | `macos-x64` | `dsh-desktop_<v>_macos-x64.app.zip` |
 | `ubuntu-22.04` | `linux-x64` | `dsh-desktop_<v>_linux-x64.deb` |
 | `ubuntu-24.04-arm` | `linux-arm64` | `dsh-desktop_<v>_linux-arm64.deb` |
+| `windows-latest`（复用 `windows-portable.yml`） | `windows-x64` | `dsh-desktop_<v>_windows-x64-portable.zip` ＋ 同名 `.exe` —— **仅在 `feat/bundled-runtime` 分支上打 tag 时产出** |
 
 **流程**：`preflight`（校验 tag 与 `tauri.conf.json` / `Cargo.toml` / `package.json` 三处版本一致）→
 每平台 `make fmt` + `git diff --exit-code` + `make clippy` + `make test`（发布门禁）→ `make bundle` →
@@ -299,8 +327,9 @@ git tag v0.2.0 && git push origin v0.2.0
 
 **校验下载**：`shasum -a 256 -c SHA256SUMS`（Linux 用 `sha256sum -c SHA256SUMS`）。
 
-**当前限制**：产物未签名、未公证（macOS 首次打开需右键 →「打开」，或 `xattr -dr com.apple.quarantine`），
-且需要机器已装 `node` 与 `dsh` —— 自带运行时的发行版仍在实施中（见下节）。
+**当前限制**：产物均未签名、未公证（macOS 首次打开需右键 →「打开」，或 `xattr -dr com.apple.quarantine`）；
+macOS/Linux 产物**需要机器已装 `node` 与 `dsh`**（自带运行时的发行版仍在 `feat/bundled-runtime` 上实施，见下节），
+Windows 免安装包则**自带 node 与 dsh**。
 按需扩展：把 dmg 加进 macOS 的 `bundles`（`app,dmg`）、AppImage 加进 Linux、以及签名/公证（需要证书 secrets，做法见自带运行时方案 §7）。
 ## 后续实施计划：自带运行时（无需预装 Node/dsh）
 

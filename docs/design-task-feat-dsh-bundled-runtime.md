@@ -1,5 +1,12 @@
 # 桌面壳自带 Node 与 dsh 核心的发行方案
 
+> **分支策略（2026-09-13 起）**：本方案实施在长期分支 `feat/bundled-runtime` 上，**暂不合并到 `main`**。
+> 该分支当前的对外用途是**构建与发布 Windows 免安装版**（`.github/workflows/windows-portable.yml`，
+> 由 `main` 手动触发、构建 `build_ref` 指向的分支代码；在分支上打 tag 则由 `release.yml` 的
+> `windows-portable` 任务一并发布）。macOS/Linux 的自带运行时继续在该分支上验证，
+> `main` 保持“需要预装 node 与 dsh”的现状，只保留调度用的 workflow。合并时机由后续决定，
+> 合入前不要把这里的改动同步回 `main`（`release.yml` 会因此多出一个构建不出有效运行时的 Windows 任务）。
+
 > 目标：在**没有预装 Node.js 和 DeepSeek Harness** 的机器上，双击即用。
 > 上游设计：[`design-task-feat-dsh-tauri-desktop-shell.md`](./design-task-feat-dsh-tauri-desktop-shell.md)（其 §22 已把本方案列为 V2）。
 >
@@ -713,7 +720,9 @@ make runtime-clean                              # 回收
 `release.yml` 调用——后者新增 `windows-portable` 任务（`uses: ./.github/workflows/windows-portable.yml`，
 `build_ref` 传 tag，`needs: [preflight, build, windows-portable]`），Windows 产物与 macOS/Linux 一起发布。
 `release.yml` 此前只存在于 main（含 macos-x64 交叉编译与 release 任务的 checkout 修复），本次一并取回分支，
-因此 **分支上打 tag 即可发布全套产物**；main 上的 release.yml 要等分支合并后才带 Windows 任务。
+因此 **在本分支上打 tag 即可发布全套产物**。按上面的分支策略，`main` 上的 `release.yml` 与
+`windows-portable.yml` 本次都不动：main 的代码没有自带运行时，在那里加 Windows 任务只会产出带一份
+死 `runtime/` 的包；等分支合并时再一起同步。
 
 **实机验证通过（2026-09-13，run 34752267176 的产物）**：Windows 11 上解压到 `D:\dsh` 后双击即可启动，
 自带 node 22.23.2 + dsh 0.1.5-rc.2 正常拉起 Web GUI，首启播种的插件市场可用，会话内 `glob` / `write` /
