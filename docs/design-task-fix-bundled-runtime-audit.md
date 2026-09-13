@@ -9,6 +9,9 @@
 >
 > 本文是**审查结论 + 修复任务清单**，不修改上面两份方案文档（它们记录的是当时的决策与实测，按文档生命周期规则保持原样）。
 > 修复落地后，把结果回写到本文的"处理状态"列，方案文档只在结论被推翻时才另开 supersede 文档。
+>
+> **修复已落地（2026-09-13，`feat/bundled-runtime`）**：16 项中 15 项已修，1 项（P2-13 回退/last-known-good）
+> 按 §11 的阶段 D 推到签名与实机验收一起做；逐项方案、新增测试与验证结果见 §15。
 
 ---
 
@@ -19,22 +22,22 @@
 
 | # | 级别 | 问题 | 位置 | 处理状态 |
 |---|---|---|---|---|
-| 1 | P0 | staging 校验的"必需内容"闸门完全失效（已实测复现） | `scripts/check-runtime-stage.sh:17-41` | 待修 |
-| 2 | P0 | 自带运行时更新后本轮仍跑旧核心，并报一条误导日志；且每次启动重装一遍 | `src-tauri/src/lib.rs:805-830` | 待修 |
-| 3 | P0 | 更新前停实例用了进程组终止，可能连带杀掉用户终端里的其它进程 | `src-tauri/src/lib.rs:356` | 待修 |
-| 4 | P1 | §2.4 的四格矩阵有一格永远走不到，对应单测是假的绿 | `src-tauri/src/lib.rs:508` | 待修 |
-| 5 | P1 | `DSH_DESKTOP_DSH` 排障开关会触发"自带运行时"的全套副作用 | `src-tauri/src/runtime.rs:154`、`lib.rs:386` | 待修 |
-| 6 | P1 | 首启播种把 90s 首启超时吃成 30s；播种失败留下半棵 profile | `src-tauri/src/lib.rs:591-612`、`1064-1073` | 待修 |
-| 7 | P1 | 播种不看运行时来源，`runtime: system` 的用户也会被播种 | `src-tauri/src/lib.rs:591` | 待修 |
-| 8 | P1 | staging 缺文件数/体积闸门，目录残留会被静默打包 | `Makefile:211`、`scripts/stage-runtime.sh:60` | 待修 |
-| 9 | P1 | 只拦悬空链接，不拦绝对链接 | `scripts/check-runtime-stage.sh:44` | 待修 |
-| 10 | P2 | `minimumSystemVersion` 仍是 10.15，低于自带 node 的 `minos 11.0` | `src-tauri/tauri.conf.json:26` | 方案 §20.4 已记为待办 |
-| 11 | P2 | 更新不传 `--cache`；`runtime/{prefix,tools,npm-cache}` 无人创建 | `src-tauri/src/update.rs:350`、`lib.rs:391` | 方案 §21 已记为待办 |
-| 12 | P2 | 没有 `runtime.lock`，只信下载来的 `SHASUMS256.txt` | `Makefile:198-207`、`scripts/stage-runtime.sh:54-57` | 待修 |
-| 13 | P2 | §2.3 的"回退 + last-known-good"完全没实现 | `src-tauri/src/lib.rs:1075-1083` | 待修 |
-| 14 | P2 | 系统探测无条件执行，`bundled` / 环境变量覆盖时也白跑 | `src-tauri/src/lib.rs:508-536` | 待修 |
-| 15 | P2 | `runtime: system` 仍被能力门槛拒掉，与 §2.4 的措辞有出入 | `src-tauri/src/lib.rs:519` | 待定（可能是有意为之，需文档化） |
-| 16 | P3 | 发布门禁用 `make fmt` + `git diff`，会改工作区 | `.github/workflows/release.yml:109-110` | 待修 |
+| 1 | P0 | staging 校验的"必需内容"闸门完全失效（已实测复现） | `scripts/check-runtime-stage.sh:17-41` | **已修**：`first_of` 改全局变量（不再丢 `fail`）+ `--self-test` 自检 |
+| 2 | P0 | 自带运行时更新后本轮仍跑旧核心，并报一条误导日志；且每次启动重装一遍 | `src-tauri/src/lib.rs:805-830` | **已修**：装完按安装前缀重解析（`installed_cli`）并在本轮切树；`attempted` 缓存阻止重复安装 |
+| 3 | P0 | 更新前停实例用了进程组终止，可能连带杀掉用户终端里的其它进程 | `src-tauri/src/lib.rs:356` | **已修**：`StopMode` —— 自家实例走进程组、外部实例只发单 pid |
+| 4 | P1 | §2.4 的四格矩阵有一格永远走不到，对应单测是假的绿 | `src-tauri/src/lib.rs:508` | **已修**：`locator::system_node()` / `system_dsh()` 独立解析 |
+| 5 | P1 | `DSH_DESKTOP_DSH` 排障开关会触发"自带运行时"的全套副作用 | `src-tauri/src/runtime.rs:154`、`lib.rs:386` | **已修**：`bundled` 按 `dsh.origin`（Seed/Shadow）判定；`Origin::Env` → `Updates::Notify` |
+| 6 | P1 | 首启播种把 90s 首启超时吃成 30s；播种失败留下半棵 profile | `src-tauri/src/lib.rs:591-612`、`1064-1073` | **已修**：超时判定前移到播种之前；`copy_tree` 先写 `.tmp` 再改名、失败即清理 |
+| 7 | P1 | 播种不看运行时来源，`runtime: system` 的用户也会被播种 | `src-tauri/src/lib.rs:591` | **已修**：只在 `resolved.bundled()` 时播种 |
+| 8 | P1 | staging 缺文件数/体积闸门，目录残留会被静默打包 | `Makefile:211`、`scripts/stage-runtime.sh:60` | **已修**：两处都整体清空（只留 README.md）；校验脚本加文件数/体积闸门 |
+| 9 | P1 | 只拦悬空链接，不拦绝对链接 | `scripts/check-runtime-stage.sh:44` | **已修**：新增绝对链接检查（含 Windows 盘符形式），`--self-test` 覆盖 |
+| 10 | P2 | `minimumSystemVersion` 仍是 10.15，低于自带 node 的 `minos 11.0` | `src-tauri/tauri.conf.json:26` | **已修**：`bundle-bundled` 在 macOS 上用 `--config` 覆盖为 11.0；精简版保持 10.15 |
+| 11 | P2 | 更新不传 `--cache`；`runtime/{prefix,tools,npm-cache}` 无人创建 | `src-tauri/src/update.rs:350`、`lib.rs:391` | **已修**：`install` 传 `--cache <app-data>/runtime/npm-cache`；启动时幂等创建三个目录 |
+| 12 | P2 | 没有 `runtime.lock`，只信下载来的 `SHASUMS256.txt` | `Makefile:198-207`、`scripts/stage-runtime.sh:54-57` | **已修**：新增 `src-tauri/runtime.lock`（5 个平台钉 SHA256），Makefile 与 staging 脚本都与之比对 |
+| 13 | P2 | §2.3 的"回退 + last-known-good"完全没实现 | `src-tauri/src/lib.rs:1075-1083` | **未修**：按 §11 的阶段 D 与签名/实机一起做，见 §15.3 |
+| 14 | P2 | 系统探测无条件执行，`bundled` / 环境变量覆盖时也白跑 | `src-tauri/src/lib.rs:508-536` | **已修**：`preference == Bundled` 或两个 `DSH_DESKTOP_*` 都已指定时短路探测 |
+| 15 | P2 | `runtime: system` 仍被能力门槛拒掉，与 §2.4 的措辞有出入 | `src-tauri/src/lib.rs:519` | **已处理（文档化）**：保留现行语义并写进分支 README，注明"以本条为准" |
+| 16 | P3 | 发布门禁用 `make fmt` + `git diff`，会改工作区 | `.github/workflows/release.yml:109-110` | **已修**：改用 `make fmt-check`（新增目标） |
 
 **环境备注**（不是代码问题）：本工作树的 `src-tauri/target/` 里缓存了旧路径
 `/Users/wangzy/Applications/Scripts/dsh-desktop/…` 的 tauri 构建产物，`cargo test` 会在 build script 阶段失败
@@ -311,4 +314,67 @@ let timeout = if home.join("profiles").join("web").exists() { NEXT /*30s*/ } els
 - 未做联网测试（`make test-live`）与实机 GUI 验证；
 - 未审查 `src/index.html`、图标脚本、`README.md` 正文的表述一致性（只核对了与本文相关的几处）；
 - macOS 签名/公证链路（方案 §7）本轮没有产物可验；
+---
+
+## 15. 修复记录（2026-09-13，`feat/bundled-runtime`）
+
+16 项中 15 项已修，P2-13（回退/last-known-good）按 §11 的阶段 D 推迟。
+新增/改写 6 个单测；`cargo fmt`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 全绿：**53 passed / 0 failed**。
+
+### 15.1 逐项方案
+
+| # | 落地 | 位置 |
+|---|---|---|
+| P0-1 | `first_of` 不再用命令替换返回（改全局变量并记录缺失项），缺口由主 shell 的 `fail` 决定；补 `--self-test`：用假目录断言"缺必需内容"与"绝对符号链接"都必须非 0 退出，干净假目录必须通过；`runtime-stage` 与 CI 的 staging 步骤之前都会跑它。同时修掉收尾 bug（`$dsh_js` 为空时不再把 `node --version` 当成 dsh 版本） | `scripts/check-runtime-stage.sh`、`Makefile` |
+| P0-2 | 安装完成后用 `installed_cli(prefix, supervised, fallback)` 从**安装前缀**重新解析 CLI 与版本：版本变了就把 `resolved.dsh_js` 切到新树并 `just_updated = true`（本轮重启）；版本确实没变才记那条 `check npm global prefix`，并把尝试写进缓存（`Cache.attempted` + `carried_attempt`），同一版本不再重复安装 | `lib.rs`、`update.rs` |
+| P0-3 | 新增 `StopMode`：`ours.is_some()` → `process::terminate`（进程组），外部实例 → `process::terminate_pid`；状态页与日志写明用了哪种 | `lib.rs` |
+| P1-4 | `locator::system_node()` / `system_dsh()` 各自独立解析（`find_node_without_env` 拆出；`system_node` 不看 `DSH_DESKTOP_NODE`，那是另一个输入）；`keep_system_install` 纯函数把门槛结果作用到两半：没有系统 node 时保留系统 dsh（§2.4 那一格），门槛 Reject 时两半一起丢 | `locator.rs`、`lib.rs` |
+| P1-5 | `ResolvedRuntime` 增加 `bundled` 字段，来自 `decision.dsh.origin` 属于 Seed/Shadow（不再从 `updates` 反推）；`runtime::decide` 改为 Seed/Shadow → Shadow、System/Env → Notify | `lib.rs`、`runtime.rs` |
+| P1-6 | `first_launch` 在播种**之前**判定（`home` 也一并提前），播种出的 `profiles/web` 不再把首次启动的预算压成 30 s；`copy_tree` 改为先写同名 `.tmp` 再 `rename`，失败清理临时目录 | `lib.rs` |
+| P1-7 | 只有 `resolved.bundled()` 时才播种 profile 模板 | `lib.rs` |
+| P1-8 | `runtime-stage` 与 `stage-runtime.sh` 都整体清空 `runtime/`（`find -mindepth 1 ! -name README.md -exec rm -rf`）；`check-runtime-stage.sh` 增加文件数（默认 20000–55000，Makefile 收紧到 45000）与体积（默认 700 MB，Makefile 收紧到 600 MB）闸门，阈值可用 `DSH_RUNTIME_*` 覆盖 | `Makefile`、`scripts/*` |
+| P1-9 | 新增绝对符号链接检查：`find -type l` + `readlink`，目标以 `/` 或盘符开头即失败（相对链接如 `node_modules/.bin/*` 放行）。**注意**：这里用 `if` 而不是 `case` —— 本仓库实测的 macOS bash 3.2 解析不了 `$( )` 里的 `case`（最小用例直接报语法错误） | `scripts/check-runtime-stage.sh` |
+| P2-10 | `bundle-bundled` 在 macOS 上给 `tauri build` 传 `--config` 覆盖，把 `bundle.macOS.minimumSystemVersion` 提到 11.0；`bundle` 目标新增 `TAURI_CONFIG_EXTRA` 透传（精简版仍是 `tauri.conf.json` 的 10.15） | `Makefile` |
+| P2-11 | `update::install` 增加 `cache` 参数并传 `--cache`；启动时幂等创建 `app-data/runtime/{prefix,tools,npm-cache}` | `update.rs`、`lib.rs` |
+| P2-12 | 新增 `src-tauri/runtime.lock`（5 个平台钉 node 22.23.2 的 SHA256，逐字节等于官方 `SHASUMS256.txt` 的行）；`runtime-fetch` 与 `stage-runtime.sh` 都先 `grep` 锁文件、再与下载来的清单 `cmp`、最后按锁文件校验 tarball | `src-tauri/runtime.lock`、`Makefile`、`scripts/stage-runtime.sh` |
+| P2-14 | `probe_system = preference != Bundled && !(env_node && env_dsh)`：不探测时记一条日志并跳过 `locate`/`probe_node` | `lib.rs` |
+| P2-15 | 文档化选择：能力门槛继续管 `runtime: system`（旧 node 本来就跑不起 dsh），并在分支 README 的「自带运行时」一节写明"以本条为准" | `README.md` |
+| P3-16 | `release.yml` 的门禁改用 `make fmt-check`（新增目标：`cargo fmt --check`，不改工作区） | `Makefile`、`.github/workflows/release.yml` |
+
+### 15.2 新增/改写的测试与脚本验证
+
+- `update.rs`：`carried_attempt_follows_the_registry_answer`、`cache_files_without_the_attempt_field_still_parse`、
+  `an_expired_window_does_not_reopen_an_ineffective_install`（假 `npm` 脚本走完整 `check_cached`）；
+- `runtime.rs`：`environment_overrides_win_over_everything` 补 `Updates::Notify` 断言（P1-5）；
+- `lib.rs`：`external_instances_are_never_stopped_by_process_group`（P0-3）、
+  `the_system_gate_keeps_a_lone_dsh_and_drops_a_rejected_install`（P1-4）、
+  `an_install_switches_the_supervised_cli_to_the_shadow_prefix`（P0-2，临时目录造 seed 与影子两棵树）、
+  `a_seed_copy_is_all_or_nothing`（P1-6，失败不得留下目标或 `.tmp`）；
+- 脚本：`sh scripts/check-runtime-stage.sh --self-test` 通过；真实 staging 通过（31,069 文件 / 519 MB / dsh 0.1.5-rc.2）；
+  实测复现过的两条失效路径（只有 node 的假目录、含绝对链接的假目录）现在都非 0 退出；
+- `make runtime-fetch`：输出 `node-v22.23.2-darwin-arm64.tar.gz: OK`（对照 `src-tauri/runtime.lock`）。
+
+### 15.3 未修与刻意保留
+
+1. **P2-13（回退 + last-known-good）**：实现需要在 `start()` 里把"解析 → 起进程 → 等 URL"包成可重试的一轮，
+   并在失败时排除刚失败的候选重试一次；按 §11 的阶段 D 与签名/公证、macOS 实机验收一起做。
+   当前行为不变：被选中的树起不来时直接给错误页（`abort_start`）。
+2. **P2-15 的另一种选择**（放行 `runtime: system` 并只警告）没有采纳：会让旧 node 跑到一半才失败，
+   错误页反而更难解释；README 已把现行语义写成显式契约。
+3. **staging 闸门阈值**按实测标定（干净 macOS staging 31,069 文件 / 519 MB），没有照抄方案里的"25k±10%"
+   （那是 dsh 树的量级，实测总数约 3.1 万）——阈值可用 `DSH_RUNTIME_*` 覆盖；Windows 侧未实测，
+   因此脚本默认值（55000 / 700 MB）明显宽松，Makefile 在 macOS/Linux 上传更紧的 45000 / 600 MB。
+
+### 15.4 验证
+
+```text
+cargo fmt --manifest-path src-tauri/Cargo.toml --check                            # 通过
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings    # 0 warning
+cargo test --manifest-path src-tauri/Cargo.toml                                   # 53 passed / 0 failed
+sh scripts/check-runtime-stage.sh --self-test                                     # 自检通过
+make runtime-fetch                                                                # 对照 src-tauri/runtime.lock 校验通过
+```
+
+仍未执行：`make runtime-stage` / `make bundle-bundled`（要联网下载并写约 490 MB payload）、
+macOS 自带运行时的 GUI 实机验证、Windows 侧 staging（§12 的脚本部分已在 macOS 上等价验证）。
 - Linux 侧 staging 与 `.deb` / AppImage 产物未在 Linux 机器上跑过。

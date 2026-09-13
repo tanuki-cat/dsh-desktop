@@ -1,5 +1,12 @@
 # 桌面壳自带 Node 与 dsh 核心的发行方案
 
+> **分支策略（2026-09-13 起）**：本方案实施在长期分支 `feat/bundled-runtime` 上，**暂不合并到 `main`**。
+> 该分支当前的对外用途是**构建与发布 Windows 免安装版**（`.github/workflows/windows-portable.yml`，
+> 由 `main` 手动触发、构建 `build_ref` 指向的分支代码；在分支上打 tag 则由 `release.yml` 的
+> `windows-portable` 任务一并发布）。macOS/Linux 的自带运行时继续在该分支上验证，
+> `main` 保持“需要预装 node 与 dsh”的现状，只保留调度用的 workflow。合并时机由后续决定，
+> 合入前不要把这里的改动同步回 `main`（`release.yml` 会因此多出一个构建不出有效运行时的 Windows 任务）。
+
 > 目标：在**没有预装 Node.js 和 DeepSeek Harness** 的机器上，双击即用。
 > 上游设计：[`design-task-feat-dsh-tauri-desktop-shell.md`](./design-task-feat-dsh-tauri-desktop-shell.md)（其 §22 已把本方案列为 V2）。
 >
@@ -122,7 +129,9 @@ DSH Desktop.app/Contents/Resources/runtime/
 所以"系统的 node + 自带的 dsh 树"（或反之）不会因为 ABI 直接崩。真正的门槛只剩两条：
 
 1. **架构必须一致**：系统 node 可能是 x64（Rosetta）而自带预编译产物是 arm64，混用会加载失败 ⇒
-   比较 `process.arch` 与自带运行时一致才允许混搭；
+   比较 `process.arch` 与自带运行时一致才允许混搭。**v3.4 修正**：这条只在该构建**确实带运行时**
+   （seed 的 node 与 dsh 都在）时才能拒绝；没有自带候选时降级为警告并继续用系统安装 ——
+   x64 node + x64 dsh 树本身自洽，拒绝它只是把“能跑但慢”换成错误页；
 2. **能力门槛，而不是版本号**：`@deepseek-ai/dsh` 的 `package.json` **没有 `engines.node` 字段**（实测），
    所以"按 engines 判断"落空。可用的硬指标是能力探测：dsh 的 `@deepseek-ai/dsh-code-runtime-worker-thread`
    依赖 `module.stripTypeScriptTypes()`（Node ≥ 22.13；日志里那条 `ExperimentalWarning: stripTypeScriptTypes` 就是它），
@@ -132,8 +141,11 @@ DSH Desktop.app/Contents/Resources/runtime/
 **必须一起定的两条规则**（否则这套策略会自我矛盾）：
 
 - **更新语义**：若采用系统 dsh，而更新仍落到自带的影子前缀，那条"更高版本优先"的规则会让更新后的核心
-  反过来盖掉用户自己的安装。建议：**使用系统 dsh 时不做自动安装**，只提示有新版（可一键切到自带运行时再更新）；
-  桌面壳永远不写用户自己的全局前缀 —— 那既可能失败（权限、pnpm/yarn 布局），也是"GUI 偷偷改我环境"的典型投诉；
+  反过来盖掉用户自己的安装。原建议是"使用系统 dsh 时不做自动安装，只提示有新版"；**实现时改成可配置**
+  （v3.4，见 §21）：`config.json` 的 `system_updates` 默认 `install`，即沿用自带运行时之前"有新版就装进
+  用户自己的前缀"的既有行为 —— 老用户静默失去自动升级比一次 npm 全局写入更糟；想只提示就写 `notify`。
+  装到哪个前缀仍由 `update::install_prefix(dsh_js)` 从 CLI 位置反推（与旧实现一致）；自带运行时不受该开关
+  影响（始终写影子前缀）。"GUI 偷偷改我环境"的顾虑交给这个显式开关，而不是替用户默认关掉；
 - **决策要稳定且可见**：系统运行时依赖登录 shell 探测，rc 文件改动或导入失败都会让结果在两次启动之间翻转。
   因此：探测一次后把结论与版本写进配置/诊断，并保留手动 `runtime: system | bundled | auto` 覆盖；
   启动日志与状态页显示 `runtime: system (node 22.23.2 / dsh 0.1.5-rc.2)` 这类信息。
@@ -638,3 +650,149 @@ make runtime-clean     # 清理 staging（约 475MB）
 - 启动：`dsh web` **4 秒**输出 URL、stderr 为空、无模块解析错误，profile 内出现 `.dsh-market/`（市场已加载）。
 
 **未验证**：断网首启（§12 仍列为验收项）、从市场实际安装一个第三方插件的端到端链路。
+
+## 20. 实施进展（P1 第一步，2026-09-13，分支 `feat/bundled-runtime`）
+
+本轮把方案 P1 里"能独立验证的部分"先做掉，全部在本机真跑过。**未合并到 main**：
+自带运行时会改变发行方式，等解析接入与签名验收完成后再决定合并时机。
+
+### 20.1 已完成
+
+| 项 | 内容 | 验证 |
+|---|---|---|
+| 运行时解析策略 | 新增 `src-tauri/src/runtime.rs`：来源（Env/Seed/Shadow/System）、§2.4 的四格矩阵、
+  seed↔shadow 版本仲裁、更新落点（系统运行时 → 只提示） | 6 个单测（共 35 passed）、clippy 0 warning |
+| 配置项 | `config.json` 新增 `runtime: auto\|bundled\|system`（默认 auto） | 部分配置照常解析 |
+| `make runtime-fetch` | 按 uname 选发行版、下载、**按 SHASUMS256.txt 校验**、缓存到 `.runtime-cache/` | 实测 48 MB / 6.5 s，校验输出 `OK` |
+| `make runtime-stage` | 解包 Node → `dsh-prefix`（`npm install -g --prefix`）→ `tools`（pnpm）→ profile 模板 → 许可清单 → 校验 | 实测 **520 MB**、22 s（缓存热） |
+| profile 模板 | `scripts/make-profile-template.sh`：真 pnpm 生成含 dshmarket 的 profile（§2.5） | 模板内 dshmarket 1.45.1 + lockfile 齐全 |
+| staging 校验 | `scripts/check-runtime-stage.sh`：必需文件 + **悬空链接** + **quarantine** + 版本回显 | 实测通过对；此前探针已证明这两类问题会让构建失败/被 Gatekeeper 拦 |
+| 许可清单 | `scripts/write_third_party_notices.py`：扫描 dsh 依赖树与模板，汇总 name@version + license | 生成 `THIRD-PARTY-NOTICES.md`，UNKNOWN 条目 0 |
+| `make bundle-bundled` | staging + 打包，`bundle.resources` 把 runtime/ 塞进 .app | 产出 **598 MB** .app，31,090 文件，包内 node 可直接执行 |
+
+### 20.2 关键实测（决定后续实现方式）
+
+1. **无系统 node 也能跑**：`env -i PATH=/usr/bin:/bin` + 自带 node + 自带 dsh → `0.1.5-rc.2`；
+2. **离线首启形态成立**：全新 DSH_HOME + 模板播种 + 只用自带运行时 → `dsh web` **6 秒**输出 URL、stderr 干净、
+   `.dsh-market/` 出现（插件市场已加载）；
+3. **`npm install --prefix` 不带 `-g` 是错的**：会装成 `<prefix>/node_modules` 局部布局，
+   而 dsh 与壳都按全局布局 `<prefix>/lib/node_modules` 找包 —— staging 必须写 `-g --prefix`；
+4. **构建期缓存要独立**：staging 的 npm/pnpm 都改用 `.runtime-cache/` 下的 store（CI 可复用、不碰用户缓存）；
+5. 打包耗时：31k 文件的资源复制 + 构建 ≈ **47 s**，磁盘峰值约 1.1 GB（staging 520 MB + bundle 复制一份）。
+
+### 20.3 已接入启动流程（2026-09-13，第二次推进）
+
+| 项 | 实现 | 验证 |
+|---|---|---|
+| 种子发现 | `seed_root_for()`：`DSH_DESKTOP_RUNTIME` → 应用资源目录 → `tauri dev` 在二进制旁的 `target/<profile>/runtime`（两种布局都试），node 兼容 `node.exe` | 单测 `finds_a_seed_under_the_resource_directory` |
+| 运行时决策 | `resolve_runtime()` 组装 `Inputs`（系统那一半先过 arch/能力门槛）、调 `decide()`、日志记来源与更新落点 | 单测 `forcing_bundled_resolves_into_the_seed_tree` |
+| 候选为空 | `decide()` 返回 `None` ⇒ 错误页提示装 node/dsh 或用环境变量指定 | 单测 `no_candidate_at_all_is_reported_as_none` |
+| 偏好覆盖 | `DSH_DESKTOP_RUNTIME_PREFERENCE=bundled\|system\|auto`（排障/验证用） | 单测 `runtime_preference_parses_the_env_spelling` |
+| 首启播种 | `$DSH_HOME/profiles/web` 不存在时复制 seed 的 `profile-template`（§2.5） | 复用模板实验结论 |
+| PATH | 自带时把 app-data 与 seed 的 `tools/bin` 前置 | 代码审查 + 单测覆盖来源判定 |
+| 全局安装落点 | 注入 `npm_config_prefix` / `PNPM_HOME` 指向可写 tools 前缀（§5） | 同上 |
+| 更新落点 | 自带 → `app-data/runtime/prefix`；系统安装 → **只提示不安装**（§2.4/§18.1 H1） | 单测 + 更新流程改动 |
+
+### 20.4 仍未做（P1 剩余）
+
+- **带自带的 GUI 实机验证**：需要 `make bundle-bundled` 的产物 + `DSH_DESKTOP_RUNTIME_PREFERENCE=bundled` 跑一次；
+  本轮因开发机上已有实例占用 3080（会抢占会话）而未执行；
+- **平台矩阵**：`bundle.macOS.minimumSystemVersion` 提到 11.0（§18.1 H2）；Linux 侧 staging 尚未跑过；
+- **签名与公证**（§7）：需要 Developer ID；本轮产物未签名；
+- **构建期磁盘**：实测 tauri 会把整份 `runtime/` 复制到 `target/<profile>/runtime`（debug 下 **584 MB**），
+  加上 staging 与 bundle 各一份 ⇒ 峰值约 1.7 GB，比 §6 原先估的 1.5 GB 更高；
+- **Windows 侧**：交叉编译已能出 exe（见 shell 方案相关提交）；自带运行时改为在 CI 的 Windows runner 上原生 staging
+  （koffi 的 postinstall 在 macOS 上跨平台 staging 会因缺 CMake 失败），已落地为 `.github/workflows/windows-portable.yml`，
+  并已在实机验证通过（见 §20.6）；仍未做的是给 `release.yml` 加 Windows 任务、以及代码签名。
+
+### 20.5 复现命令
+
+```bash
+git checkout feat/bundled-runtime
+make runtime-fetch && make runtime-stage        # 约 520 MB，21 s（缓存热）
+make bundle-bundled                             # 产出带运行时的 .app（约 598 MB）
+make runtime-clean                              # 回收
+```
+
+### 20.6 Windows 免安装包（2026-09-13，第三次推进）
+
+`.github/workflows/windows-portable.yml` 在 `windows-latest` 上原生 staging 并打包，输入
+`dsh_version` / `node_version` / `build_ref`（默认 `feat/bundled-runtime`）/ `attach_to_release`。
+产物 `dsh-desktop-windows-x64-portable`（zip 182–326 MB，约 3.3 万个文件，包内最长路径 205–223 字符），
+另附 `SHA256SUMS-windows-x64`（release 任务会与 macOS/Linux 的合并成一份 `SHA256SUMS`）。
+
+触发方式有两种，共用同一份实现（`workflow_call` + `workflow_dispatch`）：手动出包，或由 tag 触发的
+`release.yml` 调用——后者新增 `windows-portable` 任务（`uses: ./.github/workflows/windows-portable.yml`，
+`build_ref` 传 tag，`needs: [preflight, build, windows-portable]`），Windows 产物与 macOS/Linux 一起发布。
+`release.yml` 此前只存在于 main（含 macos-x64 交叉编译与 release 任务的 checkout 修复），本次一并取回分支，
+因此 **在本分支上打 tag 即可发布全套产物**。按上面的分支策略，`main` 上的 `release.yml` 与
+`windows-portable.yml` 本次都不动：main 的代码没有自带运行时，在那里加 Windows 任务只会产出带一份
+死 `runtime/` 的包；等分支合并时再一起同步。
+
+**实机验证通过（2026-09-13，run 34752267176 的产物）**：Windows 11 上解压到 `D:\dsh` 后双击即可启动，
+自带 node 22.23.2 + dsh 0.1.5-rc.2 正常拉起 Web GUI，首启播种的插件市场可用，会话内 `glob` / `write` /
+`read` / `grep` / `edit` / `patch` / `todo_write` / `present` 全部正常（一次任务 14 s / 81K tokens）。
+Windows runner 上的 `cargo test --lib` 为 40 passed（Unix-only 的三个用例在那里被 cfg 掉）。
+
+本机无法执行 PE，Windows 侧行为只能由用户实测，因此每个失败回合都在缩小假设面：
+
+| 现象 | 处置 |
+|---|---|
+| 解压报 `0x80010135`（路径太长） | 说明文件写明短路径 `D:\dsh`、`tar -xf`、7-Zip 三种方式，并追加 7z SFX 自解压包 |
+| 包内多一层 `dist/` | 先 `cd dist` 再打包；说明文件改 ASCII 文件名（中文名在不同解压工具里乱码） |
+| Git Bash 的 `cp -R` 在 pnpm 符号链接上失败 | 组装目录改用 tar 管道（`-h` 解引用） |
+| `npm view` 找不到 node | `npm_command()` 把 npm 所在目录前置进 PATH |
+| 启动即 `EISDIR: illegal operation on a directory, lstat 'D:'` | 见下：`\\?\` verbatim 前缀 + Unix-only 的 PATH 合并与查找 |
+
+**`EISDIR: lstat 'D:'` 的根因与修法**（commit `4152ca7` 与随后的 Windows 子进程环境修复）
+
+用户实测日志给出了完整证据链（`%APPDATA%\com.deepseek.dsh.desktop\logs\harness.log`）：
+
+    [dsh-desktop] runtime: node \\?\D:\dsh\DSH Desktop\runtime\node\node.exe (bundled) + dsh \\?\D:\dsh\…\lib\bin.js (bundled) | updates: Shadow
+    [dsh-desktop] login shell env import failed (/bin/zsh); using the app environment
+    [dsh-desktop] child PATH = /opt/homebrew/bin:/usr/local/bin
+    Error: EISDIR: illegal operation on a directory, lstat 'D:'
+        at Object.realpathSync (node:fs:2749:25)
+        at toRealPath (node:internal/modules/helpers:61:13)
+        at Function._findPath (node:internal/modules/cjs/loader:760:22)
+        at resolveMainPath (node:internal/modules/run_main:39:23)
+
+三点结论（不是「workspace 里写了 D:」这么简单）：
+
+1. **`\\?\` verbatim 前缀**：种子路径经过 canonicalize，在 Windows 上带出 `\\?\D:\…`。Win32 文件 API
+   能用，但 node 的 `fs.realpathSync` 会逐组件解析它，走到 `lstat 'D:'`（盘符相对路径 = 目录）就 EISDIR。
+   `unverbatim()` 在 `absolute()` / `seed_root_for()` / `locator::real_path()` 去掉前缀（超过 MAX_PATH 时保留）。
+2. **`merge_path` 原本是 Unix-only**：`value.split(':')` 加上「必须以 `/` 开头」的过滤，在 Windows 上把整条
+   PATH 砍成只剩硬编码的 `/opt/homebrew/bin:/usr/local/bin`（与日志完全一致）——子进程既没有系统目录，
+   也没有自带 node 目录。改为 `std::env::split_paths` / `join_paths` + `is_absolute()`，按平台拼接；
+   硬编码的 Homebrew 目录改成 `#[cfg(target_os = "macos")]`，Windows 补 `%SystemRoot%` 与 `System32`。
+3. **登录 shell 与 npm 查找同样是 Unix-only**：Windows 上不该去跑 `/bin/zsh`（现直接跳过并记日志）；
+   `npm` 的裸名会命中 npm 自带的 POSIX wrapper（日志里的 `os error 193`），改为 `.exe/.cmd/.bat` 优先。
+
+顺带保留的加固（同类风险，仍然有价值）：`home_dir()` 校验（Windows 优先 `USERPROFILE`）、`workspace` /
+`dsh_home` 不可用则回退并记日志、路径绝对化、`harness::spawn()` 前置校验，以及 `app data dir = … |
+workspace = …` 和 `spawn: <完整命令行>` 两行日志——下一次失败可以直接从日志定位到具体路径。
+
+回归方式：`cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`（本机可做，覆盖所有
+`cfg(windows)` 代码），以及 CI 里 Windows runner 上的 `cargo test --lib`。
+
+排障入口：`%APPDATA%\com.deepseek.dsh.desktop\logs\harness.log`，关键字
+`runtime: node … (bundled|system) + dsh … | updates: …` 与 `spawn: …`。
+
+---
+
+## 21. 修订记录（v3.4：合并影响审查后的四处修正，2026-09-13）
+
+对 `main..feat/bundled-runtime` 做了一次"合并到主分支会影响原有功能吗"的审查，结论是：普通用户的可启动路径
+等价（同一个 node、同一份 `bin.js`、同样的启动参数；`src/`、`package.json`、`tauri.conf.json`、`Cargo.toml`
+全部未动、没有新增 crate），但以下四处需要先修，否则合并会改变或破坏现有行为。四处都已实现并补了测试：
+
+| 项 | 问题 | 修法 | 测试 |
+|---|---|---|---|
+| 交叉编译入口 | `Makefile` 的 `TARGET=` 支持只存在于 `main`（`tauri build … $(if $(TARGET),--target $(TARGET),)`），分支上没有；合并若按分支解析，`release.yml` 的 macOS x64 会静默编成 host 版，随后 `[ -d "$app" ]` 报错 | 把 main 的 `TARGET` 传参与产物路径判断取回分支（`make -n bundle TARGET=…` 已核对输出 `--target x86_64-apple-darwin`），`make help` 也补上该变量 | CI（tag 触发时由 `release.yml` 兜底） |
+| 系统安装的自动升级 | 新增的 `Updates::Notify` 让系统安装**只提示不安装**，等于删掉壳的既有卖点（每次启动有新版就装并重启） | 新增 `config.json` 的 `system_updates: install（默认）\| notify`；`install` 时用 `update::install_prefix(dsh_js)` 反推用户前缀并就地升级（与自带运行时之前的实现一致），`notify` 才是只提示 | `system_updates_defaults_to_upgrading_the_user_install` |
+| 架构门槛 | Rosetta 下的 x64 node 原本可用（dsh 树同架构、N-API 自洽），新门槛会直接拒掉它，**非自带构建**因此没有候选 ⇒ 错误页 | `system_runtime_gate()`：能力门槛（`stripTypeScriptTypes`，Node < 22.13 本来也跑不起来）保持硬性；架构不一致只在**有自带候选**时拒绝，否则警告并继续用系统安装；错误页也改为说明具体是哪道门槛 | `the_system_runtime_gate_only_refuses_what_it_must` |
+| 能力探测没有超时 | `probe_node()` 用 `Command::output()` 阻塞，而它跑在启动状态机之前 —— 版本管理器 shim 一挂住，启动页就永久卡住，连"等 URL 超时"的兜底都用不上 | `probe_node_within(node, timeout)`：独立线程读管道 + `try_wait` 轮询，5 s 到期即 kill 并记日志；超时路径**不 join 读线程**（孙进程可能还握着管道，join 会把卡死搬回来） | `gives_up_on_a_node_that_never_answers`（300 ms 预算） |
+
+顺带记录一处**未修**的既有缺口：§4 要求更新时追加 `--cache <app-data>/runtime/npm-cache` 复用依赖树缓存，
+`update::install()` 目前没有传（每次更新重新下载整棵依赖树）。它不影响合并安全性，留待后续。

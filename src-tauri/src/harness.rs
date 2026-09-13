@@ -1,6 +1,5 @@
 //! Spawn `dsh web`, stream its output, parse the startup URL, and probe for a live instance.
 
-use crate::locator::DshLocation;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -241,11 +240,15 @@ pub struct SpawnOptions<'a> {
 ///
 /// Launcher flags must precede app flags; the child gets its own process group so the
 /// whole tree can be terminated together.
-pub fn spawn(loc: &DshLocation, opts: &SpawnOptions<'_>) -> std::io::Result<Spawned> {
-    validate_paths(&loc.node, &loc.dsh_js, opts.workspace)?;
-    let mut command = Command::new(&loc.node);
+pub fn spawn(node: &Path, dsh_js: &Path, opts: &SpawnOptions<'_>) -> std::io::Result<Spawned> {
+    // A relative path is resolved against the child's working directory, not ours, which turns
+    // a bad PATH entry into an error from inside node (`EISDIR: lstat 'D:'`); a workspace that
+    // does not exist fails with a bare ENOENT that never names the config entry. `validate_paths`
+    // names the culprit before the child is started.
+    validate_paths(node, dsh_js, opts.workspace)?;
+    let mut command = Command::new(node);
     command
-        .arg(&loc.dsh_js)
+        .arg(dsh_js)
         .arg("--profile")
         .arg("web")
         .arg("--patch")

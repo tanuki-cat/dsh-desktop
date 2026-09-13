@@ -1,7 +1,7 @@
 # runtime/ —— 自带运行时（staging 目录）
 
-此目录由 `feat/bundled-runtime` 分支的 `make runtime-stage` 填充，随后被该分支的 `bundle.resources`
-原样打进 `DSH Desktop.app/Contents/Resources/runtime/`：
+此目录由 `make runtime-stage` 填充，随后被 `bundle.resources` 原样打进
+`DSH Desktop.app/Contents/Resources/runtime/`：
 
 ```
 runtime/
@@ -9,12 +9,13 @@ runtime/
 └── dsh-prefix/    # dsh 安装树，按 npm 全局前缀布局：lib/node_modules/@deepseek-ai/dsh
 ```
 
-在该分支上，本文件同时是 **glob 非空的保证**：`bundle.resources = ["runtime/**/*"]` 是相对
-`src-tauri/` 解析的，若该目录没有任何文件，`tauri build` 会直接失败
+本文件同时是 **glob 非空的保证**：`make bundle-bundled` 用 `--config` 注入
+`bundle.resources = ["runtime/**/*"]`（相对 `src-tauri/` 解析），若该目录没有任何文件，
+`tauri build` 会直接失败
 （实测报错：`glob pattern runtime/**/* path not found or didn't match any files`）。
 
-> **`main` 上没有这条配置**（2026-09-13 移除）：main 既没有 staging 目标，也没有读取运行时种子的
-> 代码，留着它只会把别的分支残留在本目录里的 payload（实测 520 MB）静默打进 `.app`。
-> 所以本目录在 main 上不参与打包；保留 README 只是让合并分支时目录仍在、`.gitignore` 规则继续有效。
+> **2026-09-13 合并后**：`feat/bundled-runtime` 已并入 `main`。基座 `tauri.conf.json` 不再常开这条 glob，
+> 所以普通 `make bundle` 不会把 payload 打进包；只有 `make bundle-bundled` 才会，因此本文件必须保留。
+> `make runtime-stage` 在组装前会清空本目录（只留本文件），不会把别的平台的残留静默打包。
 
 方案见 `../../docs/design-task-feat-dsh-bundled-runtime.md`。

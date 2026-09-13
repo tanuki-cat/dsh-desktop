@@ -1,33 +1,63 @@
 name: windows-portable
 
-# 手动触发：在 Windows runner 上**原生** stage 运行时，打出免安装的便携包。
+# 在 Windows runner 上**原生** stage 运行时，打出免安装的便携包。
 #
 # 为什么必须在 Windows 上 stage：在 macOS 上用 `npm install --os=win32` 装 dsh 时，
 # koffi 的平台包不会被装上（npm 的 --os/--cpu 对全局安装的依赖树不生效），postinstall 会
 # 回退到就地编译并因缺 CMake 失败 —— 实测过。Windows runner 上原生安装才能拿到正确的原生模块。
 #
+# 两种触发方式共用同一份实现：
+#   * workflow_dispatch —— 手动出包，产物作为 workflow artifact（可选附加到已有 Release）；
+#   * workflow_call    —— 由 release.yml 在打 tag 时调用，产物交给它的 release 任务统一发布。
+#
 # 分支策略：自带运行时只存在于长期分支 feat/bundled-runtime（**暂不合并到 main**），Windows 免安装包
-# 目前是该分支唯一的对外产物。本文件留在 main 上只是为了能随时手动触发 —— 构建的是 build_ref 指向的
-# 分支代码（默认 feat/bundled-runtime）。main 上 lib.rs 带 #[cfg(windows)] compile_error!，用 main
-# 当 build_ref 会在离线测试门禁直接失败，而不是产出一个存活探测恒真、行为不对的包。
+# 目前是该分支唯一的对外产物。工作流文件留在 main 上只是为了能随时手动触发 —— 构建的是 build_ref
+# 指向的分支代码（默认就是 feat/bundled-runtime）。用 main 当 build_ref 只会得到一份用不上的 runtime/。
 on:
   workflow_dispatch:
     inputs:
       dsh_version:
         description: 随包附带的 dsh 版本
         required: false
+        type: string
         default: 0.1.5-rc.2
       node_version:
         description: 随包附带的 Node 版本
         required: false
+        type: string
         default: 22.23.2
       build_ref:
         description: 从哪个分支标签构建（自带运行时的实现目前在 feat/bundled-runtime）
         required: false
+        type: string
         default: feat/bundled-runtime
       attach_to_release:
         description: 可选：把产物传到已存在的 Release tag（留空则只作为 workflow artifact）
         required: false
+        type: string
+        default: ""
+  # 被 release.yml 在打 tag 时调用；输入与手动触发完全一致（不用 YAML 锚点，避免解析差异）。
+  workflow_call:
+    inputs:
+      dsh_version:
+        description: 随包附带的 dsh 版本
+        required: false
+        type: string
+        default: 0.1.5-rc.2
+      node_version:
+        description: 随包附带的 Node 版本
+        required: false
+        type: string
+        default: 22.23.2
+      build_ref:
+        description: 从哪个分支标签构建（release.yml 传 tag 名）
+        required: false
+        type: string
+        default: feat/bundled-runtime
+      attach_to_release:
+        description: 可选：把产物传到已存在的 Release tag（release.yml 留空，交给它的 release 任务发布）
+        required: false
+        type: string
         default: ""
 
 permissions:
@@ -167,12 +197,35 @@ jobs:
           echo "提醒：解压到 D:\dsh 这类短路径，或使用自解压 exe / tar / 7-Zip"
           ls -lh dist
 
+      # 校验和文件名与 macOS/Linux 一致（SHA256SUMS-<suffix>），release 任务会把它们合并成 SHA256SUMS。
+      # 用 python 而不是 sha256sum：Git for Windows 不保证带 coreutils。
+      - name: 生成校验和
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob, hashlib, os
+
+          def digest(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as fh:
+                  for chunk in iter(lambda: fh.read(1 << 20), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          files = sorted(glob.glob("dist/*.zip")) + sorted(glob.glob("dist/*.exe"))
+          with open("dist/SHA256SUMS-windows-x64", "w", newline="\n") as out:
+              for path in files:
+                  out.write(f"{digest(path)}  {os.path.basename(path)}\n")
+          print(open("dist/SHA256SUMS-windows-x64").read())
+          PY
+
       - uses: actions/upload-artifact@v4
         with:
           name: dsh-desktop-windows-x64-portable
           path: |
             dist/*.zip
             dist/*-portable.exe
+            dist/SHA256SUMS-windows-x64
           if-no-files-found: error
           retention-days: 30
 
@@ -183,4 +236,4 @@ jobs:
           TAG: ${{ inputs.attach_to_release }}
         run: |
           set -euo pipefail
-          gh release upload "$TAG" dist/*.zip --clobber
+          gh release upload "$TAG" dist/*.zip dist/SHA256SUMS-windows-x64 --clobber

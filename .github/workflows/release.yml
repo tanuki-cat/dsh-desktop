@@ -161,9 +161,22 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # Windows 免安装包复用 windows-portable.yml 的实现：staging 与打包只有一份脚本，
+  # 手动出包和打 tag 发布不会各修一遍。产物交给下面的 release 任务统一发布，
+  # 所以这里不传 attach_to_release。
+  #
+  # 注意：自带运行时只存在于长期分支 feat/bundled-runtime（暂不合并到 main），所以这个任务
+  # 在 main 上不会生效 —— Windows 发布要在 feat/bundled-runtime 上打 tag。main 版本刻意不加。
+  windows-portable:
+    name: build windows-x64
+    needs: preflight
+    uses: ./.github/workflows/windows-portable.yml
+    with:
+      build_ref: ${{ github.ref_name }}
+
   release:
     name: publish release
-    needs: [preflight, build]
+    needs: [preflight, build, windows-portable]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-22.04
     steps:
@@ -195,7 +208,8 @@ jobs:
           cat > notes.md <<'MD'
           ## DSH Desktop v__VERSION__
 
-          下载对应平台的产物即可。**当前版本需要机器已安装 node 与 dsh** —— 自带运行时的发行版仍在实施中，见 README 的"后续实施计划"。
+          Windows 免安装包**自带 node 与 dsh**，解压即用；macOS 与 Linux 产物**仍需要机器上已安装
+          node 与 dsh** —— 自带运行时的 macOS/Linux 发行版仍在实施中，见 README 的"后续实施计划"。
 
           | 平台 | 产物 |
           |---|---|
@@ -203,6 +217,7 @@ jobs:
           | macOS x64 | dsh-desktop___VERSION___macos-x64.app.zip |
           | Linux x64 | dsh-desktop___VERSION___linux-x64.deb |
           | Linux arm64 | dsh-desktop___VERSION___linux-arm64.deb |
+          | Windows x64 | dsh-desktop___VERSION___windows-x64-portable.zip（免安装，自带运行时）|
 
           > ⚠️ 这些构建**未签名也未公证**：macOS 首次打开请右键 →「打开」，或执行
           > xattr -dr com.apple.quarantine "/Applications/DSH Desktop.app"。Linux 上 WebKitGTK 仍来自系统。
@@ -210,7 +225,9 @@ jobs:
           校验：shasum -a 256 -c SHA256SUMS（Linux 用 sha256sum -c SHA256SUMS）。
 
           安装：macOS 解压后把 DSH Desktop.app 拖进「应用程序」；
-          Linux sudo apt install ./dsh-desktop___VERSION___linux-x64.deb。
+          Linux sudo apt install ./dsh-desktop___VERSION___linux-x64.deb；
+          Windows 解压到短路径（如 D:\dsh）后双击 DSH Desktop\dsh-desktop.exe —— 包内依赖树最深
+          约 223 字符，路径太长时资源管理器会报 0x80010135，可改用同名的 .exe 自解压包或 tar -xf。
           MD
           sed -i.bak "s|__VERSION__|${VERSION}|g" notes.md && rm -f notes.md.bak   # GNU/BSD sed 都可用
           head -5 notes.md

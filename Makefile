@@ -63,7 +63,7 @@ help:
 	@echo "  make icon-art    重新绘制 icon.png（需 python3 + Pillow）"
 	@echo "  make clean / distclean"
 	@echo ''
-	@echo "变量：CARGO_HOME= PNPM_STORE= BUNDLE_TARGETS= CARGO= PNPM= PYTHON="
+	@echo "变量：CARGO_HOME= PNPM_STORE= BUNDLE_TARGETS= TARGET= CARGO= PNPM= PYTHON="
 
 doctor:
 	@echo "平台  : $(UNAME_S) ($(PLATFORM))"
@@ -115,7 +115,7 @@ node-deps:
 # TARGET 用于交叉编译（例如在 arm64 runner 上产出 Intel 包）：
 #   make bundle TARGET=x86_64-apple-darwin
 bundle: node-deps
-	$(CARGO_ENV) $(PNPM) tauri build --bundles $(BUNDLE_TARGETS) $(if $(TARGET),--target $(TARGET),)
+	$(CARGO_ENV) $(PNPM) tauri build --bundles $(BUNDLE_TARGETS) $(if $(TARGET),--target $(TARGET),) $(if $(TAURI_CONFIG_EXTRA),--config '$(TAURI_CONFIG_EXTRA)',)
 	@echo "产物: $(if $(TARGET),$(TAURI_DIR)/target/$(TARGET),$(TAURI_DIR)/target)/release/bundle/$(if $(filter macos,$(PLATFORM)),macos,deb)"
 
 ifeq ($(PLATFORM),macos)
@@ -146,9 +146,117 @@ endif
 icon-art:
 	$(PYTHON) $(TAURI_DIR)/icons/make_icon.py $(TAURI_DIR)/icons/icon.png 1024
 	@$(MAKE) --no-print-directory icons
+	@$(MAKE) --no-print-directory icon-ico
+
+# Windows 目标的 exe 资源需要 .ico（tauri-build 在 Windows target 下强制要求）
+icon-ico:
+	@cd $(TAURI_DIR)/icons && $(PYTHON) make_ico.py icon.ico icon.png
+
+# 实验性：交叉编译 Windows 可执行文件（只能出裸 exe：NSIS/MSI 需要在 Windows 上打包）
+#   前置：brew install mingw-w64 且 rustup target add x86_64-pc-windows-gnu
+#   注意：Windows 专用的进程监管/退出清理语义尚未实现正确（见方案文档），且自带运行时
+#         必须按平台单独 staging —— 否则会把别的平台的运行时打进包里。
+WINDOWS_TARGET ?= x86_64-pc-windows-gnu
+windows:
+	@if [ -e $(RUNTIME_DIR)/node/bin/node ] && [ ! -e $(RUNTIME_DIR)/node/bin/node.exe ]; then \
+		echo "警告：$(RUNTIME_DIR)/ 里是别的平台的运行时，会被一起打进 Windows 包；先 make runtime-clean" >&2; \
+	fi
+	$(CARGO_ENV) $(PNPM) tauri build --target $(WINDOWS_TARGET) --no-bundle
+	@case "$(WINDOWS_TARGET)" in *aarch64*) arch=arm64;; *i686*) arch=x86;; *) arch=x64;; esac; \
+	  cargo_home=$(if $(CARGO_HOME),$(CARGO_HOME),$$HOME/.cargo); \
+	  dll=$$(find "$$cargo_home/registry/src" -path "*webview2-com-sys-*/$$arch/WebView2Loader.dll" 2>/dev/null | head -1); \
+	  if [ -n "$$dll" ]; then cp "$$dll" $(TAURI_DIR)/target/$(WINDOWS_TARGET)/release/ && echo "已附带 WebView2Loader.dll ($$arch)"; \
+	  else echo "提示：未找到 WebView2Loader.dll；目标机需要有 WebView2 运行时" >&2; fi
+	@echo "产物目录: $(TAURI_DIR)/target/$(WINDOWS_TARGET)/release/（拷贝其中的 dsh-desktop.exe 与 WebView2Loader.dll）"
 
 clean:
 	$(CARGO_ENV) $(CARGO) clean --manifest-path $(MANIFEST)
 
 distclean: clean
 	rm -rf node_modules .pnpm-store .cargo-home $(TAURI_DIR)/gen
+# ---------------------------------------------------------------- 自带运行时（方案 §5）
+# 目标：在没有 node / dsh 的机器上双击即用。
+#   make runtime-fetch    下载官方 Node 并校验 SHASUMS256.txt
+#   make runtime-stage    组装 src-tauri/runtime/{node,dsh-prefix,tools,profile-template,THIRD-PARTY-NOTICES.md}
+#   make bundle-bundled   runtime-stage + 打包（.app 会带上整套运行时，约 490 MB）
+#   make runtime-clean    回收 staging 与下载缓存
+# staging 必须按平台各自执行：dsh 树里有平台相关的原生模块。
+NODE_VERSION      ?= 22.23.2
+DSH_VERSION       ?= 0.1.5-rc.2
+PNPM_VERSION      ?= 12.3.4
+DSHMARKET_VERSION ?= 1.45.1
+RUNTIME_DIR       := $(TAURI_DIR)/runtime
+RUNTIME_CACHE     := .runtime-cache
+NODE_ARCH         := $(shell uname -m | sed -e s/arm64/arm64/ -e s/aarch64/arm64/ -e s/x86_64/x64/)
+ifeq ($(PLATFORM),macos)
+NODE_OS           := darwin
+NODE_TARBALL      := node-v$(NODE_VERSION)-darwin-$(NODE_ARCH).tar.gz
+else
+NODE_OS           := linux
+NODE_TARBALL      := node-v$(NODE_VERSION)-linux-$(NODE_ARCH).tar.xz
+endif
+NODE_DIST_NAME    := node-v$(NODE_VERSION)-$(NODE_OS)-$(NODE_ARCH)
+NODE_BASE_URL     := https://nodejs.org/dist/v$(NODE_VERSION)
+NODE_BIN          := $(abspath $(RUNTIME_DIR))/node/bin
+RUNTIME_LOCK      := $(TAURI_DIR)/runtime.lock
+
+# 自带运行时版才声明 resources：普通 `make bundle`（精简版）不该把 520 MB 的 staging 打进包 ——
+# 这正是桌面壳审查 §10 记过的陷阱（bundle.resources 常开 + 残留 payload = 静默变胖）。
+ifeq ($(PLATFORM),macos)
+# macOS 上还要声明 11.0：随包的 node 22 是 minos 11.0，写 10.15 会"能装、能开壳、一起 harness 就崩"。
+BUNDLED_CONFIG_JSON := {"bundle":{"resources":["runtime/**/*"],"macOS":{"minimumSystemVersion":"11.0"}}}
+else
+BUNDLED_CONFIG_JSON := {"bundle":{"resources":["runtime/**/*"]}}
+endif
+
+# 信任链钉在仓库里的 $(RUNTIME_LOCK)：只校验"下载来的 SHASUMS256.txt"等于把信任交给 TLS，
+# 清单被换掉时发现不了（review P2-12）。
+runtime-fetch:
+	@mkdir -p $(RUNTIME_CACHE)
+	@if [ ! -f $(RUNTIME_CACHE)/$(NODE_TARBALL) ]; then \
+		echo "下载 $(NODE_TARBALL)"; \
+		curl -fsSL -o $(RUNTIME_CACHE)/$(NODE_TARBALL) $(NODE_BASE_URL)/$(NODE_TARBALL); \
+	fi
+	@curl -fsSL -o $(RUNTIME_CACHE)/SHASUMS256.txt $(NODE_BASE_URL)/SHASUMS256.txt
+	@grep " $(NODE_TARBALL)$$" $(RUNTIME_LOCK) > $(RUNTIME_CACHE)/.locked \
+		|| { echo "$(RUNTIME_LOCK) 里没有 $(NODE_TARBALL) 的 SHA256，先补上再打包" >&2; exit 1; }
+	@cd $(RUNTIME_CACHE) && grep " $(NODE_TARBALL)$$" SHASUMS256.txt > .downloaded \
+		&& cmp -s .locked .downloaded \
+		|| { echo "下载的 SHASUMS256.txt 与 $(RUNTIME_LOCK) 不一致：$(NODE_TARBALL)" >&2; exit 1; }
+	@cd $(RUNTIME_CACHE) && (shasum -a 256 -c .locked 2>/dev/null || sha256sum -c .locked) && rm -f .locked .downloaded
+	@echo "已校验 $(NODE_TARBALL)（对照 $(RUNTIME_LOCK)）"
+
+runtime-stage: runtime-fetch
+	@sh scripts/check-runtime-stage.sh --self-test
+	@echo "组装 $(RUNTIME_DIR) …"
+	@# 整体清空（只留 README.md 这个非空 marker）：只删四个已知子目录时，别的平台/上一次的残留
+	@# 会被 bundle.resources 静默打进包（review P1-8）。
+	@if [ -d $(RUNTIME_DIR) ]; then find $(RUNTIME_DIR) -mindepth 1 -maxdepth 1 ! -name README.md -exec rm -rf {} +; fi
+	@rm -rf $(RUNTIME_CACHE)/unpacked && mkdir -p $(RUNTIME_CACHE)/unpacked $(RUNTIME_DIR)
+	@tar -xf $(RUNTIME_CACHE)/$(NODE_TARBALL) -C $(RUNTIME_CACHE)/unpacked
+	@mv $(RUNTIME_CACHE)/unpacked/$(NODE_DIST_NAME) $(RUNTIME_DIR)/node
+	@echo "安装 dsh $(DSH_VERSION) 到 dsh-prefix …"
+	@PATH="$(NODE_BIN):$$PATH" $(RUNTIME_DIR)/node/bin/npm install -g --prefix $(RUNTIME_DIR)/dsh-prefix \
+		--cache $(RUNTIME_CACHE)/npm --no-fund --no-audit --loglevel=error @deepseek-ai/dsh@$(DSH_VERSION)
+	@echo "安装 pnpm $(PNPM_VERSION) 到 tools …"
+	@PATH="$(NODE_BIN):$$PATH" $(RUNTIME_DIR)/node/bin/npm install -g --prefix $(RUNTIME_DIR)/tools \
+		--cache $(RUNTIME_CACHE)/npm --no-fund --no-audit --loglevel=error pnpm@$(PNPM_VERSION)
+	@echo "生成 profile 模板（含插件市场 dshmarket@$(DSHMARKET_VERSION)）…"
+	@PATH="$(NODE_BIN):$$PATH" PNPM_STORE_DIR="$(abspath $(RUNTIME_CACHE))/pnpm-store" \
+		sh scripts/make-profile-template.sh \
+		"$(RUNTIME_DIR)/profile-template" "$(DSHMARKET_VERSION)" "$(RUNTIME_DIR)/tools/bin"
+	@xattr -cr $(RUNTIME_DIR) 2>/dev/null || true
+	@$(PYTHON) scripts/write_third_party_notices.py "$(RUNTIME_DIR)" "$(NODE_VERSION)" "$(DSH_VERSION)" "$(PNPM_VERSION)" "$(DSHMARKET_VERSION)"
+	@DSH_RUNTIME_MAX_FILES=45000 DSH_RUNTIME_MAX_MB=600 sh scripts/check-runtime-stage.sh "$(RUNTIME_DIR)"
+	@du -sh $(RUNTIME_DIR) 2>/dev/null || true
+
+# 打包"无需预装 node/dsh"的版本：bundle.resources 会把 runtime/ 一起塞进 .app。
+# 自带运行时的发行版必须声明 macOS 11.0：随包的 node 22 是 `minos 11.0`，而 tauri.conf.json 里的
+# 10.15 只对精简版成立 —— 声明 10.15 的结果是"能装、能开壳、一起 harness 就崩"（方案 §18.1 H2 实测）。
+bundle-bundled: runtime-stage
+	@$(MAKE) --no-print-directory bundle TAURI_CONFIG_EXTRA='$(BUNDLED_CONFIG_JSON)'
+
+runtime-clean:
+	rm -rf $(RUNTIME_CACHE)
+	@if [ -d $(RUNTIME_DIR) ]; then find $(RUNTIME_DIR) -mindepth 1 -maxdepth 1 ! -name README.md -exec rm -rf {} +; fi
+	@echo "已回收 staging 与下载缓存（src-tauri/runtime/README.md 保留）"

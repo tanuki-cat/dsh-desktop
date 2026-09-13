@@ -1,0 +1,11 @@
+# 自带运行时的下载清单：runtime-fetch 只认这里的 SHA256，而不是"下载来的 SHASUMS256.txt"。
+# 只校验后者等于把信任链交给 TLS —— 清单本身被换掉时发现不了（review P2-12）。
+#
+# 新增/升级平台时：从 https://nodejs.org/dist/v<NODE_VERSION>/SHASUMS256.txt 抄对应行，
+# 保持与原文件逐字节一致（<sha256> + 两个空格 + 文件名），runtime-fetch 用 grep + cmp 比对。
+# 当前对应 NODE_VERSION = 22.23.2（Makefile 里的变量）。
+61130f394c1630d211dd50aecc4353d379480f36d3ac913cd85dbba1aed585c6  node-v22.23.2-darwin-arm64.tar.gz
+58e99022c2ff89395576cc7fd4d98cea24bb68081475d5f88b801ee8729fb026  node-v22.23.2-darwin-x64.tar.gz
+d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307  node-v22.23.2-linux-x64.tar.xz
+fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8  node-v22.23.2-linux-arm64.tar.xz
+1177b4137ba5adaa56354ae40f1080c7450e8ae09cecb47da459d1c52ac99f97  node-v22.23.2-win-x64.zip

@@ -88,12 +88,62 @@ fn signal_pid(pid: u32, signal: TermSignal) -> bool {
     unsafe { libc::kill(pid as i32, sig) == 0 }
 }
 
+/// Minimal Win32 bindings: no extra dependency, one handle probe.
 #[cfg(windows)]
-fn signal_pid(pid: u32, _signal: TermSignal) -> bool {
-    std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
+mod win {
+    pub type Handle = *mut core::ffi::c_void;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn GetExitCodeProcess(handle: Handle, code: *mut u32) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    /// True while the pid is a running process.
+    ///
+    /// A failed `OpenProcess` means "gone" — except for access denied, which means the
+    /// process exists but belongs to someone else. Reporting that as gone would make the
+    /// shell skip cleaning up an instance it cannot inspect.
+    pub fn alive(pid: u32) -> bool {
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return GetLastError() == ERROR_ACCESS_DENIED;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            ok != 0 && code == STILL_ACTIVE
+        }
+    }
+}
+
+/// Windows has no SIGTERM: `taskkill` without `/F` asks the process to close (the closest
+/// thing to a graceful stop), `/F` is the force-kill counterpart of SIGKILL.
+#[cfg(windows)]
+fn signal_pid(pid: u32, signal: TermSignal) -> bool {
+    taskkill(pid, false, matches!(signal, TermSignal::Kill))
+}
+
+#[cfg(windows)]
+fn taskkill(pid: u32, tree: bool, force: bool) -> bool {
+    let mut command = std::process::Command::new("taskkill");
+    command.args(["/PID", &pid.to_string()]);
+    if tree {
+        command.arg("/T");
+    }
+    if force {
+        command.arg("/F");
+    }
+    command
         .status()
-        .map(|s| s.success())
+        .map(|status| status.success())
         .unwrap_or(false)
 }
 
@@ -128,19 +178,15 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Windows branch: not covered by this project. The Makefile refuses to build anywhere but
-/// macOS and Linux, and `None` here cannot tell a live process from a dead one, so
-/// `terminate` would always sit out the full grace period. Treat Windows as unsupported
-/// until someone ports and tests it (OpenProcess + GetExitCodeProcess).
+/// Windows: liveness through `OpenProcess` + `GetExitCodeProcess` (a plain "assume alive"
+/// made `terminate` sit out the whole grace period and then report failure), termination
+/// through `taskkill` — graceful first, `/F` only after the grace period.
 #[cfg(windows)]
 fn kill_signal(pid: u32, signal: Option<TermSignal>) -> bool {
     match signal {
-        None => true,
-        Some(_) => std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false),
+        None => win::alive(pid),
+        Some(TermSignal::Term) => taskkill(pid, true, false),
+        Some(TermSignal::Kill) => taskkill(pid, true, true),
     }
 }
 

@@ -8,10 +8,9 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 > 当前版本（`main`）仍**要求系统已装 `node` 与 `dsh`**。让目标机器无需预装这两者的发行方案
 > （自带 Node + dsh 核心）已在 `feat/bundled-runtime` 分支落地，见 [后续实施计划](#后续实施计划自带运行时无需预装-nodedsh)。
 >
-> **分支策略**：`feat/bundled-runtime` 是**长期分支，暂不合并到 `main`**，当前用途是构建与发布
-> **Windows 免安装版**（自带 Node + dsh + 插件市场，已实机验证）。要出包时用 `main` 上的
-> `.github/workflows/windows-portable.yml` 手动触发：工作流挂在 `main` 只是为了随时能跑，
-> 构建的却是 `build_ref` 指向的分支代码（默认 `feat/bundled-runtime`）。该分支的 README 有完整说明。
+> **分支策略**：`feat/bundled-runtime` 已合并回 `main`（2026-09-13）。自带运行时、Windows 免安装包与
+> `.github/workflows/windows-portable.yml` 现在都在 `main` 上，`main` 的产物不再要求目标机器预装 node/dsh。
+> 该分支保留为历史分支；后续开发直接在 `main` 上进行。
 
 设计依据：[`docs/design-task-feat-dsh-tauri-desktop-shell.md`](docs/design-task-feat-dsh-tauri-desktop-shell.md)
 （正文为设计，实施偏差与验证证据见其 §13.1–13.4）。
@@ -65,14 +64,14 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 
 **待实机点击确认**：附件上传、下载、`window.open` 实际效果、macOS TCC 授权归因。
 
-**平台**：构建入口只覆盖 macOS 与 Linux（其他平台在 Makefile 解析阶段直接报错）。Windows 分支代码保留但 `main` 上**未支持也未验证**：
-这里的存活探测恒为真，`terminate` 会白等满 grace，要移植得先换成 `OpenProcess` + `GetExitCodeProcess`
-—— 这些已在长期分支 `feat/bundled-runtime` 完成并实机验证（Windows 免安装包），该分支**暂不合并到 `main`**。
-`main` 的 `lib.rs` 因此带 `#[cfg(windows)] compile_error!`：在 Windows 上误用 `main` 会直接编译失败，
-而不是产出一个看起来能用、实际行为不对的包（`build_ref` 默认就指向那个分支，见上方分支策略）。
+**平台**：`make` 的构建入口只覆盖 macOS 与 Linux（其他平台在解析阶段直接报错）。Windows 走
+`.github/workflows/windows-portable.yml` 的原生 staging + 免安装包（已实机验证，见下一节），
+`process.rs` 的存活探测用的是 `OpenProcess` + `GetExitCodeProcess`。本机可用
+`cargo clippy --target x86_64-pc-windows-gnu` 对 `cfg(windows)` 代码做回归（只检查类型与 lint，不能运行 PE）。
 
 **未做**：签名与公证（对外分发必需）、多 workspace 切换 UI；
-**自带运行时（打包 Node/dsh）已规划未实施**，见下方"后续实施计划"。
+**自带运行时（打包 Node/dsh）已在 `feat/bundled-runtime` 分支实现**（macOS `.app` 实测可跑、
+Windows 免安装包实机验证通过），`main` 上未实施，见下方"后续实施计划"。
 
 ## 构建（Makefile，支持 macOS 与 Linux）
 
@@ -92,6 +91,10 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 | `make run` | 构建后启动 | macOS 用 `open` 打开打包产物；Linux 直接跑 release 二进制 |
 | `make icons` | 由 `icon.png` 重生成 `icon.icns` | 仅 macOS（`sips` + `iconutil`）；Linux 打包直接用 png |
 | `make icon-art` | 由 `src-tauri/icons/make_icon.py` 重绘 `icon.png` | 自绘小黑鲸，需 `python3` + Pillow；改设计改脚本，不要手改 png |
+| `make runtime-fetch` | 下载官方 Node，并**对照仓库里的 `src-tauri/runtime.lock`** 校验 SHA256 | 缓存到 `.runtime-cache/`（48 MB，可复用）；只校验下载来的 `SHASUMS256.txt` 挡不住清单被换 |
+| `make runtime-stage` | 组装 `src-tauri/runtime/`：Node + dsh 树 + pnpm + profile 模板 + 许可清单 | 约 **520 MB**；先清空整个 `runtime/`（只留 README.md），再跑脚本自检 + 必需文件/悬空链接/**绝对链接**/quarantine/**文件数与体积**闸门 |
+| `make bundle-bundled` | `runtime-stage` + 打包 | 产出**无需预装 node/dsh** 的 `.app`（约 598 MB），本机实测可跑；macOS 上额外把 `minimumSystemVersion` 覆盖为 **11.0**（随包 node 是 `minos 11.0`） |
+| `make runtime-clean` | 回收 staging 与下载缓存 | 保留 `runtime/README.md` |
 | `make clean` | 清理构建产物 | `cargo clean` |
 | `make distclean` | 连依赖缓存一起清理 | 额外删 `node_modules`、`.pnpm-store`、`.cargo-home`、`src-tauri/gen` |
 
@@ -100,20 +103,56 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 
 ### 已知坑
 
-- **`main` 不再声明 `bundle.resources`**：main 上既没有 staging 目标也没有读取自带运行时的代码，
-  留着 `["runtime/**/*"]` 只会把别的分支跑 `make runtime-stage` 后残留在 `src-tauri/runtime/` 的
-  payload（实测 520 MB）静默打进 `.app`。该配置与 `src-tauri/runtime/README.md` 标记文件都留给
-  `feat/bundled-runtime`（它需要这条配置，合并时加回）。main 上 `make bundle` 与 `src-tauri/runtime/` 无关。
+- **`bundle.resources` 只由 `make bundle-bundled` 声明**（`--config` 注入），基座 `tauri.conf.json` 里没有它：
+  常开这条 glob 会把残留的 staging（实测 520 MB）静默打进普通 `make bundle` 的包 —— 合并前两边各自吃过一次这个亏。
+  因此 `make bundle` 与 `src-tauri/runtime/` 无关，自带运行时版必须走 `make bundle-bundled`；
+  该目标要求 `src-tauri/runtime/` 里至少有一个文件，`README.md` 就是那个 marker（`.gitignore` 只忽略 payload）。
 - `make bundle` / `make run` 需要 `pnpm`；只跑 `make dev` / `check` / `test` 不需要。
 - Linux 首次构建前请先 `make doctor` 装齐系统依赖；即便将来采用自带 Node/dsh 的发行方式，
   **WebKitGTK 仍来自系统**（见后续实施计划）。
 - `make test-live` 与首次 `make bundle` 需要网络（查 registry / 拉 Tauri CLI）。
 
-### 规划中的目标（自带运行时，尚未实现）
+### 自带运行时（进行中）
 
-`runtime-fetch`（下载官方 Node 并按 `SHASUMS256.txt` 校验）、`runtime-stage`（组装 `src-tauri/runtime/`：
-Node + dsh 树 + pnpm + 许可文件）、`runtime-clean`（回收约 475 MB staging）——见
-[后续实施计划](#后续实施计划自带运行时无需预装-nodedsh) 与方案文档 §5。
+已完成并可实机复现，全部在 **`feat/bundled-runtime`** 分支上（**长期分支，暂不合并到 `main`**；
+Windows 免安装版也由它构建，见 [Windows 免安装包](#windows-免安装包手动触发)）：
+
+- `make runtime-fetch / runtime-stage / runtime-clean / bundle-bundled` 四个目标全部跑通；
+- staging 自带校验（`scripts/check-runtime-stage.sh`，`--self-test` 会先用假目录验证闸门本身有效）：必需文件、**悬空符号链接**（会让 `tauri build` 失败）、**绝对符号链接**（会被解引用，把宿主机文件复制进包）、**quarantine 属性**（会带进 .app）、**文件数/体积闸门**（多放 2 万个文件这类残留以前会被静默打包）；
+- profile 模板由真 pnpm 生成（含插件市场 dshmarket，见方案 §2.5）；
+- 实测：`env -i PATH=/usr/bin:/bin` 下自带 node 跑自带 dsh → `0.1.5-rc.2`；
+  全新 DSH_HOME + 模板播种 → `dsh web` **6 秒**出 URL、stderr 干净、`.dsh-market` 出现；
+- 实测：`make bundle-bundled` 产出 598 MB 的 `.app`，包内 node 可直接执行、31,090 个文件。
+
+**运行时解析已接进启动流程**（`src-tauri/src/runtime.rs` + `lib.rs::resolve_runtime`）：
+
+- 来源：`DSH_DESKTOP_RUNTIME` → 应用资源目录 → `tauri dev` 的 `target/<profile>/runtime`；
+- 候选：显式环境变量 → 系统安装（先过能力门槛）→ 自带（seed 与影子前缀取版本更高者）；一个候选都没有时给
+  「装 node + dsh」错误页（若系统安装被门槛拒掉，错误页会说明是哪一道）；
+- 门槛：`module.stripTypeScriptTypes`（Node 22.13 以上）是硬性的——dsh 没有它跑不起来；架构不一致只在
+  **本构建确实带运行时**时才拒绝，否则降级为警告继续用系统安装（Rosetta 下的 x64 node 自洽、可用）。
+  能力探测带 5 秒超时，版本管理器 shim 挂住时不会把启动页卡死；
+- 自带时：首启播种 profile 模板（含插件市场）、PATH 前置自带工具目录、注入 `npm_config_prefix`／
+  `PNPM_HOME` 指向可写前缀；核心更新只落到 `app-data/runtime/prefix`；
+- 用系统安装时：**默认仍然就地升级**（`system_updates: install`，与自带运行时之前的行为一致），
+  想自己管升级就写 `system_updates: notify`（只提示，不动用户的全局前缀）；
+- **node 与 dsh 分开解析**：系统装了 node 但没装 dsh 时，可以「系统 node + 自带 dsh」混用（方案 §2.4 的那一格以前不可达）；
+- **只有本壳自己的树才算「自带」**：seed（包内）与影子前缀（`app-data/runtime/prefix`）会得到 PATH 前置、
+  `npm_config_prefix`／`PNPM_HOME` 注入与首启播种；`DSH_DESKTOP_DSH`／`DSH_DESKTOP_RUNTIME` 指向的树按**用户的**处理 ——
+  不动它的子进程环境、不往里装更新（排障开关不再带来副作用）；
+- **能力门槛仍然管 `runtime: system`**：node 缺 `module.stripTypeScriptTypes`、或有自带运行时时架构不一致，
+  系统安装会被拒（错误页说明原因）。这是有意为之（旧 node 本来就跑不起 dsh），与方案 §2.4「保留手动覆盖」的措辞
+  有出入，以本条为准；
+- 探测短路：`runtime: bundled` 或两个 `DSH_DESKTOP_*` 都已指定时，跳过系统运行时探测（省掉一次登录 shell + 最长 5 秒的探测）；
+- 首启超时：判定发生在播种**之前**，所以带模板播种的首启仍然是 90 秒预算；播种失败不会留下半棵 profile（先写 `.tmp` 再改名）；
+- 想看效果：`DSH_DESKTOP_RUNTIME_PREFERENCE=bundled|system|auto` 可覆盖 `config.json` 的 `runtime`。
+
+**Windows 免安装包已实机验证通过**（2026-09-13：解压到 `D:\dsh` 双击即启动，自带 node + dsh 拉起 Web GUI，
+插件市场与会话内工具调用正常）。
+
+尚未做：macOS 自带运行时的 **GUI 实机验证**、**"回退 + last-known-good"**（方案 §2.3 规则 2：选中的树起不来时自动
+换另一个候选重试一次）、签名与公证、Linux 侧 staging。
+细节见[方案文档](docs/design-task-feat-dsh-bundled-runtime.md) §20。
 
 运行时（当前版本）需要系统中已有 `dsh` 与 `node`。
 
@@ -142,6 +181,7 @@ Node + dsh 树 + pnpm + 许可文件）、`runtime-clean`（回收约 475 MB sta
 | `update_check_interval_minutes` | `60` | 一次成功的查询结果缓存多久（0 = 每次启动都查）。查询实测约 1.2–1.9 s，缓存命中 0 ms |
 | `import_shell_env` | `true` | 启动时导入登录 shell 的环境变量（见下节）。`false` 则只用 App 自身环境 |
 | `require_tested_dsh` | `false` | CLI 版本落在已测试区间外时是否拒绝启动。默认只告警并继续（状态页标注「未测试版本」） |
+| `runtime` | `"auto"` | 运行时来源：`auto` 用系统已装的（通过门槛时），否则用自带；`bundled` 强制自带；`system` 保持旧行为（开发用） |
 | `env` | `{}` | 显式追加/覆盖传给 harness 的环境变量，优先级最高，如 `{"DEEPSEEK_API_KEY": "sk-…"}` |
 
 只要写你想改的字段即可：`port` / `workspace` 缺失会取默认值，其余字段本就有默认值。
@@ -214,20 +254,22 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
    树被换走后运行中的 harness 下一次 `require()` 会直接 `MODULE_NOT_FOUND`（实测）。所以先 SIGTERM 停实例、
    等端口释放，再安装；不能停时（外部实例且 `take_over_existing=false`、或拿不到 PID）**跳过本次更新**并记日志，
    实例不受任何影响；
-4. 有新版则 `npm install -g --no-fund --no-audit @deepseek-ai/dsh@<解析出的具体版本>`；
-   npm 取自 node 同目录，且 npm 全局前缀 ≠ CLI 实际位置时自动带 `--prefix`；
+4. 有新版则 `npm install -g --no-fund --no-audit --cache <app-data>/runtime/npm-cache @deepseek-ai/dsh@<解析出的具体版本>`；
+   npm 取自 node 同目录，且 npm 全局前缀 ≠ CLI 实际位置时自动带 `--prefix`；`runtime/{prefix,tools,npm-cache}` 在启动时
+   幂等创建；
 5. 所有 npm 子进程都在 PATH 最前面插入 npm 所在目录：npm 是 `#!/usr/bin/env node` 脚本，
    而 GUI 启动的壳只有 launchd 的 PATH（不含 node），不这样处理会直接 `exit 127`（详见设计文档 §13.8）；
-6. 安装后**回读一次 CLI 版本**：版本没变说明 npm 装到了别的前缀（自定义 prefix、pnpm/yarn 布局），
-   此时只记日志、不谎报成功、也不为一次无效更新重启实例；这次尝试会写进缓存（`attempted`），
+6. 安装后**从安装前缀回读** CLI 路径与版本：自带运行时的更新落在影子前缀，回读 seed 会让版本看起来没变，
+   于是本轮继续跑旧核心、日志还指向 npm 前缀；版本变了就把受管 CLI 切到新树并在本轮重启实例；
+   只有**确实没变**（npm 装到了别处）才记那条日志，并把这次尝试写进缓存（`attempted`），
    **同一缓存窗口内不再重复安装**（否则每次启动都会先停掉 Harness 再重建一棵约 289 MB 的依赖树）；
 7. 刚更新过 → 强制重启实例（否则复用旧进程仍跑旧二进制）。
 
 结果写入日志：`dsh is up to date` / `update available: A -> B` / `dsh updated: A -> B` / `update failed, keeping vA` /
 `update A was already attempted and changed nothing; not installing again`。
 
-**排障**：手工修好 npm 全局前缀（或改用别的安装方式）之后，壳在出现更高版本前不会再尝试安装 ——
-日志里那句 `already attempted and changed nothing` 是唯一线索，删掉 `<app-data>/update-check.json` 即可复位。
+**排障**：手工修好 npm 全局前缀（或换安装方式）后，壳在出现更高版本前不会再尝试安装 —— 日志里那句
+`already attempted and changed nothing` 是唯一线索，删掉 `<app-data>/update-check.json` 即可复位。
 
 ## 启动耗时与性能
 
@@ -255,6 +297,36 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
 `icon.png` 由 `src-tauri/icons/make_icon.py` 自绘生成（矢量路径 + 4× 超采样，非官方素材）。当前**未签名**：
 本机可运行；分发给别人需要 Developer ID 签名 + 公证（`codesign` / `notarytool`）。
 
+## Windows 免安装包（手动触发）
+
+**这个包只由 `feat/bundled-runtime` 分支产出**：工作流文件挂在 `main` 上（这样 Actions 页面随时能触发），
+默认构建的却是 `build_ref` 指向的分支代码。该分支是长期分支、**暂不合并到 `main`**；`main` 上没有自带运行时，
+即使跑同一个工作流也只会得到一份用不上的 `runtime/`。
+
+工作流：`.github/workflows/windows-portable.yml` —— 在 Actions 页面 **Run workflow** 手动触发（`workflow_dispatch`），
+在 `windows-latest` 上**原生** stage 运行时，产出 `dsh-desktop_<版本>_windows-x64-portable.zip`：
+内含 `DSH Desktop/dsh-desktop.exe` + `WebView2Loader.dll` + `runtime/`（Node + dsh + pnpm + 插件市场模板 + 许可清单），
+目标机器**无需安装任何东西**。另附同名 `.exe`（7z 自解压包，双击解压，绕开资源管理器解压的 260 字符路径限制）
+与 `SHA256SUMS-windows-x64`。
+
+| 输入 | 默认 | 说明 |
+|---|---|---|
+| `dsh_version` | `0.1.5-rc.2` | 随包附带的 dsh 版本 |
+| `node_version` | `22.23.2` | 随包附带的 Node 版本 |
+| `build_ref` | `feat/bundled-runtime` | 从哪个分支/tag 构建（自带运行时只在该分支上） |
+| `attach_to_release` | 空 | 填一个已存在的 Release tag 就把 zip 一并传上去；留空只作为 workflow artifact |
+
+**打 tag 发版**：`release.yml` 的 `windows-portable` 任务用 `workflow_call` 复用同一份实现
+（`build_ref` 传 tag 名），所以**在 `feat/bundled-runtime` 上打 tag** 就能把 Windows 包和 macOS/Linux 产物
+一起发出去；`main` 的 `release.yml` 没有这个任务。
+
+**实机验证（2026-09-13，run 34752267176 的产物）**：Windows 11 解压到 `D:\dsh` 后双击即启动，
+自带 Node 22.23.2 + dsh 0.1.5-rc.2 拉起 Web GUI，首启播种的插件市场可用，会话内
+`glob`/`write`/`read`/`grep`/`edit`/`patch`/`todo_write`/`present` 正常。
+
+**为什么必须在 Windows 上 stage**：在 macOS 上用 `npm install --os=win32 --cpu=x64` 装 dsh 时，koffi 的平台包
+`@koromix/koffi-win32-x64` 不会被装进依赖树（npm 的 `--os/--cpu` 对全局安装的依赖树不生效），于是 postinstall
+回退到就地编译并因缺 CMake 报 `CMake does not seem to be available`（实测）。本地等价脚本：`scripts/stage-runtime.sh`。
 ## 发布（GitHub Actions）
 
 编排文件：`.github/workflows/release.yml`。
@@ -267,9 +339,10 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
 | 运行器 | 平台标识 | 产物 |
 |---|---|---|
 | `macos-14` | `macos-arm64` | `dsh-desktop_<v>_macos-arm64.app.zip` |
-| `macos-13` | `macos-x64` | `dsh-desktop_<v>_macos-x64.app.zip` |
+| `macos-14`（交叉 `x86_64-apple-darwin`） | `macos-x64` | `dsh-desktop_<v>_macos-x64.app.zip` |
 | `ubuntu-22.04` | `linux-x64` | `dsh-desktop_<v>_linux-x64.deb` |
 | `ubuntu-24.04-arm` | `linux-arm64` | `dsh-desktop_<v>_linux-arm64.deb` |
+| `windows-latest`（复用 `windows-portable.yml`） | `windows-x64` | `dsh-desktop_<v>_windows-x64-portable.zip` ＋ 同名 `.exe` —— **仅在 `feat/bundled-runtime` 分支上打 tag 时产出** |
 
 **流程**：`preflight`（校验 tag 与 `tauri.conf.json` / `Cargo.toml` / `package.json` 三处版本一致）→
 每平台 `make fmt-check`（只检查、不改工作区）+ `make clippy` + `make test`（发布门禁）→ `make bundle` →
@@ -286,8 +359,9 @@ git tag v0.2.0 && git push origin v0.2.0
 
 **校验下载**：`shasum -a 256 -c SHA256SUMS`（Linux 用 `sha256sum -c SHA256SUMS`）。
 
-**当前限制**：产物未签名、未公证（macOS 首次打开需右键 →「打开」，或 `xattr -dr com.apple.quarantine`），
-且需要机器已装 `node` 与 `dsh` —— 自带运行时的发行版仍在实施中（见下节）。
+**当前限制**：产物均未签名、未公证（macOS 首次打开需右键 →「打开」，或 `xattr -dr com.apple.quarantine`）；
+macOS/Linux 产物**需要机器已装 `node` 与 `dsh`**（自带运行时的发行版仍在 `feat/bundled-runtime` 上实施，见下节），
+Windows 免安装包则**自带 node 与 dsh**。
 按需扩展：把 dmg 加进 macOS 的 `bundles`（`app,dmg`）、AppImage 加进 Linux、以及签名/公证（需要证书 secrets，做法见自带运行时方案 §7）。
 ## 后续实施计划：自带运行时（无需预装 Node/dsh）
 

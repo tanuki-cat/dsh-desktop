@@ -291,30 +291,38 @@ pub fn check(npm: &Path, package: &str, wanted_tags: &[String], current: &str) -
 /// `npm` that belongs to the same installation as the resolved node.
 pub fn npm_for(node: &Path) -> Option<PathBuf> {
     if let Some(dir) = node.parent() {
-        let candidate = dir.join("npm");
-        if candidate.is_file() {
-            return Some(candidate);
+        // `bin/npm` on Unix, `npm.cmd` beside `node.exe` on Windows. The bare name is checked
+        // last: npm also ships a POSIX wrapper next to its `.cmd`, and running that fails
+        // with `os error 193`.
+        for name in ["npm.cmd", "npm.exe", "npm"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
-    if let Some(paths) = std::env::var_os("PATH") {
-        if let Some(found) = std::env::split_paths(&paths)
-            .map(|dir| dir.join("npm"))
-            .find(|p| p.is_file())
-        {
-            return Some(found);
-        }
+    if let Some(found) = crate::locator::path_lookup("npm") {
+        return Some(found);
     }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let output = Command::new(shell)
-        .args(["-lc", "command -v npm"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let candidate = PathBuf::from(text);
-    if candidate.is_file() {
-        Some(candidate)
-    } else {
+    login_shell_npm()
+}
+
+/// Last resort: ask the user's login shell where npm is. Unix only.
+fn login_shell_npm() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
         None
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let output = Command::new(shell)
+            .args(["-lc", "command -v npm"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let candidate = PathBuf::from(text);
+        candidate.is_file().then_some(candidate)
     }
 }
 
@@ -344,9 +352,15 @@ pub fn install(
     package: &str,
     version: &str,
     prefix: Option<&Path>,
+    cache: Option<&Path>,
 ) -> Result<(), String> {
     let mut command = npm_command(npm);
     command.args(["install", "-g", "--no-fund", "--no-audit"]);
+    // The dependency tree is ~289 MB: point npm at this app's own cache instead of the
+    // user's global one (plan §4, review P2-11).
+    if let Some(dir) = cache {
+        command.arg("--cache").arg(dir);
+    }
     if let Some(wanted) = prefix {
         let differs = global_prefix(npm)
             .map(|current| current != wanted.to_string_lossy())
@@ -380,9 +394,8 @@ pub struct Cache {
     /// Newest version seen, or None when the query failed.
     pub latest: Option<String>,
     /// Latest version whose install was already attempted while the supervised CLI stayed put
-    /// (npm wrote the package to a prefix this shell does not run from). Suppresses a second
-    /// install of the same cached answer inside the window. The field is newer than existing
-    /// cache files, so it must stay optional on the wire.
+    /// (npm wrote the package somewhere this shell does not run it from). Suppresses a second
+    /// install of the same answer; newer than existing cache files, hence optional on the wire.
     #[serde(default)]
     pub attempted: Option<String>,
 }
@@ -414,21 +427,6 @@ impl Cache {
     }
 }
 
-/// Which "already attempted" marker a fresh registry answer should carry forward.
-///
-/// Without this, a machine whose npm global prefix is not the one this shell runs from would
-/// repeat the whole stop-install-restart dance every time the cache window expires: a new query
-/// used to clear the marker. Only a *different* version reopens that decision; a failed query
-/// learned nothing new, so it carries the marker too.
-pub fn carried_attempt(previous: Option<&Cache>, latest: Option<&str>) -> Option<String> {
-    let tried = previous?.attempted.clone()?;
-    match latest {
-        None => Some(tried),
-        Some(latest) if latest == tried => Some(tried),
-        Some(_) => None,
-    }
-}
-
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -455,8 +453,8 @@ pub struct Checked {
     pub status: Status,
     /// True when the answer came from the cache instead of the network.
     pub cached: bool,
-    /// True when this cached answer already led to an install that changed nothing, so the
-    /// caller must report it without installing again.
+    /// True when this answer already led to an install that changed nothing, so the caller
+    /// must report it without installing again.
     pub attempted: bool,
 }
 
@@ -494,8 +492,8 @@ pub fn check_cached(
         Status::UpToDate { version } => Some(version.clone()),
         _ => None,
     };
-    // The window expiring is not news about the CLI: keep the marker while the answer is still
-    // the version that was already tried, and let only a new version reopen the decision.
+    // An expired window is not news about the CLI: keep the marker while the answer is still the
+    // version that was already tried, so a mismatched npm prefix does not reinstall for ever.
     let attempted = carried_attempt(previous.as_ref(), latest.as_deref());
     let suppress = matches!(
         &status,
@@ -517,8 +515,21 @@ pub fn check_cached(
     }
 }
 
+/// Which "already attempted" marker a fresh registry answer should carry forward.
+///
+/// Only a different version reopens the install decision; a failed query learned nothing new,
+/// so it carries the marker too.
+pub fn carried_attempt(previous: Option<&Cache>, latest: Option<&str>) -> Option<String> {
+    let tried = previous?.attempted.clone()?;
+    match latest {
+        None => Some(tried),
+        Some(latest) if latest == tried => Some(tried),
+        Some(_) => None,
+    }
+}
+
 /// Remember that installing `latest` did not change the CLI this shell runs, so the cached
-/// "update available" answer is reported but not installed again inside the same window.
+/// answer is reported but not installed again.
 pub fn mark_attempt_ineffective(data_dir: &Path, latest: &str) {
     let Some(mut cache) = read_cache(data_dir) else {
         return;
@@ -659,8 +670,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A cache file written before the `attempted` field existed must keep working: it is
-    /// what every installation has on disk at the moment it upgrades the app.
+    /// A cache file written before the `attempted` field existed must keep working.
     #[test]
     fn cache_files_without_the_attempt_field_still_parse() {
         let dir = std::env::temp_dir().join("dsh-desktop-update-cache-legacy-test");
@@ -676,6 +686,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The window expiring must not reopen an install that already proved useless.
+    #[test]
+    fn carried_attempt_follows_the_registry_answer() {
+        let cache = |attempted: Option<&str>, latest: Option<&str>| Cache {
+            checked_at: 42,
+            installed: "0.1.5-rc.1".into(),
+            latest: latest.map(str::to_string),
+            attempted: attempted.map(str::to_string),
+        };
+        assert_eq!(
+            carried_attempt(
+                Some(&cache(Some("0.1.5-rc.2"), Some("0.1.5-rc.2"))),
+                Some("0.1.5-rc.2")
+            ),
+            Some("0.1.5-rc.2".to_string())
+        );
+        assert_eq!(
+            carried_attempt(Some(&cache(Some("0.1.5-rc.2"), None)), None),
+            Some("0.1.5-rc.2".to_string())
+        );
+        assert_eq!(
+            carried_attempt(
+                Some(&cache(Some("0.1.5-rc.2"), Some("0.1.5-rc.2"))),
+                Some("0.1.5-rc.3")
+            ),
+            None
+        );
+        assert_eq!(carried_attempt(None, Some("0.1.5-rc.2")), None);
+        assert_eq!(
+            carried_attempt(Some(&cache(None, Some("0.1.5-rc.2"))), Some("0.1.5-rc.2")),
+            None
+        );
+    }
+
+    /// End to end through `check_cached`: an expired window on a machine whose npm writes the
+    /// package elsewhere must not reinstall.
+    #[cfg(unix)]
+    #[test]
+    fn an_expired_window_does_not_reopen_an_ineffective_install() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join("dsh-desktop-update-window-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A stand-in for npm: `npm view <pkg> dist-tags --json` prints the file below.
+        let tags = dir.join("dist-tags.json");
+        let npm = dir.join("npm");
+        std::fs::write(&npm, format!("#!/bin/sh\ncat {}\n", tags.display())).unwrap();
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let window_ago = now_secs() - 2 * 60 * 60;
+        let seed = |latest: &str| Cache {
+            checked_at: window_ago,
+            installed: "0.1.5-rc.1".into(),
+            latest: Some(latest.into()),
+            attempted: Some("0.1.5-rc.2".into()),
+        };
+        let wanted = vec!["latest".to_string()];
+        std::fs::write(&tags, r#"{"latest":"0.1.5-rc.2"}"#).unwrap();
+        write_cache(&dir, &seed("0.1.5-rc.2")).unwrap();
+
+        let checked = check_cached(&npm, PACKAGE, &wanted, "0.1.5-rc.1", &dir, 60);
+        assert!(
+            !checked.cached,
+            "the window is over, so the registry is queried"
+        );
+        assert!(checked.attempted, "the same answer must not install again");
+        assert_eq!(
+            read_cache(&dir).unwrap().attempted.as_deref(),
+            Some("0.1.5-rc.2"),
+            "the marker survives the new query"
+        );
+
+        // A new version reopens the decision.
+        std::fs::write(&tags, r#"{"latest":"0.1.5-rc.3"}"#).unwrap();
+        write_cache(&dir, &seed("0.1.5-rc.2")).unwrap();
+        let checked = check_cached(&npm, PACKAGE, &wanted, "0.1.5-rc.1", &dir, 60);
+        assert!(!checked.attempted, "a new version is a new decision");
+        assert_eq!(read_cache(&dir).unwrap().attempted, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// The repeat-install bug: npm wrote the package somewhere this shell does not run it
     /// from, so the version never changes and every launch inside the cache window used to
     /// stop the Harness and rebuild the tree.
@@ -738,93 +830,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The window expiring must not reopen an install that already proved useless: only a
-    /// different registry answer does.
-    #[test]
-    fn carried_attempt_follows_the_registry_answer() {
-        let cache = |attempted: Option<&str>, latest: Option<&str>| Cache {
-            checked_at: 42,
-            installed: "0.1.5-rc.1".into(),
-            latest: latest.map(str::to_string),
-            attempted: attempted.map(str::to_string),
-        };
-        // Same answer as the one already tried: keep suppressing.
-        assert_eq!(
-            carried_attempt(
-                Some(&cache(Some("0.1.5-rc.2"), Some("0.1.5-rc.2"))),
-                Some("0.1.5-rc.2")
-            ),
-            Some("0.1.5-rc.2".to_string())
-        );
-        // The query failed: nothing new was learned, keep it too.
-        assert_eq!(
-            carried_attempt(Some(&cache(Some("0.1.5-rc.2"), None)), None),
-            Some("0.1.5-rc.2".to_string())
-        );
-        // A genuinely new version reopens the decision.
-        assert_eq!(
-            carried_attempt(
-                Some(&cache(Some("0.1.5-rc.2"), Some("0.1.5-rc.2"))),
-                Some("0.1.5-rc.3")
-            ),
-            None
-        );
-        // Nothing was ever attempted, or there is no previous entry.
-        assert_eq!(carried_attempt(None, Some("0.1.5-rc.2")), None);
-        assert_eq!(
-            carried_attempt(Some(&cache(None, Some("0.1.5-rc.2"))), Some("0.1.5-rc.2")),
-            None
-        );
-    }
-
-    /// End to end through `check_cached`: an expired window on a machine whose npm writes the
-    /// package elsewhere used to reinstall every hour.
-    #[cfg(unix)]
-    #[test]
-    fn an_expired_window_does_not_reopen_an_ineffective_install() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join("dsh-desktop-update-window-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // A stand-in for npm: `npm view <pkg> dist-tags --json` prints the file below verbatim.
-        let tags = dir.join("dist-tags.json");
-        let npm = dir.join("npm");
-        std::fs::write(&npm, format!("#!/bin/sh\ncat {}\n", tags.display())).unwrap();
-        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let window_ago = now_secs() - 2 * 60 * 60;
-        let seed = |latest: &str| Cache {
-            checked_at: window_ago,
-            installed: "0.1.5-rc.1".into(),
-            latest: Some(latest.into()),
-            attempted: Some("0.1.5-rc.2".into()),
-        };
-        std::fs::write(&tags, r#"{"latest":"0.1.5-rc.2"}"#).unwrap();
-        write_cache(&dir, &seed("0.1.5-rc.2")).unwrap();
-
-        let wanted = vec!["latest".to_string()];
-        let checked = check_cached(&npm, PACKAGE, &wanted, "0.1.5-rc.1", &dir, 60);
-        assert!(
-            !checked.cached,
-            "the window is over, so the registry is queried"
-        );
-        assert!(checked.attempted, "the same answer must not install again");
-        assert_eq!(
-            read_cache(&dir).unwrap().attempted.as_deref(),
-            Some("0.1.5-rc.2"),
-            "the marker survives the new query"
-        );
-
-        // A new version reopens the decision.
-        std::fs::write(&tags, r#"{"latest":"0.1.5-rc.3"}"#).unwrap();
-        write_cache(&dir, &seed("0.1.5-rc.2")).unwrap();
-        let checked = check_cached(&npm, PACKAGE, &wanted, "0.1.5-rc.1", &dir, 60);
-        assert!(!checked.attempted, "a new version is a new decision");
-        assert_eq!(read_cache(&dir).unwrap().attempted, None);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
     #[test]
     fn compatibility_flags_versions_outside_the_tested_range() {
         assert_eq!(compatibility(TESTED_MIN), Compatibility::Tested);

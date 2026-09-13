@@ -1,17 +1,13 @@
 //! dsh-desktop: a Tauri shell that supervises `dsh web` and hosts it in the system WebView.
 
-// The Windows code paths in this tree are reference material only: `process.rs` cannot tell a
-// live process from a dead one there, and the Makefile refuses to build on anything but macOS
-// and Linux. Refuse the build instead of producing a bundle that looks supported but
-// misbehaves; the ported, machine-tested implementation lives on feat/bundled-runtime.
-#[cfg(windows)]
-compile_error!(
-    "main 分支不构建 Windows 产物：见 README 的 Windows 免安装版说明（feat/bundled-runtime 分支）"
-);
+// Windows is a supported target since `feat/bundled-runtime` merged in (2026-09-13):
+// `process.rs` probes liveness with `OpenProcess` + `GetExitCodeProcess`, and
+// `.github/workflows/windows-portable.yml` stages a bundled runtime on a Windows runner.
 
 pub mod harness;
 pub mod locator;
 pub mod process;
+pub mod runtime;
 pub mod shellenv;
 pub mod update;
 pub mod window;
@@ -70,6 +66,18 @@ pub struct Config {
     /// running it and failing in a confusing way. Off by default: we warn and continue.
     #[serde(default)]
     pub require_tested_dsh: bool,
+    /// Which runtime to supervise: `auto` (use an installed one when it passes the gates,
+    /// otherwise the bundled halves), `bundled` (always the shipped runtime) or `system`
+    /// (pre-bundled behaviour, for development).
+    #[serde(default)]
+    pub runtime: runtime::Preference,
+    /// What to do when the supervised CLI is the user's own installation and a newer version
+    /// exists: `install` (default — upgrade it in place, the pre-bundled behaviour) or
+    /// `notify` (report it and leave the tree alone, §2.4: never rewrite a prefix we do not
+    /// own). Only affects system installations; a bundled runtime always updates its shadow
+    /// prefix.
+    #[serde(default)]
+    pub system_updates: runtime::SystemUpdates,
 }
 
 fn default_port() -> u16 {
@@ -77,14 +85,19 @@ fn default_port() -> u16 {
 }
 
 fn default_workspace() -> PathBuf {
-    home_workspace(std::env::var("HOME").ok())
+    match home_dir() {
+        // `home_dir` is the platform-aware lookup: Windows has no `HOME`, and a Git-Bash-style
+        // `/c/Users/me` is not a usable working directory there.
+        Some(home) => home,
+        None => home_workspace(None),
+    }
 }
 
-/// Workspace for a config that does not name one.
+/// Workspace for a config that does not name one, when no home directory was found at all.
 ///
-/// A missing `HOME` used to fall back to `/`, which is worse than failing: the agent runs its
-/// `glob` and `grep` from the workspace root, so it would walk the whole filesystem. The
-/// temporary directory is still local and private, and the log says why `$HOME` was not used.
+/// Falling back to `/` is worse than failing: the agent runs its `glob` and `grep` from the
+/// workspace root, so it would walk the whole filesystem. The temporary directory is still local
+/// and private, and the log says why `$HOME` was not used.
 fn home_workspace(home: Option<String>) -> PathBuf {
     match home {
         Some(home) if !home.trim().is_empty() => PathBuf::from(home),
@@ -97,6 +110,81 @@ fn home_workspace(home: Option<String>) -> PathBuf {
             fallback
         }
     }
+}
+
+/// The user's home directory, on every platform we build for.
+///
+/// `HOME` is a Unix convention: a Windows GUI process normally only has `USERPROFILE`
+/// (sometimes `HOMEDRIVE` + `HOMEPATH`), so looking for `HOME` alone left the workspace and
+/// the profile check pointing at a drive root.
+pub fn home_dir() -> Option<PathBuf> {
+    // Git Bash exports a POSIX-style `HOME` (`/c/Users/me`) and other setups use a bare drive
+    // (`D:`); both are unusable as a process working directory, so validate what we return.
+    #[cfg(windows)]
+    let keys = ["USERPROFILE", "HOME"];
+    #[cfg(not(windows))]
+    let keys = ["HOME", "USERPROFILE"];
+    for key in keys {
+        if let Some(value) = std::env::var_os(key) {
+            let candidate = PathBuf::from(value);
+            if usable_directory(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    let drive = std::env::var_os("HOMEDRIVE")?;
+    let path = std::env::var_os("HOMEPATH")?;
+    let mut combined = PathBuf::from(drive);
+    combined.push(path);
+    usable_directory(&combined).then_some(combined)
+}
+
+/// Whether a path may be handed to a child process as its working directory.
+///
+/// Absolute and named. Rejects the empty string and, on Windows, `D:` — drive-relative, meaning
+/// "the current directory on D:" — plus MSYS-style `/c/Users/me`, which is not absolute there.
+pub fn usable_directory(path: &Path) -> bool {
+    path.is_absolute() && !path.as_os_str().is_empty() && path.parent().is_some()
+}
+
+/// Drop a Windows verbatim prefix (`\\?\`, `\\?\UNC\`).
+///
+/// Rust's canonicalization returns verbatim paths on Windows, and the startup path resolves the
+/// seed through APIs that canonicalize — logged as `\\?\D:\…\node.exe` and `\\?\D:\…\bin.js`.
+/// Win32 file APIs accept them, but anything that *parses* one breaks: node's `fs.realpathSync`
+/// walked `\\?\D:\…` component-wise and died on `lstat 'D:'` (`EISDIR: illegal operation on a
+/// directory`) before the CLI ever started. The prefix exists to exceed MAX_PATH, so it is only
+/// dropped while the path still fits.
+pub(crate) fn unverbatim(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        let stripped = match text.strip_prefix(r"\\?\UNC\") {
+            Some(rest) => Some(format!(r"\\{rest}")),
+            None => text.strip_prefix(r"\\?\").map(str::to_string),
+        };
+        if let Some(stripped) = stripped {
+            if stripped.len() < 260 {
+                return PathBuf::from(stripped);
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Resolve a path against the app's own working directory.
+///
+/// Every path we hand to the Harness must be absolute: it becomes either the child's working
+/// directory or an argv entry, and Windows resolves a relative one (a bare `PATH` entry, a
+/// drive-relative `D:tools`) against the *child's* directory instead.
+fn absolute(path: &Path) -> PathBuf {
+    let path = unverbatim(path);
+    if path.is_absolute() {
+        return path;
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(&path))
+        .unwrap_or(path)
 }
 
 fn default_import_shell_env() -> bool {
@@ -148,6 +236,8 @@ impl Config {
             import_shell_env: true,
             env: BTreeMap::new(),
             require_tested_dsh: false,
+            runtime: runtime::Preference::Auto,
+            system_updates: runtime::SystemUpdates::Install,
         };
         // The same repair a loaded file gets, so the value seeded here is already usable
         // (a `HOME` that is relative or gone would otherwise become the workspace).
@@ -167,12 +257,15 @@ impl Config {
 
     /// Replace values that would send the Harness somewhere it cannot start.
     ///
-    /// A workspace becomes the child's working directory, so a workspace that is missing or
-    /// relative fails inside the spawn with a bare ENOENT and no mention of which config entry
-    /// caused it. The value is repaired in memory rather than rewritten, the same principle as
-    /// an unparsable config.json: this run adapts, the user's file stays as they left it.
+    /// A workspace becomes the child's working directory, so a workspace that is missing,
+    /// relative, or drive-relative (`D:` written by an earlier Windows build, which makes node
+    /// fail with `EISDIR: lstat 'D:'`) cannot start the Harness. The value is repaired in memory
+    /// rather than rewritten — the same principle as an unparsable config.json: this run adapts,
+    /// the user's file stays as they left it.
     fn repair(&mut self) {
-        if !(self.workspace.is_absolute() && self.workspace.is_dir()) {
+        if usable_directory(&self.workspace) && self.workspace.is_dir() {
+            self.workspace = absolute(&self.workspace);
+        } else {
             let fallback = default_workspace();
             harness::app_log(&format!(
                 "config.json 的 workspace 不是已存在的绝对路径，本次改用 {}: {}",
@@ -190,6 +283,17 @@ impl Config {
                     path.display()
                 ));
                 self.dsh_path = None;
+            }
+        }
+        if let Some(home) = self.dsh_home.clone() {
+            if usable_directory(&home) {
+                self.dsh_home = Some(absolute(&home));
+            } else {
+                harness::app_log(&format!(
+                    "config.json 中的 dsh_home 不可用，已忽略: {}",
+                    home.display()
+                ));
+                self.dsh_home = None;
             }
         }
     }
@@ -274,8 +378,8 @@ fn may_stop_before_update(
 /// serves from.
 ///
 /// Only a Harness this shell started lives in the process group we created; a foreign one
-/// shares its group with whatever terminal or script launched it, and a group signal would
-/// take unrelated processes down with it (design §13.1).
+/// shares its group with whatever terminal or script launched it, and `process::terminate`
+/// signals the whole group first (design §13.1 / review P0-3).
 #[derive(Debug, PartialEq, Eq)]
 enum StopMode {
     ProcessGroup,
@@ -348,6 +452,328 @@ fn stop_instance_before_update(
         "stopped Harness pid {pid} before updating the CLI ({})",
         mode.describe()
     ));
+    Ok(())
+}
+
+/// The supervised runtime, resolved once at startup.
+struct ResolvedRuntime {
+    node: PathBuf,
+    dsh_js: PathBuf,
+    version: String,
+    updates: runtime::Updates,
+    /// Where the bundled runtime lives, when this build ships one.
+    seed: Option<PathBuf>,
+    /// True when the supervised tree is this shell's own: the seed inside the bundle, or the
+    /// writable shadow prefix. A tree the user installed or pointed at with an environment
+    /// variable is theirs — its child PATH, `npm_config_prefix` and `PNPM_HOME` must not be
+    /// rewritten (review P1-5).
+    bundled: bool,
+}
+
+impl ResolvedRuntime {
+    fn bundled(&self) -> bool {
+        self.bundled
+    }
+
+    /// Where a core update may install (`None` = the CLI is the user's own, only notify).
+    fn update_prefix(&self, data_dir: &Path) -> Option<PathBuf> {
+        match self.updates {
+            runtime::Updates::Shadow => Some(data_dir.join("runtime").join("prefix")),
+            runtime::Updates::Notify => None,
+        }
+    }
+}
+
+/// The bundled runtime shipped inside the app, when there is one.
+///
+/// `DSH_DESKTOP_RUNTIME` wins (useful for testing a staged tree without bundling), then the
+/// resource directory of the running app, then `src-tauri/runtime` for `make dev`.
+fn seed_root_for(resources: Option<&Path>) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = std::env::var_os("DSH_DESKTOP_RUNTIME") {
+        candidates.push(PathBuf::from(dir));
+    }
+    if let Some(resources) = resources {
+        candidates.push(resources.join("runtime"));
+    }
+    // `tauri dev` copies the resources next to the binary: `target/<profile>/runtime` is the
+    // parent when running the app binary, and the grandparent for anything under `deps/`.
+    if let Ok(exe) = std::env::current_exe() {
+        for base in [exe.parent(), exe.ancestors().nth(2)].into_iter().flatten() {
+            candidates.push(base.join("runtime"));
+        }
+    }
+    candidates
+        .into_iter()
+        .map(|dir| unverbatim(&dir))
+        .find(|dir| node_in(dir).is_some())
+}
+
+/// The node binary of a runtime directory.
+///
+/// Two layouts exist: the Unix tarballs put it in `bin/`, while the Windows distribution is
+/// flat (`node.exe` next to `node_modules/npm`), so both are accepted.
+fn node_in(runtime: &Path) -> Option<PathBuf> {
+    let node = runtime.join("node");
+    ["bin/node", "node", "bin/node.exe", "node.exe"]
+        .iter()
+        .map(|relative| node.join(relative))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Relative paths of the CLI entry script inside a prefix.
+///
+/// npm uses `<prefix>/lib/node_modules` on Unix but `<prefix>/node_modules` on Windows, so a
+/// staged tree from either platform has to be found.
+const DSH_JS_SUFFIXES: [&str; 2] = [
+    "lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
+    "node_modules/@deepseek-ai/dsh/lib/bin.js",
+];
+
+/// Which CLI a successful install left the shell to run, and the version of that tree.
+///
+/// A shadow install lands in the prefix, while `resolved.dsh_js` still points at the seed
+/// resolved at startup: reading the version back from the seed made an update look ineffective,
+/// so the launch kept the old core and reinstalled on every start (review P0-2). Pure apart from
+/// file reads, so the switch is testable on a temp tree.
+fn installed_cli(prefix: Option<&Path>, supervised: &Path, fallback: &str) -> (PathBuf, String) {
+    let installed = prefix.and_then(dsh_js_in).filter(|path| path.is_file());
+    let version = installed
+        .as_deref()
+        .and_then(locator::version_of)
+        .or_else(|| locator::version_of(supervised))
+        .unwrap_or_else(|| fallback.to_string());
+    (
+        installed.unwrap_or_else(|| supervised.to_path_buf()),
+        version,
+    )
+}
+
+/// The CLI entry script inside an npm prefix, when it is there.
+fn dsh_js_in(prefix: &Path) -> Option<PathBuf> {
+    DSH_JS_SUFFIXES
+        .iter()
+        .map(|suffix| prefix.join(suffix))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The verdict on the user's own installation (§2.4).
+#[derive(Debug, PartialEq, Eq)]
+enum SystemGate {
+    Accept,
+    /// Usable, but the bundled runtime would be a better fit: say so and keep it.
+    Warn(String),
+    Reject(String),
+}
+
+/// Gate the system installation on the two facts `probe_node` reports.
+///
+/// `module.stripTypeScriptTypes` is fatal either way: the CLI's code-runtime worker needs it and
+/// `@deepseek-ai/dsh` declares no `engines.node`, so Node < 22.13 cannot run it (measured). A
+/// wrong architecture is different — an x64 node under Rosetta runs a self-consistent x64 tree,
+/// so it is only worth rejecting when a bundled runtime can take its place; without one, refusing
+/// would turn a slow-but-working setup into an error page.
+fn system_runtime_gate(facts: &locator::NodeFacts, host_arch: &str, bundled: bool) -> SystemGate {
+    if !facts.strip_types {
+        return SystemGate::Reject(format!(
+            "node 缺少 module.stripTypeScriptTypes（需要 Node 22.13 以上，当前架构 {}）",
+            facts.arch
+        ));
+    }
+    if facts.arch != host_arch {
+        let reason = format!("node 架构 {} 与宿主 {} 不一致", facts.arch, host_arch);
+        return if bundled {
+            SystemGate::Reject(format!("{reason}，改用自带运行时"))
+        } else {
+            SystemGate::Warn(format!(
+                "{reason}，且本构建没有自带运行时，继续使用系统安装"
+            ))
+        };
+    }
+    SystemGate::Accept
+}
+
+/// Apply the capability gate to the user's own installation.
+///
+/// Pure, so the matrix stays testable. `None` means there was no system node to judge — a dsh
+/// without node is still usable on the bundled node — while a rejected installation drops both
+/// halves: the gate judges the installation, not the file (§2.4).
+fn keep_system_install(
+    node: Option<PathBuf>,
+    dsh: Option<PathBuf>,
+    gate: Option<SystemGate>,
+) -> (Option<PathBuf>, Option<PathBuf>, Option<String>) {
+    match gate {
+        Some(SystemGate::Reject(reason)) => (None, None, Some(reason)),
+        _ => (node, dsh, None),
+    }
+}
+
+/// Decide which node and which dsh tree to supervise (bundled-runtime plan §2.3/§2.4).
+fn resolve_runtime(
+    resources: Option<&Path>,
+    data_dir: &Path,
+    config: &Config,
+) -> Result<ResolvedRuntime, String> {
+    let seed = seed_root_for(resources);
+    let seed_node = seed.as_deref().and_then(node_in);
+    let seed_dsh = seed
+        .as_deref()
+        .and_then(|dir| dsh_js_in(&dir.join("dsh-prefix")));
+    let seed_dsh = seed_dsh.filter(|path| path.is_file());
+    let seed_version = seed_dsh.as_deref().and_then(locator::version_of);
+
+    let shadow_dsh = dsh_js_in(&data_dir.join("runtime").join("prefix"));
+    let shadow_version = shadow_dsh.as_deref().and_then(locator::version_of);
+
+    // The user's own installation, resolved as two independent halves: a machine can have node
+    // without dsh, and §2.4 expects "system node + bundled dsh" to work — resolving the pair with
+    // one `locate()` made that cell unreachable (review P1-4).
+    let preference = std::env::var("DSH_DESKTOP_RUNTIME_PREFERENCE")
+        .ok()
+        .and_then(|value| runtime::Preference::parse(&value))
+        .unwrap_or(config.runtime);
+    let env_node = std::env::var("DSH_DESKTOP_NODE")
+        .ok()
+        .map(|value| absolute(Path::new(&value)))
+        .filter(|path| path.is_file());
+    let env_dsh = std::env::var("DSH_DESKTOP_DSH")
+        .ok()
+        .map(|value| absolute(Path::new(&value)))
+        .filter(|path| path.is_file());
+    // Probing the system installation costs a login shell and up to 5 s of node probing; when the
+    // answer cannot change the outcome, skip it (review P2-14).
+    let probe_system =
+        preference != runtime::Preference::Bundled && !(env_node.is_some() && env_dsh.is_some());
+    if !probe_system {
+        harness::app_log("跳过系统运行时探测：preference/env 已经决定了用哪棵树");
+    }
+    let system_node = probe_system.then(locator::system_node).flatten();
+    let system_dsh = probe_system
+        .then(|| locator::system_dsh(config.dsh_path.clone()))
+        .flatten();
+    let facts = system_node
+        .as_ref()
+        .and_then(|node| locator::probe_node(node));
+    let host_arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        other => other,
+    };
+    let has_seed = seed_node.is_some() && seed_dsh.is_some();
+    let gate = facts
+        .as_ref()
+        .map(|facts| system_runtime_gate(facts, host_arch, has_seed));
+    if let Some(SystemGate::Warn(reason)) = &gate {
+        harness::app_log(&format!("system runtime kept with a warning: {reason}"));
+    }
+    if let Some(SystemGate::Reject(reason)) = &gate {
+        harness::app_log(&format!("system runtime rejected: {reason}"));
+    }
+    let (system_node, system_dsh, rejection) = keep_system_install(system_node, system_dsh, gate);
+
+    let decision = runtime::decide(&runtime::Inputs {
+        preference,
+        env_node,
+        env_dsh,
+        system_node,
+        system_dsh,
+        seed_node: seed_node.as_deref(),
+        seed_dsh: seed_dsh.as_deref(),
+        shadow_dsh: shadow_dsh.as_deref(),
+        seed_version: seed_version.as_deref(),
+        shadow_version: shadow_version.as_deref(),
+    })
+    .ok_or_else(|| match &rejection {
+        // Say which gate failed: "找不到 dsh" would be wrong, and the fix differs (upgrade
+        // node vs. install dsh).
+        Some(reason) => format!(
+            "系统安装的 dsh 不可用（{reason}），本构建也没有自带运行时。请升级 node / 重装 @deepseek-ai/dsh，或用 DSH_DESKTOP_DSH / DSH_DESKTOP_NODE 指定路径。"
+        ),
+        None => "找不到 dsh，也没有自带运行时。请安装 node 与 @deepseek-ai/dsh，或用 DSH_DESKTOP_DSH / DSH_DESKTOP_NODE 指定路径。"
+            .to_string(),
+    })?;
+
+    let describe = format!(
+        "{} | updates: {:?} (system_updates: {})",
+        decision.describe(),
+        decision.updates,
+        config.system_updates.label()
+    );
+    harness::app_log(&describe);
+    let version = locator::version_of(&decision.dsh.path).unwrap_or_else(|| "未知".into());
+    Ok(ResolvedRuntime {
+        node: absolute(&decision.node.path),
+        dsh_js: absolute(&decision.dsh.path),
+        version,
+        updates: decision.updates,
+        seed,
+        bundled: matches!(
+            decision.dsh.origin,
+            runtime::Origin::Seed | runtime::Origin::Shadow
+        ),
+    })
+}
+
+/// The login-shell capture: the shell that was run, and the variables it printed.
+type EnvCapture = std::thread::JoinHandle<(String, Option<(String, BTreeMap<String, String>)>)>;
+
+/// First launch of a bundled build: install the profile template (which carries the plugin
+/// market) into the user's DSH_HOME, unless a profile is already there (plan §2.5).
+fn seed_profile_template(config: &Config, seed: Option<&Path>) -> Option<String> {
+    let seed = seed?;
+    let template = seed.join("profile-template");
+    if !template.join("package.json").is_file() {
+        return None;
+    }
+    let home = config
+        .dsh_home
+        .clone()
+        .or_else(|| home_dir().map(|home| home.join(".dsh")))?;
+    let profile = home.join("profiles").join("web");
+    if profile.exists() {
+        return None;
+    }
+    match copy_tree(&template, &profile) {
+        Ok(()) => Some(format!(
+            "seeded profile template into {}",
+            profile.display()
+        )),
+        Err(error) => Some(format!("could not seed the profile template: {error}")),
+    }
+}
+
+/// Copy a tree into `to`, building a sibling `.tmp` directory first.
+///
+/// A failure half-way (full disk, permissions) must not leave a partial `profiles/web`: the
+/// next launch sees that directory exists and neither re-seeds nor repairs it (review P1-6).
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut name = to.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".tmp");
+    let staging = to.with_file_name(name);
+    let _ = std::fs::remove_dir_all(&staging);
+    if let Err(error) = copy_tree_into(from, &staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&staging, to) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn copy_tree_into(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree_into(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
     Ok(())
 }
 
@@ -549,6 +975,8 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     // instance it may hand to the reuse branch from one it must stop.
     let config = Config::load(data_dir);
     let port = config.port;
+    // The two paths every startup failure is traced back to; cheap to log, and the only way
+    // to diagnose a machine we cannot run on.
     harness::app_log(&format!(
         "app data dir = {} | workspace = {}",
         data_dir.display(),
@@ -596,7 +1024,19 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     // The login-shell capture costs ~160 ms and depends on nothing that follows, so it runs
     // alongside the version lookup and update check and is joined just before the child env
     // is assembled.
-    let env_capture = config.import_shell_env.then(|| {
+    // A Windows GUI process already inherits the user's variables and has no login shell to
+    // capture; asking for `/bin/zsh` there only delayed startup and changed nothing.
+    #[cfg(windows)]
+    let env_capture: Option<EnvCapture> = {
+        if config.import_shell_env {
+            harness::app_log(
+                "使用应用环境：Windows 的 GUI 进程已继承用户环境，无登录 shell 可捕获",
+            );
+        }
+        None
+    };
+    #[cfg(not(windows))]
+    let env_capture: Option<EnvCapture> = config.import_shell_env.then(|| {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         std::thread::spawn(move || {
             let imported = shellenv::import(Path::new(&shell));
@@ -604,19 +1044,49 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         })
     });
 
-    // 3) Locate dsh + node (a GUI-launched app has no Homebrew PATH).
-    window::set_status(app, "正在定位 dsh 与 node…", "");
-    // Search order: DSH_DESKTOP_DSH → dsh_path (config.json) → PATH → common prefixes → login shell.
-    let location = locator::locate(
-        config.dsh_path.clone(),
-        std::env::var("DSH_DESKTOP_DSH").ok(),
-    )?;
-    let mut version = locator::version(&location).unwrap_or_else(|| "未知".into());
+    // 3) Resolve the runtime: bundled seed / shadow prefix / the user's install (§2.3/§2.4).
+    window::set_status(app, "正在解析运行时…", "");
+    let mut resolved =
+        resolve_runtime(app.path().resource_dir().ok().as_deref(), data_dir, &config)?;
+    let mut version = resolved.version.clone();
+
+    // The profile directory decides the startup timeout, so look at it *before* seeding: a
+    // freshly seeded profile made the very first launch take the 30 s "warm" timeout instead of
+    // the 90 s budget meant for a first start (review P1-6).
+    let home = config
+        .dsh_home
+        .clone()
+        .or_else(|| home_dir().map(|home| home.join(".dsh")))
+        .unwrap_or_else(|| PathBuf::from(".dsh"));
+    let first_launch = !home.join("profiles").join("web").exists();
+
+    // First launch of a bundled build: put the profile template (plugin market included) in
+    // place before the CLI starts, so the marketplace exists without any download (§2.5).
+    // Only for the shell's own runtime: the template pins a dshmarket version, and a user who
+    // installed or pointed at their own tree should not be given one (review P1-7).
+    if resolved.bundled() {
+        if let Some(note) = seed_profile_template(&config, resolved.seed.as_deref()) {
+            harness::app_log(&note);
+        }
+    }
+
+    // The update path installs into `runtime/prefix` and keeps npm's cache there: create both
+    // up front (idempotent), like the plan's §3 step 2 asks (review P2-11).
+    let runtime_root = data_dir.join("runtime");
+    for name in ["prefix", "tools", "npm-cache"] {
+        if let Err(error) = std::fs::create_dir_all(runtime_root.join(name)) {
+            harness::app_log(&format!(
+                "无法创建 {}/{}: {error}",
+                runtime_root.display(),
+                name
+            ));
+        }
+    }
 
     // 3b) Update the supervised CLI before booting it, so "core upgrade" needs no terminal.
     let mut just_updated = false;
     if config.auto_update && !version.is_empty() {
-        match update::npm_for(&location.node) {
+        match update::npm_for(&resolved.node) {
             None => harness::app_log("找不到 npm，跳过更新检查"),
             Some(npm) => {
                 let interval = config.update_check_interval_minutes;
@@ -636,8 +1106,8 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                     window::set_status(app, "正在检查 dsh 更新…", &format!("当前 dsh {version}"));
                 }
                 // A cached answer whose install already changed nothing must not be installed
-                // again inside the window: npm wrote the package somewhere this shell does not
-                // run it from, so every launch would stop the Harness and rebuild the tree.
+                // again: npm wrote the package somewhere this shell does not run it from, so
+                // every launch would stop the Harness and rebuild a 289 MB tree (review P0-2).
                 let already_attempted = checked.attempted;
                 match checked.status {
                     update::Status::UpdateAvailable { to, .. } if already_attempted => {
@@ -651,43 +1121,78 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                             &format!("发现新版本 v{to}，正在更新…"),
                             &format!("v{from} -> v{to}"),
                         );
-                        harness::app_log(&format!("update available: {from} -> {to}, installing"));
-                        // npm rewrites the CLI tree in place. Anything serving from it must be
-                        // stopped first, or the live session breaks on its next lazy require().
-                        // A deferred update only skips the install: startup continues and the
-                        // instance keeps running (its tree was never touched).
-                        match stop_instance_before_update(app, data_dir, port, &config) {
-                            Err(reason) => harness::app_log(&format!(
-                                "update deferred, keeping v{from}: {reason}"
-                            )),
-                            Ok(()) => {
-                                let prefix = update::install_prefix(&location.dsh_js);
-                                match update::install(&npm, update::PACKAGE, &to, prefix.as_deref())
-                                {
-                                    Ok(()) => {
-                                        version = locator::version(&location)
-                                            .unwrap_or_else(|| to.clone());
-                                        if version == from {
-                                            // npm installed the package somewhere other than where
-                                            // this CLI lives (custom prefix, pnpm/yarn/volta layout),
-                                            // so the supervised binary is unchanged. Say so instead of
-                                            // claiming an update and restarting for nothing, and
-                                            // remember the attempt so the cached answer does not
-                                            // repeat it on the next launch.
-                                            update::mark_attempt_ineffective(data_dir, &to);
-                                            harness::app_log(&format!(
+                        // The user's own installation is upgraded in place by default (that is
+                        // what this shell always did); `system_updates: notify` in config.json
+                        // switches to reporting only, for anyone who would rather run their own
+                        // npm upgrade (§2.4).
+                        if matches!(resolved.updates, runtime::Updates::Notify)
+                            && config.system_updates == runtime::SystemUpdates::Notify
+                        {
+                            harness::app_log(&format!(
+                                "update available: {from} -> {to}; policy {} leaves the user install alone",
+                                config.system_updates.label()
+                            ));
+                            window::set_status(
+                                app,
+                                &format!("有新版本 v{to}（system_updates=notify，未自动更新）"),
+                                &format!("v{from} -> v{to}"),
+                            );
+                        } else {
+                            harness::app_log(&format!(
+                                "update available: {from} -> {to}, installing"
+                            ));
+                            // npm rewrites the CLI tree in place. Anything serving from it must be
+                            // stopped first, or the live session breaks on its next lazy require().
+                            // A deferred update only skips the install: startup continues and the
+                            // instance keeps running (its tree was never touched).
+                            match stop_instance_before_update(app, data_dir, port, &config) {
+                                Err(reason) => harness::app_log(&format!(
+                                    "update deferred, keeping v{from}: {reason}"
+                                )),
+                                Ok(()) => {
+                                    let prefix = resolved
+                                        .update_prefix(data_dir)
+                                        .or_else(|| update::install_prefix(&resolved.dsh_js));
+                                    let cache = runtime_root.join("npm-cache");
+                                    match update::install(
+                                        &npm,
+                                        update::PACKAGE,
+                                        &to,
+                                        prefix.as_deref(),
+                                        Some(&cache),
+                                    ) {
+                                        Ok(()) => {
+                                            // A shadow install lands in a different tree than the
+                                            // seed resolved at startup (review P0-2).
+                                            let (installed_path, installed_version) = installed_cli(
+                                                prefix.as_deref(),
+                                                &resolved.dsh_js,
+                                                &to,
+                                            );
+                                            version = installed_version;
+                                            if version == from {
+                                                // npm installed the package somewhere other than where
+                                                // this CLI lives (custom prefix, pnpm/yarn/volta layout),
+                                                // so the supervised binary is unchanged. Say so instead of
+                                                // claiming an update and restarting for nothing, and
+                                                // remember the attempt so the cached answer does not
+                                                // repeat it on the next launch.
+                                                update::mark_attempt_ineffective(data_dir, &to);
+                                                harness::app_log(&format!(
                                                 "update installed but the supervised CLI is still {from}; check npm global prefix"
                                             ));
-                                        } else {
-                                            just_updated = true;
-                                            harness::app_log(&format!(
-                                                "dsh updated: {from} -> {to}"
-                                            ));
+                                            } else {
+                                                resolved.dsh_js = installed_path;
+                                                just_updated = true;
+                                                harness::app_log(&format!(
+                                                    "dsh updated: {from} -> {to}"
+                                                ));
+                                            }
                                         }
+                                        Err(reason) => harness::app_log(&format!(
+                                            "update failed, keeping v{from}: {reason}"
+                                        )),
                                     }
-                                    Err(reason) => harness::app_log(&format!(
-                                        "update failed, keeping v{from}: {reason}"
-                                    )),
                                 }
                             }
                         }
@@ -828,11 +1333,38 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     }
 
     let mut prefix: Vec<String> = Vec::new();
-    if let Some(dir) = location.node.parent() {
+    if let Some(dir) = resolved.node.parent() {
         prefix.push(dir.to_string_lossy().to_string());
     }
-    prefix.push("/opt/homebrew/bin".to_string());
-    prefix.push("/usr/local/bin".to_string());
+    // Bundled runtime: the shipped pnpm (and the writable tools prefix taking precedence) go in
+    // front so plugins, MCP servers and agent commands use the same toolchain as the shell (§5).
+    if resolved.bundled() {
+        // npm puts shims in `bin/` on Unix and directly in the prefix on Windows; PATH entries
+        // that do not exist are harmless, so both are offered.
+        let tools = data_dir.join("runtime").join("tools");
+        prefix.push(tools.join("bin").to_string_lossy().to_string());
+        prefix.push(tools.to_string_lossy().to_string());
+        if let Some(seed) = &resolved.seed {
+            prefix.push(seed.join("tools").join("bin").to_string_lossy().to_string());
+            prefix.push(seed.join("tools").to_string_lossy().to_string());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // A macOS GUI app inherits launchd's PATH; Homebrew lives here.
+        prefix.push("/opt/homebrew/bin".to_string());
+        prefix.push("/usr/local/bin".to_string());
+    }
+    #[cfg(windows)]
+    {
+        // A launcher may hand us a sanitized environment; `cmd.exe` and friends still expect
+        // the system directories to be on PATH.
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            let root = PathBuf::from(root);
+            prefix.push(root.join("System32").to_string_lossy().to_string());
+            prefix.push(root.to_string_lossy().to_string());
+        }
+    }
     let merged = shellenv::merge_path(
         &prefix,
         shell_path.as_deref(),
@@ -840,6 +1372,20 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     );
     child_env.retain(|(key, _)| key != "PATH");
     child_env.push(("PATH".to_string(), merged));
+    // Recentred global installs: with the read-only seed in front of PATH, `npm i -g` from the
+    // harness would target the app bundle. Point it (and pnpm) at the writable tools prefix.
+    if resolved.bundled() {
+        let tools = data_dir.join("runtime").join("tools");
+        child_env.retain(|(key, _)| key != "npm_config_prefix" && key != "PNPM_HOME");
+        child_env.push((
+            "npm_config_prefix".to_string(),
+            tools.to_string_lossy().to_string(),
+        ));
+        child_env.push((
+            "PNPM_HOME".to_string(),
+            tools.join("bin").to_string_lossy().to_string(),
+        ));
+    }
     for (key, value) in &config.env {
         child_env.retain(|(existing, _)| existing != key);
         child_env.push((key.clone(), value.clone()));
@@ -872,7 +1418,8 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
             }
         ),
     );
-    let spawned = harness::spawn(&location, &options).map_err(|e| format!("启动进程失败: {e}"))?;
+    let spawned = harness::spawn(&resolved.node, &resolved.dsh_js, &options)
+        .map_err(|e| format!("启动进程失败: {e}"))?;
     let pid = spawned.child.id();
     adopt(pid, data_dir);
     // Both sides use SeqCst, so either this thread sees the exit flag or `shutdown` sees the
@@ -884,19 +1431,12 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
 
     // A profile that does not exist yet is initialised on first use, which is slower
     // (measured ~4s on a warm machine, but plugin installs can take much longer).
-    let home = config
-        .dsh_home
-        .clone()
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".dsh"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".dsh"));
-    let timeout = if home.join("profiles").join("web").exists() {
-        STARTUP_TIMEOUT_NEXT
-    } else {
+    // `first_launch` was captured before seeding, so a bundled first start still gets 90 s
+    // (review P1-6).
+    let timeout = if first_launch {
         STARTUP_TIMEOUT_FIRST
+    } else {
+        STARTUP_TIMEOUT_NEXT
     };
 
     let url = match spawned.wait_for_url(timeout) {
@@ -1045,6 +1585,68 @@ mod tests {
     }
 
     #[test]
+    fn an_install_switches_the_supervised_cli_to_the_shadow_prefix() {
+        let root = std::env::temp_dir().join("dsh-desktop-installed-cli-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let supervised = root.join("seed/lib/node_modules/@deepseek-ai/dsh/lib/bin.js");
+        std::fs::create_dir_all(supervised.parent().unwrap()).unwrap();
+        std::fs::write(&supervised, "#!/usr/bin/env node\n").unwrap();
+        std::fs::write(
+            root.join("seed/lib/node_modules/@deepseek-ai/dsh/package.json"),
+            r#"{"name":"@deepseek-ai/dsh","version":"0.1.5-rc.1"}"#,
+        )
+        .unwrap();
+
+        // Nothing was installed into the prefix: stay on the supervised tree.
+        let (path, version) = installed_cli(Some(&root.join("empty")), &supervised, "0.1.5-rc.2");
+        assert_eq!(path, supervised);
+        assert_eq!(version, "0.1.5-rc.1");
+
+        // A shadow install adds a new tree next to the seed: path *and* version must switch, or
+        // the launch keeps the old core and logs "check npm global prefix" (review P0-2).
+        let prefix = root.join("prefix");
+        let shadow = prefix.join("lib/node_modules/@deepseek-ai/dsh");
+        std::fs::create_dir_all(shadow.join("lib")).unwrap();
+        std::fs::write(shadow.join("lib/bin.js"), "#!/usr/bin/env node\n").unwrap();
+        std::fs::write(
+            shadow.join("package.json"),
+            r#"{"name":"@deepseek-ai/dsh","version":"0.1.5-rc.2"}"#,
+        )
+        .unwrap();
+        let (path, version) = installed_cli(Some(&prefix), &supervised, "0.1.5-rc.2");
+        assert_eq!(path, shadow.join("lib/bin.js"));
+        assert_eq!(version, "0.1.5-rc.2");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_seed_copy_is_all_or_nothing() {
+        let root = std::env::temp_dir().join("dsh-desktop-copy-tree-test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("profiles/web");
+        let staging = root.join("profiles/web.tmp");
+
+        // A source that cannot be read leaves neither the target nor the staging directory:
+        // a half profile would never be re-seeded nor repaired (review P1-6).
+        assert!(copy_tree(&root.join("missing"), &target).is_err());
+        assert!(!target.exists());
+        assert!(!staging.exists());
+
+        // A complete copy lands in one step and cleans up after itself.
+        let from = root.join("template");
+        std::fs::create_dir_all(from.join("node_modules/dshmarket")).unwrap();
+        std::fs::write(from.join("package.json"), "{}").unwrap();
+        std::fs::write(from.join("node_modules/dshmarket/package.json"), "{}").unwrap();
+        copy_tree(&from, &target).unwrap();
+        assert!(target.join("node_modules/dshmarket/package.json").is_file());
+        assert!(!staging.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn external_instances_are_never_stopped_by_process_group() {
         assert_eq!(stop_mode(true), StopMode::ProcessGroup);
         assert_eq!(stop_mode(false), StopMode::PidOnly);
@@ -1121,6 +1723,33 @@ mod tests {
     }
 
     #[test]
+    fn the_system_gate_keeps_a_lone_dsh_and_drops_a_rejected_install() {
+        let node = || Some(PathBuf::from("/usr/bin/node"));
+        let dsh = || {
+            Some(PathBuf::from(
+                "/usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
+            ))
+        };
+        // No system node to judge: the dsh alone is still usable on the bundled node — this is
+        // the §2.4 cell that resolving the pair with one `locate()` made unreachable (P1-4).
+        assert_eq!(keep_system_install(None, dsh(), None), (None, dsh(), None));
+        // Accepted, or accepted with a warning: both halves stay.
+        assert_eq!(
+            keep_system_install(node(), dsh(), Some(SystemGate::Accept)),
+            (node(), dsh(), None)
+        );
+        assert_eq!(
+            keep_system_install(node(), dsh(), Some(SystemGate::Warn("old".into()))),
+            (node(), dsh(), None)
+        );
+        // Rejected: the installation as a whole goes, and the reason reaches the error page.
+        assert_eq!(
+            keep_system_install(node(), dsh(), Some(SystemGate::Reject("too old".into()))),
+            (None, None, Some("too old".to_string()))
+        );
+    }
+
+    #[test]
     fn update_only_stops_an_instance_it_is_allowed_to_stop() {
         use harness::Probe;
         // Nothing running: update freely.
@@ -1132,6 +1761,138 @@ mod tests {
         // A foreign Harness only with explicit permission.
         assert!(may_stop_before_update(&Probe::HarnessNoSession, false, true).is_ok());
         assert!(may_stop_before_update(&Probe::HarnessNoSession, false, false).is_err());
+    }
+
+    #[test]
+    fn finds_a_seed_under_the_resource_directory() {
+        let dir = std::env::temp_dir().join("dsh-desktop-seed-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("runtime/node/bin")).unwrap();
+        std::fs::write(dir.join("runtime/node/bin/node"), "").unwrap();
+
+        let found = seed_root_for(Some(&dir)).expect("the resource dir holds a runtime");
+        // The resource directory wins over the `tauri dev` copies next to the test binary.
+        assert_eq!(found, dir.join("runtime"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forcing_bundled_resolves_into_the_seed_tree() {
+        let root = std::env::temp_dir().join("dsh-desktop-resolve-test");
+        let seed = root.join("runtime");
+        let dsh_dir = seed.join("dsh-prefix/lib/node_modules/@deepseek-ai/dsh");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(dsh_dir.join("lib")).unwrap();
+        std::fs::create_dir_all(seed.join("node/bin")).unwrap();
+        std::fs::write(seed.join("node/bin/node"), "").unwrap();
+        std::fs::write(dsh_dir.join("lib/bin.js"), "").unwrap();
+        std::fs::write(dsh_dir.join("package.json"), "{\"version\": \"9.9.9\"}").unwrap();
+
+        let data_dir = root.join("app-data");
+        let config = Config {
+            runtime: runtime::Preference::Bundled,
+            ..Config::load(&data_dir)
+        };
+        let resolved = resolve_runtime(Some(&root), &data_dir, &config).expect("seed resolves");
+        assert_eq!(resolved.node, seed.join("node/bin/node"));
+        assert_eq!(resolved.dsh_js, dsh_dir.join("lib/bin.js"));
+        assert_eq!(resolved.version, "9.9.9");
+        // The bundled half is ours to update; a system install never is.
+        assert_eq!(resolved.updates, runtime::Updates::Shadow);
+        assert!(resolved.bundled());
+        assert_eq!(
+            resolved.update_prefix(&data_dir),
+            Some(data_dir.join("runtime/prefix"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verbatim_windows_paths_lose_their_prefix() {
+        #[cfg(windows)]
+        {
+            // Taken from a real failure: node's `fs.realpathSync` walked this path and died
+            // on `lstat 'D:'` before the CLI ever started.
+            assert_eq!(
+                unverbatim(Path::new(r"\\?\D:\dsh\DSH Desktop\runtime\node\node.exe")),
+                PathBuf::from(r"D:\dsh\DSH Desktop\runtime\node\node.exe")
+            );
+            assert_eq!(
+                unverbatim(Path::new(r"\\?\UNC\server\share\x")),
+                PathBuf::from(r"\\server\share\x")
+            );
+            // Past MAX_PATH the prefix is the only way to reach the file, so it stays.
+            let long = format!(r"\\?\D:\{}", "a".repeat(300));
+            assert_eq!(unverbatim(Path::new(&long)), PathBuf::from(&long));
+        }
+        // Everywhere else the helper must not touch a path.
+        assert_eq!(unverbatim(Path::new("/a/b")), PathBuf::from("/a/b"));
+    }
+
+    #[test]
+    fn the_system_runtime_gate_only_refuses_what_it_must() {
+        let apple = locator::NodeFacts {
+            arch: "arm64".into(),
+            strip_types: true,
+        };
+        let intel = locator::NodeFacts {
+            arch: "x64".into(),
+            strip_types: true,
+        };
+        let old = locator::NodeFacts {
+            arch: "arm64".into(),
+            strip_types: false,
+        };
+
+        assert_eq!(
+            system_runtime_gate(&apple, "arm64", true),
+            SystemGate::Accept
+        );
+        // An x64 node under Rosetta is only worth refusing when the bundled runtime can take
+        // its place; without one it is the only way to run, so it is kept with a warning.
+        assert!(matches!(
+            system_runtime_gate(&intel, "arm64", true),
+            SystemGate::Reject(_)
+        ));
+        assert!(matches!(
+            system_runtime_gate(&intel, "arm64", false),
+            SystemGate::Warn(_)
+        ));
+        // Node < 22.13 cannot run the CLI at all, so this one is fatal in both cases.
+        assert!(matches!(
+            system_runtime_gate(&old, "arm64", false),
+            SystemGate::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn system_updates_defaults_to_upgrading_the_user_install() {
+        let dir = std::env::temp_dir().join("dsh-desktop-system-updates-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The pre-bundled behaviour: an upgrade installs. Losing that silently would be a
+        // regression for everyone already running this shell.
+        assert_eq!(
+            Config::load(&dir).system_updates,
+            runtime::SystemUpdates::Install
+        );
+        std::fs::write(dir.join("config.json"), "{\"system_updates\": \"notify\"}").unwrap();
+        assert_eq!(
+            Config::load(&dir).system_updates,
+            runtime::SystemUpdates::Notify
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_preference_parses_the_env_spelling() {
+        use runtime::Preference;
+        assert_eq!(Preference::parse("auto"), Some(Preference::Auto));
+        assert_eq!(Preference::parse("Bundled"), Some(Preference::Bundled));
+        assert_eq!(Preference::parse(" system "), Some(Preference::System));
+        assert_eq!(Preference::parse("nonsense"), None);
     }
 
     #[test]
@@ -1156,6 +1917,45 @@ mod tests {
             std::fs::read_to_string(dir.join("config.json")).unwrap(),
             broken
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_workspace_that_is_not_a_usable_directory_is_repaired() {
+        let dir = std::env::temp_dir().join("dsh-desktop-workspace-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A drive-relative workspace (the reported `EISDIR: lstat 'D:'`) falls back to home.
+        std::fs::write(dir.join("config.json"), "{\"workspace\": \"D:\"}").unwrap();
+        let repaired = Config::load(&dir);
+        assert_eq!(repaired.workspace, default_workspace());
+        assert!(repaired.workspace.is_absolute());
+
+        // An unusable dsh_home is dropped, so the Harness uses the default profile.
+        std::fs::write(dir.join("config.json"), "{\"dsh_home\": \"\"}").unwrap();
+        assert_eq!(Config::load(&dir).dsh_home, None);
+
+        // A usable pair survives untouched.
+        let workspace = dir.join("work");
+        let home = dir.join("profiles");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            format!(
+                "{{\"workspace\": {:?}, \"dsh_home\": {:?}}}",
+                workspace.to_string_lossy(),
+                home.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let kept = Config::load(&dir);
+        assert_eq!(kept.workspace, workspace);
+        assert_eq!(kept.dsh_home, Some(home));
+
+        // A relative path is resolved against the app cwd: never handed to the child as-is.
+        assert!(absolute(Path::new("runtime/node")).is_absolute());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

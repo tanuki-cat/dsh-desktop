@@ -6,12 +6,8 @@ node_modules/
 # staged bundled runtime: keep the marker, ignore the payload
 src-tauri/runtime/*
 !src-tauri/runtime/README.md
-src-tauri/gen/
 
-# icon artwork scratch space
-.icon-work/
-
-# bundled-runtime staging: downloaded node tarball, npm/pnpm stores, unpacked payload
+# downloaded node tarball + unpacked staging area
 .runtime-cache/
 
 # python bytecode from the staging helper scripts
@@ -19,3 +15,7 @@ __pycache__/
 
 # gh CLI cache when XDG_CACHE_HOME is redirected into the repo
 .gh-cache/
+src-tauri/gen/
+
+# icon artwork scratch space
+.icon-work/
