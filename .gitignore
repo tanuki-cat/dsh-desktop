@@ -16,3 +16,6 @@ src-tauri/gen/
 
 # python bytecode from the staging helper scripts
 __pycache__/
+
+# gh CLI cache when XDG_CACHE_HOME is redirected into the repo
+.gh-cache/
