@@ -1,0 +1,138 @@
+name: windows-portable
+
+# 手动触发：在 Windows runner 上**原生** stage 运行时，打出免安装的便携包。
+#
+# 为什么必须在 Windows 上 stage：在 macOS 上用 `npm install --os=win32` 装 dsh 时，
+# koffi 的平台包不会被装上（npm 的 --os/--cpu 对全局安装的依赖树不生效），postinstall 会
+# 回退到就地编译并因缺 CMake 失败 —— 实测过。Windows runner 上原生安装才能拿到正确的原生模块。
+on:
+  workflow_dispatch:
+    inputs:
+      dsh_version:
+        description: 随包附带的 dsh 版本
+        required: false
+        default: 0.1.5-rc.2
+      node_version:
+        description: 随包附带的 Node 版本
+        required: false
+        default: 22.23.2
+      attach_to_release:
+        description: 可选：把产物传到已存在的 Release tag（留空则只作为 workflow artifact）
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  portable:
+    name: build windows-x64 portable
+    runs-on: windows-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4      # 版本取自 package.json 的 packageManager
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: windows-portable
+
+      - name: 工具链自检
+        run: |
+          set -euo pipefail
+          rustc --version
+          node --version
+          pnpm --version
+          python --version
+          make --version 2>/dev/null | head -1 || echo "(Windows 上不依赖 make)"
+
+      - name: 读取版本号
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(python -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "打包版本 $version"
+
+      - name: 离线测试门禁
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: 原生 stage Windows 运行时（Node + dsh + pnpm + 插件市场模板）
+        env:
+          DSH_VERSION: ${{ inputs.dsh_version }}
+          NODE_VERSION: ${{ inputs.node_version }}
+          PYTHON: python
+        run: |
+          set -euo pipefail
+          sh scripts/stage-runtime.sh src-tauri/runtime
+
+      - name: 构建可执行文件（不出安装器）
+        run: |
+          set -euo pipefail
+          pnpm tauri build --no-bundle
+
+      - name: 组装免安装目录
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          app="dist/DSH Desktop"
+          rm -rf dist
+          mkdir -p "$app"
+          cp src-tauri/target/release/dsh-desktop.exe "$app/"
+
+          # exe 的导入表里有 WebView2Loader.dll，必须与它同目录
+          dll=$(find "$HOME/.cargo/registry/src" -path "*webview2-com-sys-*/x64/WebView2Loader.dll" 2>/dev/null | head -1)
+          [ -n "$dll" ] || { echo "::error::找不到 WebView2Loader.dll"; exit 1; }
+          cp "$dll" "$app/"
+
+          # 运行时放在 exe 旁边：应用按「同目录 runtime/」发现它（种子解析的第一顺位之一）
+          cp -R src-tauri/runtime "$app/runtime"
+
+          cat > "$app/使用说明.txt" <<TXT
+          DSH Desktop（Windows 免安装版）
+
+          1) 解压后双击 "DSH Desktop\dsh-desktop.exe" 即可，不要单独移动 exe。
+          2) 本包已自带 Node、dsh 与插件市场，目标机器无需安装任何东西。
+          3) 未签名：SmartScreen 提示时选“仍要运行”。
+          4) 需要 WebView2 运行时：Windows 11 自带；Windows 10 可装
+             https://developer.microsoft.com/microsoft-edge/webview2/
+
+          排障：日志在 %APPDATA%\com.deepseek.dsh.desktop\logs\harness.log，
+          里面会写明用的是自带运行时还是系统安装（runtime: node … (bundled) …）。
+          TXT
+
+          7z a -tzip "dist/dsh-desktop_${VERSION}_windows-x64-portable.zip" "dist/DSH Desktop" >/dev/null
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-desktop-windows-x64-portable
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 可选：附加到已有 Release
+        if: inputs.attach_to_release != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.attach_to_release }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/*.zip --clobber

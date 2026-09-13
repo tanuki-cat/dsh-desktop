@@ -335,8 +335,22 @@ fn node_in(runtime: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Relative path of the CLI entry script inside a prefix (`<prefix>/lib/node_modules/...`).
-const DSH_JS_SUFFIX: &str = "lib/node_modules/@deepseek-ai/dsh/lib/bin.js";
+/// Relative paths of the CLI entry script inside a prefix.
+///
+/// npm uses `<prefix>/lib/node_modules` on Unix but `<prefix>/node_modules` on Windows, so a
+/// staged tree from either platform has to be found.
+const DSH_JS_SUFFIXES: [&str; 2] = [
+    "lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
+    "node_modules/@deepseek-ai/dsh/lib/bin.js",
+];
+
+/// The CLI entry script inside an npm prefix, when it is there.
+fn dsh_js_in(prefix: &Path) -> Option<PathBuf> {
+    DSH_JS_SUFFIXES
+        .iter()
+        .map(|suffix| prefix.join(suffix))
+        .find(|candidate| candidate.is_file())
+}
 
 /// Decide which node and which dsh tree to supervise (bundled-runtime plan §2.3/§2.4).
 fn resolve_runtime(
@@ -347,13 +361,12 @@ fn resolve_runtime(
     let seed = seed_root_for(resources);
     let seed_node = seed.as_deref().and_then(node_in);
     let seed_dsh = seed
-        .as_ref()
-        .map(|dir| dir.join("dsh-prefix").join(DSH_JS_SUFFIX));
+        .as_deref()
+        .and_then(|dir| dsh_js_in(&dir.join("dsh-prefix")));
     let seed_dsh = seed_dsh.filter(|path| path.is_file());
     let seed_version = seed_dsh.as_deref().and_then(locator::version_of);
 
-    let shadow_dsh = data_dir.join("runtime").join("prefix").join(DSH_JS_SUFFIX);
-    let shadow_dsh = shadow_dsh.is_file().then_some(shadow_dsh);
+    let shadow_dsh = dsh_js_in(&data_dir.join("runtime").join("prefix"));
     let shadow_version = shadow_dsh.as_deref().and_then(locator::version_of);
 
     // The user's own installation, gated: an x64 node under Rosetta cannot load the bundled
@@ -768,16 +781,14 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     // Bundled runtime: the shipped pnpm (and the writable tools prefix taking precedence) go in
     // front so plugins, MCP servers and agent commands use the same toolchain as the shell (§5).
     if resolved.bundled() {
-        prefix.push(
-            data_dir
-                .join("runtime")
-                .join("tools")
-                .join("bin")
-                .to_string_lossy()
-                .to_string(),
-        );
+        // npm puts shims in `bin/` on Unix and directly in the prefix on Windows; PATH entries
+        // that do not exist are harmless, so both are offered.
+        let tools = data_dir.join("runtime").join("tools");
+        prefix.push(tools.join("bin").to_string_lossy().to_string());
+        prefix.push(tools.to_string_lossy().to_string());
         if let Some(seed) = &resolved.seed {
             prefix.push(seed.join("tools").join("bin").to_string_lossy().to_string());
+            prefix.push(seed.join("tools").to_string_lossy().to_string());
         }
     }
     prefix.push("/opt/homebrew/bin".to_string());
