@@ -252,6 +252,22 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
 `icon.png` 由 `src-tauri/icons/make_icon.py` 自绘生成（矢量路径 + 4× 超采样，非官方素材）。当前**未签名**：
 本机可运行；分发给别人需要 Developer ID 签名 + 公证（`codesign` / `notarytool`）。
 
+## Windows 免安装包（手动触发）
+
+工作流：`.github/workflows/windows-portable.yml` —— 在 Actions 页面 **Run workflow** 手动触发（`workflow_dispatch`），
+在 `windows-latest` 上**原生** stage 运行时，产出 `dsh-desktop_<版本>_windows-x64-portable.zip`：
+内含 `DSH Desktop/dsh-desktop.exe` + `WebView2Loader.dll` + `runtime/`（Node + dsh + pnpm + 插件市场模板 + 许可清单），
+目标机器**无需安装任何东西**。
+
+| 输入 | 默认 | 说明 |
+|---|---|---|
+| `dsh_version` | `0.1.5-rc.2` | 随包附带的 dsh 版本 |
+| `node_version` | `22.23.2` | 随包附带的 Node 版本 |
+| `attach_to_release` | 空 | 填一个已存在的 Release tag 就把 zip 一并传上去；留空只作为 workflow artifact |
+
+**为什么必须在 Windows 上 stage**：在 macOS 上用 `npm install --os=win32 --cpu=x64` 装 dsh 时，koffi 的平台包
+`@koromix/koffi-win32-x64` 不会被装进依赖树（npm 的 `--os/--cpu` 对全局安装的依赖树不生效），于是 postinstall
+回退到就地编译并因缺 CMake 报 `CMake does not seem to be available`（实测）。本地等价脚本：`scripts/stage-runtime.sh`。
 ## 发布（GitHub Actions）
 
 编排文件：`.github/workflows/release.yml`。
