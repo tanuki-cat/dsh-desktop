@@ -61,11 +61,25 @@ pub fn redact(line: &str) -> String {
     }
 }
 
-/// `dsh web: http://127.0.0.1:59753/?token=xxx[ (LAN: http://10.0.0.5:...)]`
+/// Startup URL of the supervised CLI.
+///
+/// Documented shape: `dsh web: http://127.0.0.1:59753/?token=xxx[ (LAN: http://10.0.0.5:...)]`.
+/// The prefix is what upstream prints today, so the parser must not depend on its exact wording:
+/// when it is missing, any token on the line that looks like a loopback startup URL is accepted.
+/// Everything else (scheme, host, the token query) is still validated, and the LAN URL upstream
+/// appends is rejected on purpose because its host is not loopback.
 pub fn parse_dsh_url(line: &str) -> Option<Url> {
-    let rest = line.split_once(URL_PREFIX)?.1;
-    // Take only the first whitespace-delimited token: a LAN suffix may follow.
-    let raw = rest.split_whitespace().next()?;
+    if let Some((_, rest)) = line.split_once(URL_PREFIX) {
+        // Only the first whitespace-delimited token: a LAN suffix may follow.
+        if let Some(url) = rest.split_whitespace().next().and_then(startup_url) {
+            return Some(url);
+        }
+    }
+    line.split_whitespace().find_map(startup_url)
+}
+
+/// A startup URL is loopback http carrying the launch token as a query parameter.
+fn startup_url(raw: &str) -> Option<Url> {
     let url = Url::parse(raw).ok()?;
     if url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && url.query().is_some() {
         Some(url)
@@ -387,6 +401,23 @@ mod tests {
         assert!(parse_dsh_url("dsh web: http://example.com/?token=abc").is_none());
         assert!(parse_dsh_url("dsh web: listening").is_none());
         assert!(parse_dsh_url("hello").is_none());
+        assert!(parse_dsh_url("open http://10.0.0.5:59753/?token=abc").is_none());
+        // No token query: not a startup URL, however loopback it looks.
+        assert!(parse_dsh_url("health http://127.0.0.1:59753/").is_none());
+    }
+
+    /// Upstream may reword or drop the `dsh web:` prefix; the parser must survive it.
+    #[test]
+    fn accepts_a_url_without_the_documented_prefix() {
+        let url = parse_dsh_url("harness listening on http://127.0.0.1:59753/?token=abc").unwrap();
+        assert_eq!(url.port(), Some(59753));
+        // A reworded prefix with a LAN suffix still prefers the loopback URL.
+        let line =
+            "web ui: http://127.0.0.1:3080/?token=abc (LAN: http://10.0.0.5:3080/?token=abc)";
+        assert_eq!(parse_dsh_url(line).unwrap().port(), Some(3080));
+        // And a broken prefixed token must not stop the scan.
+        let mixed = "dsh web: not-a-url | http://127.0.0.1:4123/?token=abc";
+        assert_eq!(parse_dsh_url(mixed).unwrap().port(), Some(4123));
     }
 
     #[test]

@@ -22,6 +22,13 @@ pub const FETCH_TIMEOUT_MS: u32 = 8_000;
 /// A failed query is retried after this many minutes even inside the normal interval.
 pub const FAILED_RETRY_MINUTES: u64 = 5;
 
+/// CLI versions this shell has actually been built and tested against. The shell drives the CLI
+/// through `--profile web --patch … --no-open --port N` and parses its `dsh web:` line, so a
+/// version outside this window may rename a flag or change that line. Saying so at startup beats
+/// failing later with a confusing timeout.
+pub const TESTED_MIN: &str = "0.1.5-rc.1";
+pub const TESTED_MAX_EXCLUSIVE: &str = "0.2.0";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
     pub major: u64,
@@ -103,6 +110,57 @@ pub enum Status {
     UpdateAvailable { from: String, to: String },
     Skipped,
     Failed { reason: String },
+}
+
+/// How the installed CLI relates to the range this shell was tested against.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Compatibility {
+    Tested,
+    Older { version: String },
+    Newer { version: String },
+    Unknown { version: String },
+}
+
+impl Compatibility {
+    /// Human-readable reason, for the log and the status page.
+    pub fn describe(&self) -> String {
+        match self {
+            Compatibility::Tested => format!("dsh {} 已在测试区间内", TESTED_MIN),
+            Compatibility::Older { version } => format!(
+                "dsh {version} 早于本壳测试过的最低版本 {TESTED_MIN}：可能缺少本壳依赖的命令行参数"
+            ),
+            Compatibility::Newer { version } => format!(
+                "dsh {version} 高于本壳测试过的区间（< {TESTED_MAX_EXCLUSIVE}）：上游可能有破坏性变更"
+            ),
+            Compatibility::Unknown { version } => {
+                format!("无法识别 dsh 版本 {version:?}，无法判断是否兼容")
+            }
+        }
+    }
+}
+
+/// Compare an installed CLI version against the tested range. Pure: the caller decides whether
+/// to warn or refuse.
+pub fn compatibility(version: &str) -> Compatibility {
+    let Some(parsed) = Version::parse(version) else {
+        return Compatibility::Unknown {
+            version: version.to_string(),
+        };
+    };
+    // Both constants are literals covered by tests, so parsing cannot fail here.
+    let min = Version::parse(TESTED_MIN).expect("TESTED_MIN must parse");
+    let max = Version::parse(TESTED_MAX_EXCLUSIVE).expect("TESTED_MAX_EXCLUSIVE must parse");
+    if parsed < min {
+        Compatibility::Older {
+            version: version.to_string(),
+        }
+    } else if parsed >= max {
+        Compatibility::Newer {
+            version: version.to_string(),
+        }
+    } else {
+        Compatibility::Tested
+    }
 }
 
 /// Highest version among the given dist-tags, e.g. `["latest", "next"]`.
@@ -542,6 +600,33 @@ mod tests {
         write_cache(&dir, &cache).unwrap();
         assert_eq!(read_cache(&dir), Some(cache));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compatibility_flags_versions_outside_the_tested_range() {
+        assert_eq!(compatibility(TESTED_MIN), Compatibility::Tested);
+        assert_eq!(compatibility("0.1.5-rc.2"), Compatibility::Tested);
+        assert_eq!(compatibility("0.1.9"), Compatibility::Tested);
+        assert!(matches!(
+            compatibility("0.1.4"),
+            Compatibility::Older { .. }
+        ));
+        assert!(matches!(
+            compatibility("0.2.0"),
+            Compatibility::Newer { .. }
+        ));
+        assert!(matches!(
+            compatibility("1.0.0"),
+            Compatibility::Newer { .. }
+        ));
+        assert!(matches!(
+            compatibility("未知"),
+            Compatibility::Unknown { .. }
+        ));
+        // The range must stay a real range, or every version would be "Newer".
+        assert!(
+            Version::parse(TESTED_MIN).unwrap() < Version::parse(TESTED_MAX_EXCLUSIVE).unwrap()
+        );
     }
 
     #[cfg(unix)]

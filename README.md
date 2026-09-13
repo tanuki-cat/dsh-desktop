@@ -42,10 +42,10 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - 退出路径实机复现（2026-09-13，macOS）：⌘Q 等价的 Apple Event 退出后，日志出现
   `stopping Harness pid 92619` / `Harness stopped`，3080 端口释放、`state.json` 删除；
   修复前只处理红点关闭（`ExitRequested`），⌘Q 走的是 `RunEvent::Exit`，清理从未执行。
-- 离线测试：`cargo test` **26 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析、
+- 离线测试：`cargo test` **28 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析、
   6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、缓存落盘往返、
   npm PATH 前缀、沉默对端探针超时、package.json 版本解析、部分/损坏 config.json 处理、
-  进程组终止与僵尸进程识别、下载重名避让）。
+  进程组终止与僵尸进程识别、下载重名避让、URL 解析兜底、CLI 版本区间判定）。
 - 权限：`config.json`（`env` 字段可能放 API Key）与 `state.json` 均为 0600；旧版本留下的 0644 文件会在下次启动时被就地收紧（实机已确认）。
 - 更新链路的失败证据也来自实机日志：修复前每次 GUI 启动都记 `npm view 失败: env: node: No such file or directory`
   （见设计文档 §13.8）。
@@ -105,6 +105,15 @@ Node + dsh 树 + pnpm + 许可文件）、`runtime-clean`（回收约 475 MB sta
 
 运行时（当前版本）需要系统中已有 `dsh` 与 `node`。
 
+### 与 CLI 的兼容边界（已实测）
+
+壳对 `dsh` CLI 有 5 个隐含契约：`--profile web`、`--patch <yaml>`、`--no-open`、`--port N`（顺序固定），
+以及 stdout 里的启动 URL 行。区间外的版本会在启动日志里记一条 warning，状态页显示「未测试版本」；
+把 `require_tested_dsh` 设成 `true` 可改为直接拒绝启动。当前测试区间：`>= 0.1.5-rc.1, < 0.2.0`（常量在 `update.rs`）。
+
+启动 URL 的解析**不依赖**上游那行文案：优先按 `dsh web:` 前缀取第一个 token，前缀不在时就退化为
+「扫描行内第一个 loopback `http://127.0.0.1:…/?token=…`」，scheme/host/token query 仍然强校验。
+
 ## 配置（`config.json`）
 
 首次运行写入应用数据目录，字段与默认值：
@@ -119,6 +128,7 @@ Node + dsh 树 + pnpm + 许可文件）、`runtime-clean`（回收约 475 MB sta
 | `update_tags` | `["latest","next"]` | 取其中最高版本；只跟正式版就写 `["latest"]` |
 | `update_check_interval_minutes` | `60` | 一次成功的查询结果缓存多久（0 = 每次启动都查）。查询实测约 1.2–1.9 s，缓存命中 0 ms |
 | `import_shell_env` | `true` | 启动时导入登录 shell 的环境变量（见下节）。`false` 则只用 App 自身环境 |
+| `require_tested_dsh` | `false` | CLI 版本落在已测试区间外时是否拒绝启动。默认只告警并继续（状态页标注「未测试版本」） |
 | `env` | `{}` | 显式追加/覆盖传给 harness 的环境变量，优先级最高，如 `{"DEEPSEEK_API_KEY": "sk-…"}` |
 
 只要写你想改的字段即可：`port` / `workspace` 缺失会取默认值，其余字段本就有默认值。
@@ -167,6 +177,10 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | 关闭状态页（启动失败时） | 直接退出应用（此时没有 Harness 窗口，不会留下无窗口进程）；应用自己移除该窗口走 `destroy`，不触发这条 |
 | 壳被强杀后再次启动 | 读取 state.json 自愈清理残留进程 |
 
+> 并发边界：壳只保证**自己这个端口**上不会同时跑两个实例（接管 + single-instance 插件）。`dsh_home` 为 `null` 时
+> 共用 `~/.dsh`，你在终端另开一个同 profile 的 `dsh` 仍会与壳并发读写同一份会话存储 —— 需要严格隔离就把 `dsh_home`
+> 指向别的目录（代价是 marketplace 插件、设置与会话不再共享）。
+>
 > 为什么必须接管：启动 URL 里的 launch token 是 `randomBytes(32)` 且只存在于那个进程内存中，外部无法取得；
 > 不重启就永远拿不到会话（无 cookie 访问一定是 401）。
 

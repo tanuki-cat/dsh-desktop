@@ -646,3 +646,42 @@ npm 会把包装到别处：实际运行的仍是旧版，日志却写 `dsh upda
 - 仓库 28 个跟踪文件不含日志、配置或凭证：应用数据目录从未入库。
 
 **验证**：`cargo test` 26 passed、`make clippy` 0 warning；崩溃提示路径的实机证据见 13.10。
+
+### 13.12 第四轮审查：外部评审清单的逐条核实（2026-09-13）
+
+外部给了一份 10 条的 P0–P2 清单（共用 DSH_HOME、退出 force kill、token 被提前访问、管道塞满、
+超时 15s、URL parser 太死、token 明文入日志、Harness 拿到 capability、只处理 on_navigation、
+追随任意 dsh 版本）。逐条对着代码核实：**7 条不存在**、2 条部分存在、1 条真实存在。
+
+| 清单项 | 结论 | 证据 |
+|---|---|---|
+| 共用 DSH_HOME 且同时运行 | 部分存在（有意取舍 + 端口级互斥） | `lib.rs` 默认 `dsh_home: None`（方案 A）；互斥靠固定端口 + 接管 + single-instance；端口之外的并发 CLI 会话拦不住 |
+| 退出直接 `taskkill /T /F` / `Child::kill()` | 不存在（macOS/Linux） | `process.rs`：SIGTERM 进程组 → 100ms 轮询 → 才 SIGKILL；harness 路径无 `Child::kill()` |
+| token URL 被 Rust/health check 提前访问 | 不存在 | `probe()` 只发裸 `GET /`，全部调用点都在 `spawn` 之前；token URL 只交给 WebView |
+| 找到 URL 后停止 drain stdout/stderr | 不存在 | `forward_lines` 从 spawn 起读到 EOF，与是否拿到 URL 无关 |
+| 启动超时太短（15s） | 不存在 | 首启 90 s / 常态 30 s（`lib.rs` 顶部常量） |
+| URL parser 太死 | **部分存在 → 已修** | 原先只认 `URL_PREFIX` 前缀，现已加"扫描行内第一个 loopback 启动 URL"兜底 |
+| token 明文写入日志 | 不存在 | `redact()` 覆盖 Ring 与日志；实测日志为 `token=***` |
+| Harness WebView 获得 capability | 不存在 | `capabilities/splash.json` 只列 `splash`；harness 窗口零 capability，`withGlobalTauri: false` |
+| 只处理 on_navigation | 不存在 | `window.rs` 同时有 `on_new_window` → 外链 + `NewWindowResponse::Deny` |
+| 追随系统安装的任意 dsh 版本 | **存在 → 已修** | 原先只有"失败可见"，现加版本区间判定与可选的拒绝启动 |
+
+**修复 1：启动 URL 解析的兜底**（`harness.rs`）
+
+- 新增 `startup_url()`（scheme/host/token query 三重校验）与"前缀缺失时扫描行内 token"的路径；
+- LAN 后缀仍被天然拒绝（host 非 loopback）；无 token 的裸 `http://127.0.0.1:PORT/` 不会被误认；
+- 新增 2 个单测：`accepts_a_url_without_the_documented_prefix`（改写前缀、坏前缀 + 正常 URL 混排）与
+  既有拒绝用例的扩展（LAN host、无 token 的 health URL）。
+
+**修复 2：CLI 版本区间判定**（`update.rs` + `lib.rs`）
+
+- 壳对 CLI 有 5 个隐含契约：`--profile web`、`--patch`、`--no-open`、`--port N`（顺序固定）与启动 URL 行；
+- 新增常量 `TESTED_MIN` / `TESTED_MAX_EXCLUSIVE` 与纯函数 `compatibility()`，
+  返回 Tested / Older / Newer / Unknown，并给出可读原因；
+- 启动时（更新检查之后，因为更新可能把版本带进区间）判定：区间外记 warning、状态页显示「未测试版本」；
+- 新增配置 `require_tested_dsh`（默认 false）：开启后区间外直接拒绝启动并给出改法。
+
+**未改的一处，改为文档说明**：共用 `~/.dsh` 时的并发边界 —— 壳只保证自己端口上没有第二个实例，
+终端里另跑同 profile 的 `dsh` 仍会并发写会话存储。README 的「行为」节已写明该边界与 `dsh_home` 隔离选项。
+
+验证：`cargo test` **28 passed**（新增版本区间判定与 URL 兜底两组用例）、`make clippy` 0 warning。

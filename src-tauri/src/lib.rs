@@ -52,6 +52,10 @@ pub struct Config {
     /// Explicit child-environment entries, applied after the shell import.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Refuse to start a CLI outside the range this shell was tested against, instead of
+    /// running it and failing in a confusing way. Off by default: we warn and continue.
+    #[serde(default)]
+    pub require_tested_dsh: bool,
 }
 
 fn default_port() -> u16 {
@@ -110,6 +114,7 @@ impl Config {
             update_check_interval_minutes: default_update_interval(),
             import_shell_env: true,
             env: BTreeMap::new(),
+            require_tested_dsh: false,
         };
         let _ = std::fs::create_dir_all(data_dir);
         if !path.exists() {
@@ -344,6 +349,21 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         }
     }
 
+    // 3b2) The shell drives the CLI through `--profile web --patch … --no-open --port N` and reads
+    //      its startup line. Versions outside the range we test against may change either, so say so
+    //      now instead of failing later with a timeout that hides the real reason.
+    let compatibility = update::compatibility(&version);
+    let untested = !matches!(compatibility, update::Compatibility::Tested);
+    if untested {
+        harness::app_log(&format!("warning: {}", compatibility.describe()));
+        if config.require_tested_dsh {
+            return Err(format!(
+                "{}\n\n如需强行使用，请在 config.json 里设置 \"require_tested_dsh\": false。",
+                compatibility.describe()
+            ));
+        }
+    }
+
     // 3c) Detection. Runs after the update so a freshly installed CLI is what we boot. The startup URL carries a per-process token that no other process can
     //     recover, so a foreign instance can never hand us a session.
     match harness::probe(port) {
@@ -476,7 +496,14 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     window::set_status(
         app,
         "正在启动 Harness…",
-        &format!("dsh {version} · 端口 {port}"),
+        &format!(
+            "dsh {version}{} · 端口 {port}",
+            if untested {
+                "（未测试版本）"
+            } else {
+                ""
+            }
+        ),
     );
     let spawned = harness::spawn(&location, &options).map_err(|e| format!("启动进程失败: {e}"))?;
     let pid = spawned.child.id();
