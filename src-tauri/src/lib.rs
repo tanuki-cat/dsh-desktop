@@ -323,11 +323,15 @@ fn seed_root_for(resources: Option<&Path>) -> Option<PathBuf> {
     candidates.into_iter().find(|dir| node_in(dir).is_some())
 }
 
-/// The node binary of a runtime directory (Windows spells it `.exe`).
+/// The node binary of a runtime directory.
+///
+/// Two layouts exist: the Unix tarballs put it in `bin/`, while the Windows distribution is
+/// flat (`node.exe` next to `node_modules/npm`), so both are accepted.
 fn node_in(runtime: &Path) -> Option<PathBuf> {
-    ["node", "node.exe"]
+    let node = runtime.join("node");
+    ["bin/node", "node", "bin/node.exe", "node.exe"]
         .iter()
-        .map(|name| runtime.join("node").join("bin").join(name))
+        .map(|relative| node.join(relative))
         .find(|candidate| candidate.is_file())
 }
 
