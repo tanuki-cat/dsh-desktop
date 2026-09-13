@@ -47,7 +47,11 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - 退出路径实机复现（2026-09-13，macOS）：⌘Q 等价的 Apple Event 退出后，日志出现
   `stopping Harness pid 92619` / `Harness stopped`，3080 端口释放、`state.json` 删除；
   修复前只处理红点关闭（`ExitRequested`），⌘Q 走的是 `RunEvent::Exit`，清理从未执行。
-- 离线测试：`cargo test` **49 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
+- 插件市场自动更新实机验证（2026-09-13，macOS，构建的 `.app`）：启动后日志依次出现
+  `plugin update available: dshmarket 1.45.1 -> 1.46.1, installing`、`plugin updated: dshmarket 1.45.1 -> 1.46.1`，
+  随后 harness 重启并正常服务；profile 的依赖范围被改写为 `^1.46.1`、`node_modules` 内实装 1.46.1，
+  且 `plugin-check.json` 与核心的 `update-check.json` 各自独立（时间戳与内容互不影响）。
+- 离线测试：`cargo test` **71 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
   缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口与跨窗口都不重复安装"、npm PATH 前缀、沉默对端探针超时、
   package.json 版本解析、部分/损坏 config.json 处理、workspace / dsh_path 回退不改文件、HOME 缺失不回落 `/`、
@@ -55,7 +59,9 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
   "Keep ⇒ 进程组终止"的组合断言、孤儿残留的 `ps` 判定与父进程分类（launchd / `systemd --user` / 父进程已消失 / 活着的会话）、
   更新前停止模式、
   日志运行中轮转与备份份数、日志句柄共享、计数器不提前轮转、spawn 路径校验点名、
-  下载重名避让、URL 解析兜底、CLI 版本区间判定）。
+  下载重名避让、URL 解析兜底、CLI 版本区间判定；合并自带运行时后另有：运行时决策矩阵与能力门槛、
+  影子前缀与版本仲裁、`Origin::Env` 不算自带、播种与首启超时、更新后切树回读、
+  插件市场 profile 判定与插件缓存隔离）。
 - 权限：`config.json`（`env` 字段可能放 API Key）与 `state.json` 均为 0600；旧版本留下的 0644 文件会在下次启动时被就地收紧（实机已确认）。
 - 更新链路的失败证据也来自实机日志：修复前每次 GUI 启动都记 `npm view 失败: env: node: No such file or directory`
   （见设计文档 §13.8）。
@@ -70,9 +76,9 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 `process.rs` 的存活探测用的是 `OpenProcess` + `GetExitCodeProcess`。本机可用
 `cargo clippy --target x86_64-pc-windows-gnu` 对 `cfg(windows)` 代码做回归（只检查类型与 lint，不能运行 PE）。
 
-**未做**：签名与公证（对外分发必需）、多 workspace 切换 UI；
-**自带运行时（打包 Node/dsh）已在 `feat/bundled-runtime` 分支实现**（macOS `.app` 实测可跑、
-Windows 免安装包实机验证通过），`main` 上未实施，见下方"后续实施计划"。
+**未做**：签名与公证（对外分发必需）、多 workspace 切换 UI、"回退 + last-known-good"（方案 §2.3 规则 2）。
+**自带运行时（打包 Node/dsh）**已随 `feat/bundled-runtime` 并入 `main`（2026-09-13）：macOS `.app`
+本机实测可跑、Windows 免安装包实机验证通过，见下方[自带运行时](#自带运行时进行中)一节。
 
 ## 构建（Makefile，支持 macOS 与 Linux）
 
@@ -122,7 +128,10 @@ Windows 免安装包实机验证通过），`main` 上未实施，见下方"后�
 - profile 模板由真 pnpm 生成（含插件市场 dshmarket，见方案 §2.5）；
 - 实测：`env -i PATH=/usr/bin:/bin` 下自带 node 跑自带 dsh → `0.1.5-rc.2`；
   全新 DSH_HOME + 模板播种 → `dsh web` **6 秒**出 URL、stderr 干净、`.dsh-market` 出现；
-- 实测：`make bundle-bundled` 产出 598 MB 的 `.app`，包内 node 可直接执行、31,090 个文件。
+- 实测：`make bundle-bundled` 产出 598 MB 的 `.app`，包内 node 可直接执行、31,090 个文件；
+  macOS 上还会用 `--config` 把 `minimumSystemVersion` 覆盖为 11.0（随包 node 是 `minos 11.0`）；
+- 模板随包钉住打包时的 `DSHMARKET_VERSION`（当前 1.46.1）：新机器首启播种该版本，之后由
+  插件市场自动更新跟到 registry 最新。
 
 **运行时解析已接进启动流程**（`src-tauri/src/runtime.rs` + `lib.rs::resolve_runtime`）：
 

@@ -184,7 +184,7 @@ distclean: clean
 NODE_VERSION      ?= 22.23.2
 DSH_VERSION       ?= 0.1.5-rc.2
 PNPM_VERSION      ?= 12.3.4
-DSHMARKET_VERSION ?= 1.45.1
+DSHMARKET_VERSION ?= 1.46.1
 RUNTIME_DIR       := $(TAURI_DIR)/runtime
 RUNTIME_CACHE     := .runtime-cache
 NODE_ARCH         := $(shell uname -m | sed -e s/arm64/arm64/ -e s/aarch64/arm64/ -e s/x86_64/x64/)
