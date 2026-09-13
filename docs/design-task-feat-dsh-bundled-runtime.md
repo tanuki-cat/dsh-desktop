@@ -704,9 +704,16 @@ make runtime-clean                              # 回收
 
 ### 20.6 Windows 免安装包（2026-09-13，第三次推进）
 
-`.github/workflows/windows-portable.yml`（`workflow_dispatch`）在 `windows-latest` 上原生 staging 并打包，
-输入 `dsh_version` / `node_version` / `build_ref`（默认 `feat/bundled-runtime`）/ `attach_to_release`。
-产物 `dsh-desktop-windows-x64-portable`（zip 182–326 MB，约 3.3 万个文件，包内最长路径 205–223 字符）。
+`.github/workflows/windows-portable.yml` 在 `windows-latest` 上原生 staging 并打包，输入
+`dsh_version` / `node_version` / `build_ref`（默认 `feat/bundled-runtime`）/ `attach_to_release`。
+产物 `dsh-desktop-windows-x64-portable`（zip 182–326 MB，约 3.3 万个文件，包内最长路径 205–223 字符），
+另附 `SHA256SUMS-windows-x64`（release 任务会与 macOS/Linux 的合并成一份 `SHA256SUMS`）。
+
+触发方式有两种，共用同一份实现（`workflow_call` + `workflow_dispatch`）：手动出包，或由 tag 触发的
+`release.yml` 调用——后者新增 `windows-portable` 任务（`uses: ./.github/workflows/windows-portable.yml`，
+`build_ref` 传 tag，`needs: [preflight, build, windows-portable]`），Windows 产物与 macOS/Linux 一起发布。
+`release.yml` 此前只存在于 main（含 macos-x64 交叉编译与 release 任务的 checkout 修复），本次一并取回分支，
+因此 **分支上打 tag 即可发布全套产物**；main 上的 release.yml 要等分支合并后才带 Windows 任务。
 
 **实机验证通过（2026-09-13，run 34752267176 的产物）**：Windows 11 上解压到 `D:\dsh` 后双击即可启动，
 自带 node 22.23.2 + dsh 0.1.5-rc.2 正常拉起 Web GUI，首启播种的插件市场可用，会话内 `glob` / `write` /

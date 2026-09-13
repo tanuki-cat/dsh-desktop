@@ -55,13 +55,14 @@ jobs:
           - os: macos-14          # Apple Silicon
             suffix: macos-arm64
             bundles: app
+            target: ""
             timeout: 60
-          # Intel 构建：macos-13 是最后一个 x64 托管镜像；若它下线，改为
-          #   os: macos-14 + 在打包前加 rustup target add x86_64-apple-darwin
-          #   并给 tauri build 传 --target x86_64-apple-darwin
-          - os: macos-13          # Intel
+          # Intel 包在 arm64 runner 上交叉编译：macos-13（最后一个 x64 镜像）排队时间不可控，
+          # 实测曾把整个 run 卡在 queued，导致 release job 永不执行。
+          - os: macos-14
             suffix: macos-x64
             bundles: app
+            target: x86_64-apple-darwin
             timeout: 60
           - os: ubuntu-22.04
             suffix: linux-x64
@@ -110,21 +111,27 @@ jobs:
           make clippy
           make test
 
+      - name: 交叉编译所需的 Rust target
+        if: matrix.target != ''
+        run: rustup target add ${{ matrix.target }}
+
       - name: 打包
         env:
           BUNDLE_TARGETS: ${{ matrix.bundles }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          make bundle BUNDLE_TARGETS="$BUNDLE_TARGETS"
+          make bundle BUNDLE_TARGETS="$BUNDLE_TARGETS" TARGET="$TARGET"
 
       - name: 整理 macOS 产物
         if: runner.os == 'macOS'
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
           SUFFIX: ${{ matrix.suffix }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          app="src-tauri/target/release/bundle/macos/DSH Desktop.app"
+          app="src-tauri/target/${TARGET:+$TARGET/}release/bundle/macos/DSH Desktop.app"
           [ -d "$app" ] || { echo "::error::找不到 $app"; exit 1; }
           mkdir -p dist
           out="dist/dsh-desktop_${VERSION}_${SUFFIX}.app.zip"
@@ -136,11 +143,12 @@ jobs:
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
           SUFFIX: ${{ matrix.suffix }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           mkdir -p dist
           shopt -s nullglob
-          debs=(src-tauri/target/release/bundle/deb/*.deb)
+          debs=(src-tauri/target/${TARGET:+$TARGET/}release/bundle/deb/*.deb)
           [ ${#debs[@]} -gt 0 ] || { echo "::error::没有产出 .deb"; exit 1; }
           for deb in "${debs[@]}"; do
             cp "$deb" "dist/dsh-desktop_${VERSION}_${SUFFIX}.deb"
@@ -154,12 +162,25 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # Windows 免安装包复用 windows-portable.yml 的实现：staging 与打包只有一份脚本，
+  # 手动出包和打 tag 发布不会各修一遍。产物交给下面的 release 任务统一发布，
+  # 所以这里不传 attach_to_release。
+  windows-portable:
+    name: build windows-x64
+    needs: preflight
+    uses: ./.github/workflows/windows-portable.yml
+    with:
+      build_ref: ${{ github.ref_name }}
+
   release:
     name: publish release
-    needs: [preflight, build]
+    needs: [preflight, build, windows-portable]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-22.04
     steps:
+      # gh release 需要 git 仓库上下文（否则报 fatal: not a git repository）
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -185,7 +206,8 @@ jobs:
           cat > notes.md <<'MD'
           ## DSH Desktop v__VERSION__
 
-          下载对应平台的产物即可。**当前版本需要机器已安装 node 与 dsh** —— 自带运行时的发行版仍在实施中，见 README 的"后续实施计划"。
+          Windows 免安装包**自带 node 与 dsh**，解压即用；macOS 与 Linux 产物**仍需要机器上已安装
+          node 与 dsh** —— 自带运行时的 macOS/Linux 发行版仍在实施中，见 README 的"后续实施计划"。
 
           | 平台 | 产物 |
           |---|---|
@@ -193,6 +215,7 @@ jobs:
           | macOS x64 | dsh-desktop___VERSION___macos-x64.app.zip |
           | Linux x64 | dsh-desktop___VERSION___linux-x64.deb |
           | Linux arm64 | dsh-desktop___VERSION___linux-arm64.deb |
+          | Windows x64 | dsh-desktop___VERSION___windows-x64-portable.zip（免安装，自带运行时）|
 
           > ⚠️ 这些构建**未签名也未公证**：macOS 首次打开请右键 →「打开」，或执行
           > xattr -dr com.apple.quarantine "/Applications/DSH Desktop.app"。Linux 上 WebKitGTK 仍来自系统。
@@ -200,7 +223,9 @@ jobs:
           校验：shasum -a 256 -c SHA256SUMS（Linux 用 sha256sum -c SHA256SUMS）。
 
           安装：macOS 解压后把 DSH Desktop.app 拖进「应用程序」；
-          Linux sudo apt install ./dsh-desktop___VERSION___linux-x64.deb。
+          Linux sudo apt install ./dsh-desktop___VERSION___linux-x64.deb；
+          Windows 解压到短路径（如 D:\dsh）后双击 DSH Desktop\dsh-desktop.exe —— 包内依赖树最深
+          约 223 字符，路径太长时资源管理器会报 0x80010135，可改用同名的 .exe 自解压包或 tar -xf。
           MD
           sed -i.bak "s|__VERSION__|${VERSION}|g" notes.md && rm -f notes.md.bak   # GNU/BSD sed 都可用
           head -5 notes.md
