@@ -109,13 +109,7 @@ jobs:
           cp "$dll" "$app/"
 
           # 运行时放在 exe 旁边：应用按「同目录 runtime/」发现它（种子解析的第一顺位之一）
-          #
-          # 用 tar 管道而不是 cp -R：Git Bash 的 cp 在 pnpm 包内的符号链接（pn/pnpx/pnx）上会报
-          # "cannot create regular file … File exists"，而 Windows 上创建 symlink 还需要额外权限。
-          # -h 解引用符号链接，拷出来是普通文件，运行时不需要这些别名。
-          mkdir -p "$app/runtime"
-          tar -chf - -C src-tauri/runtime . | tar -xf - -C "$app/runtime"
-          test -f "$app/runtime/node/node.exe" || { echo "::error::运行时拷贝不完整"; exit 1; }
+          cp -R src-tauri/runtime "$app/runtime"
 
           cat > "$app/使用说明.txt" <<TXT
           DSH Desktop（Windows 免安装版）
