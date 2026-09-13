@@ -29,7 +29,7 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
   与 ⌘Q / Dock 退出（`RunEvent::Exit`）两条事件链都处理；复用的上次实例也登记，退出时一并停掉
 - 启动失败即收尾：等待 URL 超时或窗口创建失败时，先停掉刚起的进程再报错，不留"假失败 + 端口被占"
 - 看护线程：启动成功后继续 `wait` 子进程，Harness 意外退出会清掉 state.json、销毁已无意义的 Harness 窗口并弹回状态页报错（应用不静默变死页面）；状态页是终点，关闭它即退出应用
-- 残留自愈：只有强杀/崩溃这类拿不到回调的场景才靠下次启动清理；state.json 0600。记录的 pid 仍监听记录的端口时才发信号；仍服务**本次端口**的记录会保留，让启动流程直接复用而不是重启；pid 已不拥有该端口时，只有 reparent 到 init 且命令行含 `--profile web`/`dsh` 的残留才会被清理（pid 复用不误杀）
+- 残留自愈：只有强杀/崩溃这类拿不到回调的场景才靠下次启动清理；state.json 0600。记录的 pid 仍监听记录的端口时才发信号；仍服务**本次端口**的记录会保留，让启动流程直接复用而不是重启；pid 已不拥有该端口时，只有"命令行含 `--profile web`/`dsh`，且父进程已消失或由 launchd / `systemd --user` 接管"的残留才会被清理（pid 复用、以及别人正在跑的会话都不动）
 - 安全：Harness 窗口零 capability、导航限定当次 authority、外链与 `window.open` 只把 `http`/`https` 交系统浏览器（`file:`、自定义 scheme 记 `external scheme blocked` 后丢弃）
 - 下载：`on_download` 落盘到 `~/Downloads`，同名文件自动加 `-1`/`-2` 后缀（不静默覆盖）；
   附件上传由 wry 的 `runOpenPanel` 原生处理
@@ -47,12 +47,13 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - 退出路径实机复现（2026-09-13，macOS）：⌘Q 等价的 Apple Event 退出后，日志出现
   `stopping Harness pid 92619` / `Harness stopped`，3080 端口释放、`state.json` 删除；
   修复前只处理红点关闭（`ExitRequested`），⌘Q 走的是 `RunEvent::Exit`，清理从未执行。
-- 离线测试：`cargo test` **47 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
+- 离线测试：`cargo test` **49 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
   缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口与跨窗口都不重复安装"、npm PATH 前缀、沉默对端探针超时、
   package.json 版本解析、部分/损坏 config.json 处理、workspace / dsh_path 回退不改文件、HOME 缺失不回落 `/`、
   进程组终止与僵尸进程识别、外链 scheme 白名单、页面加载重试判定矩阵、自愈三分支与
-  "Keep ⇒ 进程组终止"的组合断言、孤儿残留的 `ps` 判定、更新前停止模式、
+  "Keep ⇒ 进程组终止"的组合断言、孤儿残留的 `ps` 判定与父进程分类（launchd / `systemd --user` / 父进程已消失 / 活着的会话）、
+  更新前停止模式、
   日志运行中轮转与备份份数、日志句柄共享、计数器不提前轮转、spawn 路径校验点名、
   下载重名避让、URL 解析兜底、CLI 版本区间判定）。
 - 权限：`config.json`（`env` 字段可能放 API Key）与 `state.json` 均为 0600；旧版本留下的 0644 文件会在下次启动时被就地收紧（实机已确认）。
@@ -83,7 +84,7 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 | `make doctor` | 检查工具链与平台依赖 | Linux 用 `pkg-config` 查 `webkit2gtk-4.1` / `gtk+-3.0` / `libsoup-3.0` 并给出 Debian/Fedora/Arch 安装命令；macOS 提示装 Xcode CLT |
 | `make check` | `cargo check --all-targets` | 与 CI 口径一致 |
 | `make fmt` / `make fmt-check` / `make clippy` | 格式化 / 只检查格式（CI 门禁用，不改工作区）/ lint（`clippy -D warnings`） | |
-| `make test` | 离线单元测试（当前 **47** 个） | 不联网 |
+| `make test` | 离线单元测试（当前 **49** 个） | 不联网 |
 | `make test-live` | 联网集成测试（全部） | 自动设 `DSH_DESKTOP_LIVE_TESTS=1`：查真实 registry、对比冷/热缓存耗时，并在「PATH 里没有 node」的模拟 GUI 环境下验证 npm 仍可运行 |
 | `make dev` | 运行 debug 版 | 等价 `cargo run --manifest-path src-tauri/Cargo.toml` |
 | `make build` | 编译 release 可执行文件 | 产物 `src-tauri/target/release/dsh-desktop` |
@@ -196,6 +197,10 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 > 共用 `~/.dsh`，你在终端另开一个同 profile 的 `dsh` 仍会与壳并发读写同一份会话存储 —— 需要严格隔离就把 `dsh_home`
 > 指向别的目录（代价是 marketplace 插件、设置与会话不再共享）。
 >
+> 复用依赖 WebView 数据目录里那张 30 天有效的 cookie。清过应用数据、或距上次成功登录超过 30 天时，
+> 复用的窗口会直接显示 `dsh web authentication required`；此时**退出应用再启动**即可（退出会停掉残留实例并清掉
+> state.json，下次启动拿的是新的 token URL）。
+>
 > 为什么必须接管：启动 URL 里的 launch token 是 `randomBytes(32)` 且只存在于那个进程内存中，外部无法取得；
 > 不重启就永远拿不到会话（无 cookie 访问一定是 401）。
 
@@ -219,7 +224,10 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 7. 刚更新过 → 强制重启实例（否则复用旧进程仍跑旧二进制）。
 
 结果写入日志：`dsh is up to date` / `update available: A -> B` / `dsh updated: A -> B` / `update failed, keeping vA` /
-`update A was already attempted in this window and changed nothing; not installing again`。
+`update A was already attempted and changed nothing; not installing again`。
+
+**排障**：手工修好 npm 全局前缀（或改用别的安装方式）之后，壳在出现更高版本前不会再尝试安装 ——
+日志里那句 `already attempted and changed nothing` 是唯一线索，删掉 `<app-data>/update-check.json` 即可复位。
 
 ## 启动耗时与性能
 

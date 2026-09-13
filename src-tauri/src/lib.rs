@@ -442,12 +442,14 @@ fn self_heal_action(
 ///
 /// Only consulted for a record whose pid no longer owns its port, where the other possible
 /// reading is pid reuse. Two signals make that misread unlikely: the command line carries the
-/// flags this shell passes (`--profile web`, a `dsh` entry point), and the parent is gone — a
-/// leftover of a crashed shell is reparented to init, while a session someone started in a
-/// terminal keeps its shell as parent.
+/// flags this shell passes (`--profile web`, a `dsh` entry point), and nobody owns the process
+/// any more — a leftover of a crashed shell is handed to the session supervisor, while a
+/// session someone still runs (a terminal, or another shell of ours) keeps its parent.
 fn looks_like_our_orphan(pid: u32) -> bool {
+    // `-ww` matters: the flags that identify our spawn sit behind a long node path, and some
+    // `ps` builds truncate the command column to the terminal width without it.
     let output = match std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "ppid=,command="])
+        .args(["-ww", "-p", &pid.to_string(), "-o", "ppid=,command="])
         .output()
     {
         Ok(output) => output,
@@ -458,18 +460,73 @@ fn looks_like_our_orphan(pid: u32) -> bool {
             return false;
         }
     };
-    looks_like_our_harness(&String::from_utf8_lossy(&output.stdout))
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some((ppid, _)) = parse_ps_identity(&text) else {
+        return false;
+    };
+    looks_like_our_harness(&text, classify_parent(ppid))
 }
 
-/// `ps -p <pid> -o ppid=,command=` output -> is this a reparented `dsh web`?
-fn looks_like_our_harness(output: &str) -> bool {
-    let Some(line) = output.lines().find(|line| !line.trim().is_empty()) else {
+/// `ps -p <pid> -o ppid=,command=` output -> (parent pid, command line).
+fn parse_ps_identity(output: &str) -> Option<(u32, String)> {
+    let line = output.lines().find(|line| !line.trim().is_empty())?;
+    let mut fields = line.split_whitespace();
+    let ppid = fields.next()?.parse().ok()?;
+    Some((ppid, fields.collect::<Vec<_>>().join(" ")))
+}
+
+/// Who owns the candidate process now?
+#[derive(Debug, PartialEq, Eq)]
+enum Parent {
+    /// The parent is gone: the ordinary outcome of a shell crash on macOS and Linux alike.
+    Gone,
+    /// A session supervisor adopted it: launchd (pid 1) on macOS, `systemd --user` on most Linux
+    /// desktops. The latter is a child subreaper, so the orphan lands on a pid far from 1 —
+    /// assuming pid 1 here would leave the Linux leftovers uncleaned (review R1).
+    Supervisor,
+    /// A live process that is neither: a shell or another `dsh-desktop`, so somebody still runs
+    /// this session. Never signal it.
+    Live,
+}
+
+/// Classify the candidate's parent.
+///
+/// Anything that cannot be established counts as [`Parent::Live`]: when the answer is unknown,
+/// keeping the process is the safe side.
+fn classify_parent(ppid: u32) -> Parent {
+    if ppid == 0 {
+        // The kernel: no userspace parent is left to own it.
+        return Parent::Gone;
+    }
+    let output = match std::process::Command::new("ps")
+        .args(["-ww", "-p", &ppid.to_string(), "-o", "command="])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return Parent::Live,
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some(command) = text.lines().find(|line| !line.trim().is_empty()) else {
+        return Parent::Gone;
+    };
+    if is_session_supervisor(command) {
+        Parent::Supervisor
+    } else {
+        Parent::Live
+    }
+}
+
+/// Names an orphan is handed to on the platforms this shell builds for.
+fn is_session_supervisor(command: &str) -> bool {
+    command.contains("launchd") || command.contains("systemd") || command.contains("init")
+}
+
+/// Is this candidate the orphaned `dsh web` this shell started?
+fn looks_like_our_harness(output: &str, parent: Parent) -> bool {
+    let Some((_, command)) = parse_ps_identity(output) else {
         return false;
     };
-    let Some((ppid, command)) = line.trim().split_once(char::is_whitespace) else {
-        return false;
-    };
-    ppid.trim() == "1" && command.contains("--profile web") && command.contains("dsh")
+    command.contains("--profile web") && command.contains("dsh") && parent != Parent::Live
 }
 
 fn startup(app: AppHandle) {
@@ -934,24 +991,57 @@ mod tests {
     }
 
     #[test]
-    fn only_a_reparented_dsh_web_looks_like_our_orphan() {
-        // A leftover of a crashed shell: reparented to init and running the flags we pass.
-        assert!(looks_like_our_harness(
-            "    1 /opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --patch /x --no-open --port 3080"
-        ));
-        // The same command with a live parent is somebody else's session.
+    fn only_an_unowned_dsh_web_counts_as_our_leftover() {
+        let line = " 8831 /opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --patch /x --no-open --port 3080";
+        // A crash hands the leftover to launchd on macOS and to `systemd --user` on Linux.
+        assert!(looks_like_our_harness(line, Parent::Gone));
+        assert!(looks_like_our_harness(line, Parent::Supervisor));
+        // Somebody still runs that session (a terminal, or another shell of ours): never signal.
+        assert!(!looks_like_our_harness(line, Parent::Live));
+        // A different program took over the recorded pid.
         assert!(!looks_like_our_harness(
-            " 8831 /opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web"
+            " 8831 /usr/sbin/cupsd -l",
+            Parent::Gone
         ));
-        // Reparented, but a different program: the recorded pid was reused.
-        assert!(!looks_like_our_harness("    1 /usr/sbin/cupsd -l"));
         // A dsh that is not the web profile this shell supervises.
         assert!(!looks_like_our_harness(
-            "    1 node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --version"
+            " 8831 node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --version",
+            Parent::Gone
         ));
         // No such process: `ps` prints nothing.
-        assert!(!looks_like_our_harness(""));
-        assert!(!looks_like_our_harness("\n"));
+        assert!(!looks_like_our_harness("", Parent::Gone));
+        assert!(!looks_like_our_harness("\n", Parent::Gone));
+    }
+
+    #[test]
+    fn ps_rows_keep_the_command_line_intact() {
+        // `ps -o ppid=,command=` pads the numeric column; the command keeps its spaces.
+        assert_eq!(
+            parse_ps_identity(
+                "   45 /Applications/DSH Desktop.app/Contents/MacOS/dsh-desktop --flag\n"
+            ),
+            Some((
+                45,
+                "/Applications/DSH Desktop.app/Contents/MacOS/dsh-desktop --flag".to_string(),
+            ))
+        );
+        assert_eq!(parse_ps_identity("\n"), None);
+    }
+
+    #[test]
+    fn session_supervisors_are_recognized_on_both_platforms() {
+        assert!(is_session_supervisor("/sbin/launchd"));
+        assert!(is_session_supervisor("/usr/lib/systemd/systemd --user"));
+        assert!(is_session_supervisor("/sbin/init"));
+        assert!(!is_session_supervisor("/bin/zsh -l"));
+        assert!(!is_session_supervisor(
+            "/Applications/DSH Desktop.app/Contents/MacOS/dsh-desktop"
+        ));
+        assert!(!is_session_supervisor(
+            "/opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web"
+        ));
+        // No userspace parent left at all: treated as gone without asking `ps`.
+        assert_eq!(classify_parent(0), Parent::Gone);
     }
 
     #[test]
