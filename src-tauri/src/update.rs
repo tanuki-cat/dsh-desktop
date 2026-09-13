@@ -414,6 +414,21 @@ impl Cache {
     }
 }
 
+/// Which "already attempted" marker a fresh registry answer should carry forward.
+///
+/// Without this, a machine whose npm global prefix is not the one this shell runs from would
+/// repeat the whole stop-install-restart dance every time the cache window expires: a new query
+/// used to clear the marker. Only a *different* version reopens that decision; a failed query
+/// learned nothing new, so it carries the marker too.
+pub fn carried_attempt(previous: Option<&Cache>, latest: Option<&str>) -> Option<String> {
+    let tried = previous?.attempted.clone()?;
+    match latest {
+        None => Some(tried),
+        Some(latest) if latest == tried => Some(tried),
+        Some(_) => None,
+    }
+}
+
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -456,7 +471,8 @@ pub fn check_cached(
     interval_minutes: u64,
 ) -> Checked {
     let now = now_secs();
-    if let Some(cache) = read_cache(data_dir) {
+    let previous = read_cache(data_dir);
+    if let Some(cache) = previous.as_ref() {
         if cache.is_fresh(now, current, interval_minutes) {
             let status = match cache.latest.as_deref() {
                 Some(latest) => judge(latest, current),
@@ -478,20 +494,26 @@ pub fn check_cached(
         Status::UpToDate { version } => Some(version.clone()),
         _ => None,
     };
+    // The window expiring is not news about the CLI: keep the marker while the answer is still
+    // the version that was already tried, and let only a new version reopen the decision.
+    let attempted = carried_attempt(previous.as_ref(), latest.as_deref());
+    let suppress = matches!(
+        &status,
+        Status::UpdateAvailable { to, .. } if attempted.as_deref() == Some(to.as_str())
+    );
     let _ = write_cache(
         data_dir,
         &Cache {
             checked_at: now,
             installed: current.to_string(),
             latest,
-            // A new query opens a new window: the previous attempt no longer suppresses it.
-            attempted: None,
+            attempted,
         },
     );
     Checked {
         status,
         cached: false,
-        attempted: false,
+        attempted: suppress,
     }
 }
 
@@ -716,6 +738,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The window expiring must not reopen an install that already proved useless: only a
+    /// different registry answer does.
+    #[test]
+    fn carried_attempt_follows_the_registry_answer() {
+        let cache = |attempted: Option<&str>, latest: Option<&str>| Cache {
+            checked_at: 42,
+            installed: "0.1.5-rc.1".into(),
+            latest: latest.map(str::to_string),
+            attempted: attempted.map(str::to_string),
+        };
+        // Same answer as the one already tried: keep suppressing.
+        assert_eq!(
+            carried_attempt(
+                Some(&cache(Some("0.1.5-rc.2"), Some("0.1.5-rc.2"))),
+                Some("0.1.5-rc.2")
+            ),
+            Some("0.1.5-rc.2".to_string())
+        );
+        // The query failed: nothing new was learned, keep it too.
+        assert_eq!(
+            carried_attempt(Some(&cache(Some("0.1.5-rc.2"), None)), None),
+            Some("0.1.5-rc.2".to_string())
+        );
+        // A genuinely new version reopens the decision.
+        assert_eq!(
+            carried_attempt(
+                Some(&cache(Some("0.1.5-rc.2"), Some("0.1.5-rc.2"))),
+                Some("0.1.5-rc.3")
+            ),
+            None
+        );
+        // Nothing was ever attempted, or there is no previous entry.
+        assert_eq!(carried_attempt(None, Some("0.1.5-rc.2")), None);
+        assert_eq!(
+            carried_attempt(Some(&cache(None, Some("0.1.5-rc.2"))), Some("0.1.5-rc.2")),
+            None
+        );
+    }
+
+    /// End to end through `check_cached`: an expired window on a machine whose npm writes the
+    /// package elsewhere used to reinstall every hour.
+    #[cfg(unix)]
+    #[test]
+    fn an_expired_window_does_not_reopen_an_ineffective_install() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join("dsh-desktop-update-window-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A stand-in for npm: `npm view <pkg> dist-tags --json` prints the file below verbatim.
+        let tags = dir.join("dist-tags.json");
+        let npm = dir.join("npm");
+        std::fs::write(&npm, format!("#!/bin/sh\ncat {}\n", tags.display())).unwrap();
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let window_ago = now_secs() - 2 * 60 * 60;
+        let seed = |latest: &str| Cache {
+            checked_at: window_ago,
+            installed: "0.1.5-rc.1".into(),
+            latest: Some(latest.into()),
+            attempted: Some("0.1.5-rc.2".into()),
+        };
+        std::fs::write(&tags, r#"{"latest":"0.1.5-rc.2"}"#).unwrap();
+        write_cache(&dir, &seed("0.1.5-rc.2")).unwrap();
+
+        let wanted = vec!["latest".to_string()];
+        let checked = check_cached(&npm, PACKAGE, &wanted, "0.1.5-rc.1", &dir, 60);
+        assert!(
+            !checked.cached,
+            "the window is over, so the registry is queried"
+        );
+        assert!(checked.attempted, "the same answer must not install again");
+        assert_eq!(
+            read_cache(&dir).unwrap().attempted.as_deref(),
+            Some("0.1.5-rc.2"),
+            "the marker survives the new query"
+        );
+
+        // A new version reopens the decision.
+        std::fs::write(&tags, r#"{"latest":"0.1.5-rc.3"}"#).unwrap();
+        write_cache(&dir, &seed("0.1.5-rc.2")).unwrap();
+        let checked = check_cached(&npm, PACKAGE, &wanted, "0.1.5-rc.1", &dir, 60);
+        assert!(!checked.attempted, "a new version is a new decision");
+        assert_eq!(read_cache(&dir).unwrap().attempted, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn compatibility_flags_versions_outside_the_tested_range() {
         assert_eq!(compatibility(TESTED_MIN), Compatibility::Tested);

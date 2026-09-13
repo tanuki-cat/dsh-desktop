@@ -34,9 +34,26 @@ pub fn create_splash(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Set by the first terminal failure page. A second one (the load watcher giving up after the
+/// watchdog already reported the exit) must not replace the explanation the user is reading.
+static FAILURE_SHOWN: AtomicBool = AtomicBool::new(false);
+
 /// Put a status page in front of the user for something they must see, such as a Harness that
 /// died after a successful start. Rebuilds the splash when it was already closed.
 pub fn show_failure(app: &AppHandle, status: &str, detail: &str) {
+    if FAILURE_SHOWN.swap(true, Ordering::SeqCst) {
+        harness::app_log(&format!(
+            "failure page already shown; keeping it instead of: {status}"
+        ));
+        return;
+    }
+    // Every caller reaches this with a Harness window that is dead or unusable, and the status
+    // page tells the user that closing it quits the app. Destroy (not close: that would look
+    // like a user quit) the Harness window so that sentence is true — the splash only exits the
+    // app while no Harness window is left.
+    if let Some(harness_window) = app.get_webview_window(HARNESS) {
+        let _ = harness_window.destroy();
+    }
     if app.get_webview_window(SPLASH).is_none() {
         if let Err(error) = create_splash(app) {
             harness::app_log(&format!("could not reopen the status window: {error}"));
@@ -64,6 +81,17 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 /// Navigations of the same startup URL, including the first one.
 const LOAD_ATTEMPTS: u32 = 3;
 
+/// What the webview reported about the navigations this shell started.
+///
+/// The two events answer different questions, which is why both are tracked: no event at all
+/// means the navigation never began, while a start without a finish means a load is genuinely
+/// running and must not be restarted.
+#[derive(Default)]
+struct LoadSignals {
+    started: AtomicBool,
+    finished: AtomicBool,
+}
+
 /// The Harness page is remote content: it gets no capability, and navigation is fenced
 /// to the current loopback authority. Everything else opens in the system browser.
 pub fn create_harness(app: &AppHandle, url: &Url, port: u16) -> tauri::Result<()> {
@@ -72,10 +100,10 @@ pub fn create_harness(app: &AppHandle, url: &Url, port: u16) -> tauri::Result<()
     if let Some(existing) = app.get_webview_window(HARNESS) {
         let _ = existing.destroy();
     }
-    // Set once the page reports "finished". A failed navigation reports nothing at all, which is
-    // what the retry thread below watches for.
-    let loaded = Arc::new(AtomicBool::new(false));
-    let loaded_flag = loaded.clone();
+    // Set as the page reports its progress. A navigation the webview drops reports nothing at
+    // all, which is what the retry thread below watches for.
+    let signals = Arc::new(LoadSignals::default());
+    let load_signals = signals.clone();
     let window = WebviewWindowBuilder::new(app, HARNESS, WebviewUrl::External(url.clone()))
         .title("DeepSeek Harness")
         .inner_size(1440.0, 960.0)
@@ -96,11 +124,15 @@ pub fn create_harness(app: &AppHandle, url: &Url, port: u16) -> tauri::Result<()
             open_external(target.as_str());
             NewWindowResponse::Deny
         })
-        // The only signal that the first navigation actually rendered. A failed one produces
-        // no event at all, which is what the retry thread below waits to find out.
+        // The only evidence of what the first navigation did. `PageLoadEvent` is
+        // non-exhaustive, so each variant is matched on its own.
         .on_page_load(move |_window, payload| {
-            if matches!(payload.event(), PageLoadEvent::Finished) {
-                loaded_flag.store(true, Ordering::SeqCst);
+            let event = payload.event();
+            if matches!(event, PageLoadEvent::Started) {
+                load_signals.started.store(true, Ordering::SeqCst);
+            }
+            if matches!(event, PageLoadEvent::Finished) {
+                load_signals.finished.store(true, Ordering::SeqCst);
             }
         })
         // Downloads land in the user's Downloads folder instead of vanishing.
@@ -132,7 +164,7 @@ pub fn create_harness(app: &AppHandle, url: &Url, port: u16) -> tauri::Result<()
     let watcher = window.clone();
     let watcher_app = window.app_handle().clone();
     let target = url.clone();
-    std::thread::spawn(move || watch_first_load(watcher_app, watcher, target, port, loaded));
+    std::thread::spawn(move || watch_first_load(watcher_app, watcher, target, port, signals));
 
     // Closing the Harness window quits the app, which stops the supervised process.
     let handle = window.app_handle().clone();
@@ -152,62 +184,73 @@ pub fn create_harness(app: &AppHandle, url: &Url, port: u16) -> tauri::Result<()
 /// What to do after the page missed its load deadline.
 #[derive(Debug, PartialEq, Eq)]
 enum LoadOutcome {
-    /// Stop watching: the window is gone, or the port still serves a Harness and only the
-    /// load event failed to arrive. Retrying a healthy page would restart a load in progress.
+    /// Stop watching: the window is gone, or a load genuinely began (its `Started` arrived), so
+    /// restarting it would interrupt work in progress.
     Settled,
-    /// Navigate to the same URL again.
+    /// The navigation never began: send it again.
     Retry,
-    /// Out of attempts with nothing serving the port: tell the user.
+    /// Attempts ran out with nothing serving the port: tell the user.
     Report,
 }
 
 /// Pure retry policy, kept out of the thread so the matrix is testable.
+///
+/// The discriminator is the `Started` event, not the port: a blank window whose webview never
+/// received the navigation looks exactly like a healthy port from the outside, and that is the
+/// case this watch exists for. A port that still answers is never turned into a failure page —
+/// if an environment delivers no load events at all, the retry must not escalate into an error
+/// over a working app.
 fn load_outcome(
     attempt: u32,
     attempts: u32,
     window_alive: bool,
+    started: bool,
     port_serving: bool,
 ) -> LoadOutcome {
-    if !window_alive || port_serving {
+    if !window_alive || started {
         return LoadOutcome::Settled;
     }
-    if attempt >= attempts {
-        LoadOutcome::Report
+    if attempt < attempts {
+        return LoadOutcome::Retry;
+    }
+    if port_serving {
+        LoadOutcome::Settled
     } else {
-        LoadOutcome::Retry
+        LoadOutcome::Report
     }
 }
 
 /// Wait for the first successful render, re-navigating the startup URL when it never comes.
 ///
-/// Design §4 steps 8/9: a failed load may retry the same token URL. Only the "nothing is serving
-/// the port" case is retried — a live port whose load event is merely late must not have its load
-/// restarted, and a `dsh` that never answers is the transient race this exists for.
+/// Design §4 steps 8/9: a failed load may retry the same token URL. The retry covers the case
+/// where the webview never got as far as starting the navigation; a load that started is left
+/// alone, and a page that never renders while the port is healthy is reported in the log only.
 fn watch_first_load(
     app: AppHandle,
     window: WebviewWindow,
     url: Url,
     port: u16,
-    loaded: Arc<AtomicBool>,
+    signals: Arc<LoadSignals>,
 ) {
     for attempt in 1..=LOAD_ATTEMPTS {
-        if wait_for_load(&loaded, LOAD_TIMEOUT) {
+        if wait_for_load(&signals, LOAD_TIMEOUT) {
             return;
         }
         let window_alive = app.get_webview_window(HARNESS).is_some();
+        let started = signals.started.load(Ordering::SeqCst);
         let serving = port_serving(port);
-        match load_outcome(attempt, LOAD_ATTEMPTS, window_alive, serving) {
+        match load_outcome(attempt, LOAD_ATTEMPTS, window_alive, started, serving) {
             LoadOutcome::Settled => {
                 if window_alive {
                     harness::app_log(&format!(
-                        "page load event did not arrive, but port {port} still serves a Harness; leaving the window alone"
+                        "page load did not finish within {LOAD_TIMEOUT:?} (started={started}, port {port} serving={serving}); leaving the window alone"
                     ));
                 }
                 return;
             }
             LoadOutcome::Retry => {
                 harness::app_log(&format!(
-                    "page did not finish loading, retrying {url} (attempt {}/{LOAD_ATTEMPTS})",
+                    "navigation never started, retrying {url} (attempt {}/{LOAD_ATTEMPTS})",
                     attempt + 1
                 ));
                 if let Err(error) = window.navigate(url.clone()) {
@@ -217,7 +260,7 @@ fn watch_first_load(
             }
             LoadOutcome::Report => {
                 harness::app_log(&format!(
-                    "page never finished loading after {LOAD_ATTEMPTS} attempts: {url}"
+                    "navigation never started and port {port} stopped serving after {LOAD_ATTEMPTS} attempts: {url}"
                 ));
                 show_failure(
                     &app,
@@ -232,17 +275,17 @@ fn watch_first_load(
     }
 }
 
-/// Poll the flag instead of blocking on a channel: the watcher also has to give up when no event
-/// ever arrives, which a blocking receive cannot express.
-fn wait_for_load(loaded: &AtomicBool, timeout: Duration) -> bool {
+/// Poll the finished flag instead of blocking on a channel: the watcher also has to give up when
+/// no event ever arrives, which a blocking receive cannot express.
+fn wait_for_load(signals: &LoadSignals, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if loaded.load(Ordering::SeqCst) {
+        if signals.finished.load(Ordering::SeqCst) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    loaded.load(Ordering::SeqCst)
+    signals.finished.load(Ordering::SeqCst)
 }
 
 /// True while the port answers as a Harness: the launch URL is only worth revisiting while the
@@ -357,17 +400,23 @@ mod tests {
     }
 
     #[test]
-    fn load_retry_stops_on_a_live_port_or_a_closed_window() {
-        // Nothing serving the port and attempts left: navigate again.
-        assert_eq!(load_outcome(1, 3, true, false), LoadOutcome::Retry);
-        assert_eq!(load_outcome(2, 3, true, false), LoadOutcome::Retry);
-        // Out of attempts with the port still dead: report instead of looping forever.
-        assert_eq!(load_outcome(3, 3, true, false), LoadOutcome::Report);
-        // A late load event on a serving port must not restart the load in progress.
-        assert_eq!(load_outcome(1, 3, true, true), LoadOutcome::Settled);
-        assert_eq!(load_outcome(3, 3, true, true), LoadOutcome::Settled);
+    fn load_retry_follows_the_started_event_and_never_fails_a_live_port() {
+        // A navigation that never began is sent again while attempts remain, whether or not the
+        // port answers: the blank-window case usually comes with a healthy port.
+        assert_eq!(load_outcome(1, 3, true, false, true), LoadOutcome::Retry);
+        assert_eq!(load_outcome(2, 3, true, false, false), LoadOutcome::Retry);
+        // A load that started is not interrupted, however long it takes.
+        assert_eq!(load_outcome(1, 3, true, true, true), LoadOutcome::Settled);
+        assert_eq!(load_outcome(3, 3, true, true, false), LoadOutcome::Settled);
+        // Out of attempts: a failure page only when nothing serves the port either. A healthy
+        // port means the load events themselves are missing, which a retry cannot fix.
+        assert_eq!(load_outcome(3, 3, true, false, false), LoadOutcome::Report);
+        assert_eq!(load_outcome(3, 3, true, false, true), LoadOutcome::Settled);
         // The user closed the window: stop watching it.
-        assert_eq!(load_outcome(1, 3, false, false), LoadOutcome::Settled);
+        assert_eq!(
+            load_outcome(1, 3, false, false, false),
+            LoadOutcome::Settled
+        );
     }
 
     #[test]

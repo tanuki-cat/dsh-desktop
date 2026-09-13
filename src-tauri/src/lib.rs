@@ -396,12 +396,80 @@ fn watch_harness(
     );
 }
 
-/// May the pid recorded in `state.json` be signalled during self-heal?
+/// What step 1 does with the record a crashed shell may have left behind.
+#[derive(Debug, PartialEq, Eq)]
+enum SelfHeal {
+    /// The record is stale (the pid is gone, or it belongs to something else now): drop it.
+    Clear,
+    /// The record is ours and still owns its port, but this run will use another one: stop it.
+    Terminate,
+    /// Ours, still serving the port this run will use: keep the file so the detection step can
+    /// reuse the instance instead of restarting it.
+    Keep,
+}
+
+/// Pure decision for step 1, so the three branches are testable without a running process.
 ///
-/// The reuse and takeover branches already cross-check the state file against the pid that
-/// owns the port; self-heal must do the same or it can act on a stale record.
-fn should_self_heal(state: &process::HarnessState, listener: Option<u32>, alive: bool) -> bool {
-    alive && listener == Some(state.pid)
+/// `listener` is the pid that owns `state.port`; `looks_ours` is the secondary identity check
+/// for a record whose pid no longer owns its port (see [`looks_like_our_orphan`]).
+fn self_heal_action(
+    state: &process::HarnessState,
+    listener: Option<u32>,
+    alive: bool,
+    port: u16,
+    looks_ours: bool,
+) -> SelfHeal {
+    if !alive {
+        return SelfHeal::Clear;
+    }
+    if listener != Some(state.pid) {
+        // The pid was reused, or the instance lost its port: only a process that still looks
+        // like our own orphaned CLI may be signalled.
+        return if looks_ours {
+            SelfHeal::Terminate
+        } else {
+            SelfHeal::Clear
+        };
+    }
+    if state.port == port {
+        SelfHeal::Keep
+    } else {
+        SelfHeal::Terminate
+    }
+}
+
+/// Does this pid still look like the `dsh web` this shell started?
+///
+/// Only consulted for a record whose pid no longer owns its port, where the other possible
+/// reading is pid reuse. Two signals make that misread unlikely: the command line carries the
+/// flags this shell passes (`--profile web`, a `dsh` entry point), and the parent is gone — a
+/// leftover of a crashed shell is reparented to init, while a session someone started in a
+/// terminal keeps its shell as parent.
+fn looks_like_our_orphan(pid: u32) -> bool {
+    let output = match std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "ppid=,command="])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            harness::app_log(&format!(
+                "ps 不可用，无法确认残留进程 {pid} 的身份，按无关进程处理: {error}"
+            ));
+            return false;
+        }
+    };
+    looks_like_our_harness(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `ps -p <pid> -o ppid=,command=` output -> is this a reparented `dsh web`?
+fn looks_like_our_harness(output: &str) -> bool {
+    let Some(line) = output.lines().find(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    let Some((ppid, command)) = line.trim().split_once(char::is_whitespace) else {
+        return false;
+    };
+    ppid.trim() == "1" && command.contains("--profile web") && command.contains("dsh")
 }
 
 fn startup(app: AppHandle) {
@@ -420,29 +488,8 @@ fn startup(app: AppHandle) {
 fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     harness::init_app_log(&data_dir.join("logs").join("harness.log"));
 
-    // 1) Self-heal: an instance left behind by a crashed shell is terminated first. The state
-    //    file survives a crash (only a normal exit and the watchdog remove it), so the recorded
-    //    pid is signalled only while it still owns the recorded port — a reboot can hand the
-    //    same low pid to an unrelated process, and `terminate` signals a whole process group.
-    if let Some(state) = process::read_state(data_dir) {
-        let alive = process::is_alive(state.pid);
-        let listener = harness::listener_pid(state.port);
-        if should_self_heal(&state, listener, alive) {
-            window::set_status(
-                app,
-                "正在清理上次残留的 Harness…",
-                &format!("pid {}", state.pid),
-            );
-            process::terminate(state.pid, TERMINATE_GRACE);
-        } else if alive {
-            harness::app_log(&format!(
-                "state.json 记录的 pid {} 仍存活，但没有监听端口 {}（监听者 {:?}），只清理状态文件",
-                state.pid, state.port, listener
-            ));
-        }
-        process::clear_state(data_dir);
-    }
-
+    // The config comes first: step 1 needs the port this run will use to tell a leftover
+    // instance it may hand to the reuse branch from one it must stop.
     let config = Config::load(data_dir);
     let port = config.port;
     harness::app_log(&format!(
@@ -450,6 +497,44 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         data_dir.display(),
         config.workspace.display()
     ));
+
+    // 1) Self-heal: an instance left behind by a crashed shell is dealt with before anything
+    //    else. The state file survives a crash (only a normal exit and the watchdog remove it),
+    //    so the recorded pid is trusted only while it still owns the recorded port — a reboot can
+    //    hand the same low pid to an unrelated process, and `terminate` signals a whole group.
+    //    A record that is still serving the port this run will use is *kept*: the detection step
+    //    below then reuses a live session (its cookie is still valid) instead of restarting it.
+    if let Some(state) = process::read_state(data_dir) {
+        let alive = process::is_alive(state.pid);
+        let listener = harness::listener_pid(state.port);
+        // The `ps` call is only worth making when the record is alive but no longer owns its
+        // port, which is exactly the case where the alternative reading is pid reuse.
+        let looks_ours = alive && listener != Some(state.pid) && looks_like_our_orphan(state.pid);
+        match self_heal_action(&state, listener, alive, port, looks_ours) {
+            SelfHeal::Keep => harness::app_log(&format!(
+                "state.json 记录的 Harness pid {} 仍在端口 {} 服务，交给复用分支处理",
+                state.pid, state.port
+            )),
+            SelfHeal::Terminate => {
+                window::set_status(
+                    app,
+                    "正在清理上次残留的 Harness…",
+                    &format!("pid {}", state.pid),
+                );
+                process::terminate(state.pid, TERMINATE_GRACE);
+                process::clear_state(data_dir);
+            }
+            SelfHeal::Clear => {
+                if alive {
+                    harness::app_log(&format!(
+                        "state.json 记录的 pid {} 仍存活，但不是本应用启动的 Harness（监听端口 {} 的是 {:?}），只清理状态文件",
+                        state.pid, state.port, listener
+                    ));
+                }
+                process::clear_state(data_dir);
+            }
+        }
+    }
 
     // The login-shell capture costs ~160 ms and depends on nothing that follows, so it runs
     // alongside the version lookup and update check and is joined just before the child env
@@ -500,7 +585,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                 match checked.status {
                     update::Status::UpdateAvailable { to, .. } if already_attempted => {
                         harness::app_log(&format!(
-                            "update {to} was already attempted in this window and changed nothing; not installing again"
+                            "update {to} was already attempted and changed nothing; not installing again"
                         ));
                     }
                     update::Status::UpdateAvailable { from, to } => {
@@ -588,38 +673,48 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                 .map(|state| state.pid)
                 .filter(|pid| Some(*pid) == owner && process::is_alive(*pid));
 
-            if let Some(pid) = ours.filter(|_| !just_updated) {
-                // Our own instance from an earlier run: its cookie is still valid for this
-                // authority (verified across restarts), so reuse it as-is. A fresh update
-                // instead restarts it, otherwise the old binary would keep serving.
-                let url = url::Url::parse(&format!("http://127.0.0.1:{port}/"))
-                    .map_err(|e| e.to_string())?;
-                window::set_status(app, "复用本应用上次启动的 Harness…", &format!("pid {pid}"));
-                // Adopted, but still ours: quitting must stop it rather than leave an orphan.
-                adopt(pid, data_dir);
-                return window::create_harness(app, &url, port).map_err(|e| e.to_string());
-            }
+            match ours {
+                // Our own instance from an earlier run, and no update touched its CLI tree: its
+                // cookie is still valid for this authority (verified across restarts), so reuse
+                // it as-is instead of restarting it.
+                Some(pid) if !just_updated => {
+                    let url = url::Url::parse(&format!("http://127.0.0.1:{port}/"))
+                        .map_err(|e| e.to_string())?;
+                    window::set_status(app, "复用本应用上次启动的 Harness…", &format!("pid {pid}"));
+                    // Adopted, but still ours: quitting must stop it rather than leave an orphan.
+                    adopt(pid, data_dir);
+                    return window::create_harness(app, &url, port).map_err(|e| e.to_string());
+                }
+                // Our own instance that a fresh update just made obsolete: it is our child, so
+                // its whole process group goes down together, exactly as at exit.
+                Some(pid) => {
+                    window::set_status(app, "更新完成，正在重启 Harness…", &format!("pid {pid}"));
+                    process::terminate(pid, TERMINATE_GRACE);
+                }
+                None => {
+                    if !config.take_over_existing {
+                        window::open_external(&format!("http://127.0.0.1:{port}/"));
+                        return Err(format!(
+                            "127.0.0.1:{port} 已被另一个 Harness 占用（不是本应用启动的），已改用系统浏览器打开。                     如要让本应用接管，请保持 take_over_existing=true 或先停止该实例。"
+                        ));
+                    }
 
-            if !config.take_over_existing {
-                window::open_external(&format!("http://127.0.0.1:{port}/"));
-                return Err(format!(
-                    "127.0.0.1:{port} 已被另一个 Harness 占用（不是本应用启动的），已改用系统浏览器打开。                     如要让本应用接管，请保持 take_over_existing=true 或先停止该实例。"
-                ));
-            }
-
-            // Foreign instance: stop it (the auth fence already proved it is a Harness),
-            // then start our own so the window receives a fresh authenticated URL.
-            window::set_status(
-                app,
-                "检测到其它 Harness，正在接管…",
-                &format!("127.0.0.1:{port}"),
-            );
-            if let Some(pid) = owner {
-                process::terminate_pid(pid, TERMINATE_GRACE);
-            } else {
-                return Err(format!(
-                    "127.0.0.1:{port} 上已有 Harness，但无法确定它的进程（lsof 不可用）。请先手动停止它。"
-                ));
+                    // Foreign instance: stop it (the auth fence already proved it is a Harness),
+                    // then start our own so the window receives a fresh authenticated URL. Never a
+                    // group signal: its process group belongs to whatever started it.
+                    window::set_status(
+                        app,
+                        "检测到其它 Harness，正在接管…",
+                        &format!("127.0.0.1:{port}"),
+                    );
+                    if let Some(pid) = owner {
+                        process::terminate_pid(pid, TERMINATE_GRACE);
+                    } else {
+                        return Err(format!(
+                            "127.0.0.1:{port} 上已有 Harness，但无法确定它的进程（lsof 不可用）。请先手动停止它。"
+                        ));
+                    }
+                }
             }
             let deadline = std::time::Instant::now() + TERMINATE_GRACE;
             while !matches!(harness::probe(port), harness::Probe::Closed) {
@@ -794,20 +889,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn self_heal_signals_only_the_pid_that_still_owns_the_port() {
+    fn self_heal_keeps_a_record_it_can_reuse_and_clears_a_stale_one() {
         let state = |pid: u32, port: u16| process::HarnessState {
             pid,
             port,
             cwd: "/tmp".into(),
             started_at: 1,
         };
-        // The recorded instance still owns its port: safe to stop.
-        assert!(should_self_heal(&state(4242, 3080), Some(4242), true));
-        // The pid was reused, or another process took the port: clean the file only.
-        assert!(!should_self_heal(&state(4242, 3080), Some(9999), true));
-        assert!(!should_self_heal(&state(4242, 3080), None, true));
+        // Ours, still serving the port this run uses: hand it to the reuse branch.
+        assert_eq!(
+            self_heal_action(&state(4242, 3080), Some(4242), true, 3080, false),
+            SelfHeal::Keep
+        );
+        // Ours, but this run uses another port: stop it and drop the record.
+        assert_eq!(
+            self_heal_action(&state(4242, 3080), Some(4242), true, 4000, false),
+            SelfHeal::Terminate
+        );
+        // The pid no longer owns the port. Only a process that still looks like our own
+        // orphaned CLI may be signalled; anything else is pid reuse and is left alone.
+        assert_eq!(
+            self_heal_action(&state(4242, 3080), Some(9999), true, 3080, true),
+            SelfHeal::Terminate
+        );
+        assert_eq!(
+            self_heal_action(&state(4242, 3080), Some(9999), true, 3080, false),
+            SelfHeal::Clear
+        );
+        assert_eq!(
+            self_heal_action(&state(4242, 3080), None, true, 3080, false),
+            SelfHeal::Clear
+        );
         // Already gone: nothing to signal.
-        assert!(!should_self_heal(&state(4242, 3080), Some(4242), false));
+        assert_eq!(
+            self_heal_action(&state(4242, 3080), Some(4242), false, 3080, false),
+            SelfHeal::Clear
+        );
+
+        // Keep is what makes `ours` non-None later, and that is the only way `stop_mode` can
+        // pick the process-group signal for an instance this shell started.
+        let ours =
+            self_heal_action(&state(4242, 3080), Some(4242), true, 3080, false) == SelfHeal::Keep;
+        assert_eq!(stop_mode(ours), StopMode::ProcessGroup);
+    }
+
+    #[test]
+    fn only_a_reparented_dsh_web_looks_like_our_orphan() {
+        // A leftover of a crashed shell: reparented to init and running the flags we pass.
+        assert!(looks_like_our_harness(
+            "    1 /opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --patch /x --no-open --port 3080"
+        ));
+        // The same command with a live parent is somebody else's session.
+        assert!(!looks_like_our_harness(
+            " 8831 /opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web"
+        ));
+        // Reparented, but a different program: the recorded pid was reused.
+        assert!(!looks_like_our_harness("    1 /usr/sbin/cupsd -l"));
+        // A dsh that is not the web profile this shell supervises.
+        assert!(!looks_like_our_harness(
+            "    1 node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --version"
+        ));
+        // No such process: `ps` prints nothing.
+        assert!(!looks_like_our_harness(""));
+        assert!(!looks_like_our_harness("\n"));
     }
 
     #[test]

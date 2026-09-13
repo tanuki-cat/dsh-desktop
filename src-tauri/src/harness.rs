@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -406,6 +407,11 @@ pub struct Logger {
     /// Bytes allowed before the file rolls over; a field so tests can use a small limit.
     limit: u64,
     file: Arc<Mutex<Option<File>>>,
+    /// Bytes in the live file, maintained by the single writer this process keeps per path.
+    ///
+    /// The alternative — stat the file before every line — would double the syscalls of the
+    /// stream path, which design §13.6 budgets at one write per line.
+    written: Arc<AtomicU64>,
 }
 
 impl Logger {
@@ -414,17 +420,28 @@ impl Logger {
         if let Some(existing) = loggers.get(path) {
             return existing.clone();
         }
+        let logger = Logger::with_limit(path, LOG_LIMIT_BYTES);
+        loggers.insert(path.to_path_buf(), logger.clone());
+        logger
+    }
+
+    /// `open` with a limit a test can reach in a few lines. Also seeds the byte counter from the
+    /// file on disk, so a file an earlier run left oversized is still rotated before the next
+    /// line. Bypasses the registry: tests keep their own path.
+    fn with_limit(path: &Path, limit: u64) -> Self {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         let file = OpenOptions::new().create(true).append(true).open(path).ok();
-        let logger = Logger {
+        let written = std::fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        Logger {
             path: path.to_path_buf(),
-            limit: LOG_LIMIT_BYTES,
+            limit,
             file: Arc::new(Mutex::new(file)),
-        };
-        loggers.insert(path.to_path_buf(), logger.clone());
-        logger
+            written: Arc::new(AtomicU64::new(written)),
+        }
     }
 
     pub fn write(&self, line: &str) {
@@ -438,19 +455,20 @@ impl Logger {
                 .ok();
         }
         if let Some(file) = guard.as_mut() {
-            let _ = writeln!(file, "{line}");
+            if writeln!(file, "{line}").is_ok() {
+                self.written
+                    .fetch_add(line.len() as u64 + 1, Ordering::Relaxed);
+            }
         }
     }
 
     /// Roll the live file into `.1` once it passes the limit, keeping `LOG_BACKUPS` generations.
     ///
-    /// Checked before every write rather than once at startup: a session that runs for hours
-    /// would otherwise grow the file without bound and never apply the threshold.
+    /// Driven by the byte counter, not by a stat per line: the counter is seeded when the logger
+    /// opens, and this single writer per path keeps it exact, so the check still fires for a file
+    /// the previous run left oversized.
     fn rotate_if_oversized(&self, guard: &mut Option<File>) {
-        let oversized = std::fs::metadata(&self.path)
-            .map(|metadata| metadata.len() > self.limit)
-            .unwrap_or(false);
-        if !oversized {
+        if self.written.load(Ordering::Relaxed) <= self.limit {
             return;
         }
         // Drop the handle first: the next write reopens whatever ends up at `path`.
@@ -462,6 +480,7 @@ impl Logger {
             );
         }
         let _ = std::fs::rename(&self.path, backup_path(&self.path, 1));
+        self.written.store(0, Ordering::Relaxed);
     }
 }
 
@@ -524,13 +543,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("harness.log");
-        // A small limit keeps the test fast; the struct literal skips the shared registry so
-        // this test cannot disturb (or be disturbed by) another test on the same path.
-        let logger = Logger {
-            path: path.clone(),
-            limit: 200,
-            file: Arc::new(Mutex::new(None)),
-        };
+        // A small limit keeps the test fast; `with_limit` skips the shared registry so this
+        // test cannot disturb (or be disturbed by) another test on the same path.
+        let logger = Logger::with_limit(&path, 200);
         for index in 0..40 {
             logger.write(&format!("line {index:02} {}", "x".repeat(40)));
         }
@@ -554,6 +569,21 @@ mod tests {
     }
 
     #[test]
+    fn a_session_below_the_limit_never_rotates() {
+        let dir = std::env::temp_dir().join("dsh-desktop-log-small-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("harness.log");
+        let logger = Logger::with_limit(&path, 200);
+        for index in 0..3 {
+            logger.write(&format!("line {index}"));
+        }
+        assert!(!dir.join("harness.log.1").exists());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("line 2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_oversized_file_rotates_before_the_next_line() {
         let dir = std::env::temp_dir().join("dsh-desktop-log-leftover-test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -561,11 +591,7 @@ mod tests {
         let path = dir.join("harness.log");
         std::fs::write(&path, "y".repeat(300)).unwrap();
 
-        let logger = Logger {
-            path: path.clone(),
-            limit: 200,
-            file: Arc::new(Mutex::new(None)),
-        };
+        let logger = Logger::with_limit(&path, 200);
         logger.write("fresh line");
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh line\n");
