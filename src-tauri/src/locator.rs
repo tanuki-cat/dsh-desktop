@@ -92,7 +92,10 @@ fn find_launcher(
     if let Some(p) = login_shell_lookup("dsh") {
         return Ok(p);
     }
-    Err("找不到 dsh。可用环境变量 DSH_DESKTOP_DSH 指定绝对路径。".into())
+    Err(
+        "找不到 dsh。可在 config.json 里设置 dsh_path，或用环境变量 DSH_DESKTOP_DSH 指定绝对路径。"
+            .into(),
+    )
 }
 
 fn find_node(launcher: &Path) -> Result<PathBuf, String> {
@@ -169,6 +172,33 @@ mod tests {
         // Nothing to read above the script: the caller must fall back to running the CLI.
         let orphan = std::env::temp_dir().join("dsh-desktop-no-package/bin.js");
         assert_eq!(version_from_package(&orphan), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_environment_override_wins_over_the_remembered_path() {
+        let dir = std::env::temp_dir().join("dsh-desktop-locator-order-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let remembered = dir.join("bin/dsh");
+        let from_env = dir.join("bin/dsh-env");
+        for file in [&remembered, &from_env] {
+            std::fs::write(file, "#!/usr/bin/env node\n").unwrap();
+        }
+
+        // DSH_DESKTOP_DSH comes first in the documented order (design §4 step 3).
+        let location = locate(
+            Some(remembered.clone()),
+            Some(from_env.to_string_lossy().to_string()),
+        )
+        .unwrap();
+        assert_eq!(location.launcher, from_env);
+
+        // Without it, the remembered path is used ahead of PATH and the common prefixes.
+        let location = locate(Some(remembered.clone()), None).unwrap();
+        assert_eq!(location.launcher, remembered);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -8,7 +8,8 @@ name: windows-portable
 #
 # 分支策略：自带运行时只存在于长期分支 feat/bundled-runtime（**暂不合并到 main**），Windows 免安装包
 # 目前是该分支唯一的对外产物。本文件留在 main 上只是为了能随时手动触发 —— 构建的是 build_ref 指向的
-# 分支代码（默认 feat/bundled-runtime）。用 main 当 build_ref 只会得到一份用不上的 runtime/。
+# 分支代码（默认 feat/bundled-runtime）。main 上 lib.rs 带 #[cfg(windows)] compile_error!，用 main
+# 当 build_ref 会在离线测试门禁直接失败，而不是产出一个存活探测恒真、行为不对的包。
 on:
   workflow_dispatch:
     inputs:

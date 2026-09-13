@@ -45,7 +45,7 @@ PNPM_STORE ?=
 CARGO_ENV         := $(if $(CARGO_HOME),CARGO_HOME=$(CARGO_HOME),)
 PNPM_INSTALL_ARGS := $(if $(PNPM_STORE),--store-dir=$(PNPM_STORE),)
 
-.PHONY: help doctor check fmt clippy test test-live dev build bundle node-deps run icons clean distclean
+.PHONY: help doctor check fmt fmt-check clippy test test-live dev build bundle node-deps run icons clean distclean
 
 help:
 	@echo "dsh-desktop 构建入口（平台: $(PLATFORM)，打包目标: $(BUNDLE_TARGETS)）"
@@ -54,7 +54,7 @@ help:
 	@echo "  make check       cargo check --all-targets"
 	@echo "  make test        离线单元测试"
 	@echo "  make test-live   联网集成测试（查询 npm registry）"
-	@echo "  make fmt / clippy"
+	@echo "  make fmt / fmt-check / clippy"
 	@echo "  make dev         运行 debug 版"
 	@echo "  make build       编译 release 可执行文件"
 	@echo "  make bundle      打包（$(BUNDLE_TARGETS)）"
@@ -87,6 +87,10 @@ check:
 
 fmt:
 	$(CARGO) fmt --manifest-path $(MANIFEST)
+
+# 只检查不改工作区：CI 门禁用这个，避免“先改再查”把 runner 的工作树改脏
+fmt-check:
+	$(CARGO) fmt --manifest-path $(MANIFEST) --check
 
 clippy:
 	$(CARGO_ENV) $(CARGO) clippy --manifest-path $(MANIFEST) --all-targets -- -D warnings

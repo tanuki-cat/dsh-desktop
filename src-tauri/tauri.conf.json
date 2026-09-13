@@ -24,9 +24,6 @@
     ],
     "macOS": {
       "minimumSystemVersion": "10.15"
-    },
-    "resources": [
-      "runtime/**/*"
-    ]
+    }
   }
 }

@@ -1,5 +1,14 @@
 //! dsh-desktop: a Tauri shell that supervises `dsh web` and hosts it in the system WebView.
 
+// The Windows code paths in this tree are reference material only: `process.rs` cannot tell a
+// live process from a dead one there, and the Makefile refuses to build on anything but macOS
+// and Linux. Refuse the build instead of producing a bundle that looks supported but
+// misbehaves; the ported, machine-tested implementation lives on feat/bundled-runtime.
+#[cfg(windows)]
+compile_error!(
+    "main 分支不构建 Windows 产物：见 README 的 Windows 免安装版说明（feat/bundled-runtime 分支）"
+);
+
 pub mod harness;
 pub mod locator;
 pub mod process;
@@ -31,6 +40,11 @@ pub struct Config {
     pub workspace: PathBuf,
     /// `None` shares `~/.dsh` with CLI usage (keeps marketplace plugins and settings).
     pub dsh_home: Option<PathBuf>,
+    /// Remembered `dsh` launcher: checked after `DSH_DESKTOP_DSH` and before PATH
+    /// (design §4 step 3). Hand-written for installations the search cannot find; a missing
+    /// or relative path is ignored for this run.
+    #[serde(default)]
+    pub dsh_path: Option<PathBuf>,
     /// When another Harness owns the port and we hold no session, stop it and take over,
     /// so the window always ends up with a valid session. Disable to only warn.
     #[serde(default = "default_take_over")]
@@ -63,9 +77,26 @@ fn default_port() -> u16 {
 }
 
 fn default_workspace() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/"))
+    home_workspace(std::env::var("HOME").ok())
+}
+
+/// Workspace for a config that does not name one.
+///
+/// A missing `HOME` used to fall back to `/`, which is worse than failing: the agent runs its
+/// `glob` and `grep` from the workspace root, so it would walk the whole filesystem. The
+/// temporary directory is still local and private, and the log says why `$HOME` was not used.
+fn home_workspace(home: Option<String>) -> PathBuf {
+    match home {
+        Some(home) if !home.trim().is_empty() => PathBuf::from(home),
+        _ => {
+            let fallback = std::env::temp_dir();
+            harness::app_log(&format!(
+                "HOME 不可用，workspace 回落到 {}",
+                fallback.display()
+            ));
+            fallback
+        }
+    }
 }
 
 fn default_import_shell_env() -> bool {
@@ -93,9 +124,10 @@ impl Config {
         let path = data_dir.join("config.json");
         if let Ok(raw) = std::fs::read_to_string(&path) {
             match serde_json::from_str::<Config>(&raw) {
-                Ok(config) => {
+                Ok(mut config) => {
                     // The `env` map may hold credentials, and older versions wrote 0644.
                     process::restrict(&path);
+                    config.repair();
                     return config;
                 }
                 // Never rewrite a file the user owns: fall back for this run and say why.
@@ -104,10 +136,11 @@ impl Config {
                 )),
             }
         }
-        let config = Config {
+        let mut config = Config {
             port: default_port(),
             workspace: default_workspace(),
             dsh_home: None,
+            dsh_path: None,
             take_over_existing: true,
             auto_update: true,
             update_tags: default_update_tags(),
@@ -116,6 +149,9 @@ impl Config {
             env: BTreeMap::new(),
             require_tested_dsh: false,
         };
+        // The same repair a loaded file gets, so the value seeded here is already usable
+        // (a `HOME` that is relative or gone would otherwise become the workspace).
+        config.repair();
         let _ = std::fs::create_dir_all(data_dir);
         if !path.exists() {
             let written = std::fs::write(
@@ -127,6 +163,35 @@ impl Config {
             }
         }
         config
+    }
+
+    /// Replace values that would send the Harness somewhere it cannot start.
+    ///
+    /// A workspace becomes the child's working directory, so a workspace that is missing or
+    /// relative fails inside the spawn with a bare ENOENT and no mention of which config entry
+    /// caused it. The value is repaired in memory rather than rewritten, the same principle as
+    /// an unparsable config.json: this run adapts, the user's file stays as they left it.
+    fn repair(&mut self) {
+        if !(self.workspace.is_absolute() && self.workspace.is_dir()) {
+            let fallback = default_workspace();
+            harness::app_log(&format!(
+                "config.json 的 workspace 不是已存在的绝对路径，本次改用 {}: {}",
+                fallback.display(),
+                self.workspace.display()
+            ));
+            self.workspace = fallback;
+        }
+        if let Some(path) = self.dsh_path.clone() {
+            // A relative path would be resolved against the app's own working directory,
+            // which is unpredictable when the app is started from Finder.
+            if !(path.is_absolute() && path.is_file()) {
+                harness::app_log(&format!(
+                    "config.json 的 dsh_path 不是已存在的绝对路径，本次忽略: {}",
+                    path.display()
+                ));
+                self.dsh_path = None;
+            }
+        }
     }
 }
 
@@ -205,6 +270,35 @@ fn may_stop_before_update(
     }
 }
 
+/// How the instance owning the port must be stopped before an install rewrites the tree it
+/// serves from.
+///
+/// Only a Harness this shell started lives in the process group we created; a foreign one
+/// shares its group with whatever terminal or script launched it, and a group signal would
+/// take unrelated processes down with it (design §13.1).
+#[derive(Debug, PartialEq, Eq)]
+enum StopMode {
+    ProcessGroup,
+    PidOnly,
+}
+
+fn stop_mode(ours: bool) -> StopMode {
+    if ours {
+        StopMode::ProcessGroup
+    } else {
+        StopMode::PidOnly
+    }
+}
+
+impl StopMode {
+    fn describe(&self) -> &'static str {
+        match self {
+            StopMode::ProcessGroup => "process group, our own instance",
+            StopMode::PidOnly => "pid only, external instance",
+        }
+    }
+}
+
 /// Stop whatever Harness owns the port, so the install cannot rewrite the tree it is serving
 /// from. Returns Err with the reason when the instance must be left alone.
 fn stop_instance_before_update(
@@ -228,12 +322,16 @@ fn stop_instance_before_update(
             "端口 {port} 上已有 Harness，但无法确定它的进程（lsof 不可用），跳过本次更新"
         ));
     };
+    let mode = stop_mode(ours.is_some());
     window::set_status(
         app,
         "更新前先停止正在运行的 Harness…",
-        &format!("pid {pid}"),
+        &format!("pid {pid}（{}）", mode.describe()),
     );
-    process::terminate(pid, TERMINATE_GRACE);
+    let _ = match mode {
+        StopMode::ProcessGroup => process::terminate(pid, TERMINATE_GRACE),
+        StopMode::PidOnly => process::terminate_pid(pid, TERMINATE_GRACE),
+    };
     let deadline = std::time::Instant::now() + TERMINATE_GRACE;
     while !matches!(harness::probe(port), harness::Probe::Closed) {
         if std::time::Instant::now() > deadline {
@@ -247,7 +345,8 @@ fn stop_instance_before_update(
         process::clear_state(data_dir);
     }
     harness::app_log(&format!(
-        "stopped Harness pid {pid} before updating the CLI"
+        "stopped Harness pid {pid} before updating the CLI ({})",
+        mode.describe()
     ));
     Ok(())
 }
@@ -297,6 +396,14 @@ fn watch_harness(
     );
 }
 
+/// May the pid recorded in `state.json` be signalled during self-heal?
+///
+/// The reuse and takeover branches already cross-check the state file against the pid that
+/// owns the port; self-heal must do the same or it can act on a stale record.
+fn should_self_heal(state: &process::HarnessState, listener: Option<u32>, alive: bool) -> bool {
+    alive && listener == Some(state.pid)
+}
+
 fn startup(app: AppHandle) {
     let data_dir = match app.path().app_data_dir() {
         Ok(dir) => dir,
@@ -313,21 +420,36 @@ fn startup(app: AppHandle) {
 fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     harness::init_app_log(&data_dir.join("logs").join("harness.log"));
 
-    // 1) Self-heal: an instance left behind by a crashed shell is terminated first.
+    // 1) Self-heal: an instance left behind by a crashed shell is terminated first. The state
+    //    file survives a crash (only a normal exit and the watchdog remove it), so the recorded
+    //    pid is signalled only while it still owns the recorded port — a reboot can hand the
+    //    same low pid to an unrelated process, and `terminate` signals a whole process group.
     if let Some(state) = process::read_state(data_dir) {
-        if process::is_alive(state.pid) {
+        let alive = process::is_alive(state.pid);
+        let listener = harness::listener_pid(state.port);
+        if should_self_heal(&state, listener, alive) {
             window::set_status(
                 app,
                 "正在清理上次残留的 Harness…",
                 &format!("pid {}", state.pid),
             );
             process::terminate(state.pid, TERMINATE_GRACE);
+        } else if alive {
+            harness::app_log(&format!(
+                "state.json 记录的 pid {} 仍存活，但没有监听端口 {}（监听者 {:?}），只清理状态文件",
+                state.pid, state.port, listener
+            ));
         }
         process::clear_state(data_dir);
     }
 
     let config = Config::load(data_dir);
     let port = config.port;
+    harness::app_log(&format!(
+        "app data dir = {} | workspace = {}",
+        data_dir.display(),
+        config.workspace.display()
+    ));
 
     // The login-shell capture costs ~160 ms and depends on nothing that follows, so it runs
     // alongside the version lookup and update check and is joined just before the child env
@@ -342,8 +464,11 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
 
     // 3) Locate dsh + node (a GUI-launched app has no Homebrew PATH).
     window::set_status(app, "正在定位 dsh 与 node…", "");
-    // Search order: DSH_DESKTOP_DSH → PATH → common prefixes → login shell.
-    let location = locator::locate(None, std::env::var("DSH_DESKTOP_DSH").ok())?;
+    // Search order: DSH_DESKTOP_DSH → dsh_path (config.json) → PATH → common prefixes → login shell.
+    let location = locator::locate(
+        config.dsh_path.clone(),
+        std::env::var("DSH_DESKTOP_DSH").ok(),
+    )?;
     let mut version = locator::version(&location).unwrap_or_else(|| "未知".into());
 
     // 3b) Update the supervised CLI before booting it, so "core upgrade" needs no terminal.
@@ -368,7 +493,16 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                 } else {
                     window::set_status(app, "正在检查 dsh 更新…", &format!("当前 dsh {version}"));
                 }
+                // A cached answer whose install already changed nothing must not be installed
+                // again inside the window: npm wrote the package somewhere this shell does not
+                // run it from, so every launch would stop the Harness and rebuild the tree.
+                let already_attempted = checked.attempted;
                 match checked.status {
+                    update::Status::UpdateAvailable { to, .. } if already_attempted => {
+                        harness::app_log(&format!(
+                            "update {to} was already attempted in this window and changed nothing; not installing again"
+                        ));
+                    }
                     update::Status::UpdateAvailable { from, to } => {
                         window::set_status(
                             app,
@@ -395,7 +529,10 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                                             // npm installed the package somewhere other than where
                                             // this CLI lives (custom prefix, pnpm/yarn/volta layout),
                                             // so the supervised binary is unchanged. Say so instead of
-                                            // claiming an update and restarting for nothing.
+                                            // claiming an update and restarting for nothing, and
+                                            // remember the attempt so the cached answer does not
+                                            // repeat it on the next launch.
+                                            update::mark_attempt_ineffective(data_dir, &to);
                                             harness::app_log(&format!(
                                                 "update installed but the supervised CLI is still {from}; check npm global prefix"
                                             ));
@@ -655,6 +792,99 @@ fn fail(app: &AppHandle, status: &str, detail: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_heal_signals_only_the_pid_that_still_owns_the_port() {
+        let state = |pid: u32, port: u16| process::HarnessState {
+            pid,
+            port,
+            cwd: "/tmp".into(),
+            started_at: 1,
+        };
+        // The recorded instance still owns its port: safe to stop.
+        assert!(should_self_heal(&state(4242, 3080), Some(4242), true));
+        // The pid was reused, or another process took the port: clean the file only.
+        assert!(!should_self_heal(&state(4242, 3080), Some(9999), true));
+        assert!(!should_self_heal(&state(4242, 3080), None, true));
+        // Already gone: nothing to signal.
+        assert!(!should_self_heal(&state(4242, 3080), Some(4242), false));
+    }
+
+    #[test]
+    fn external_instances_are_never_stopped_by_process_group() {
+        assert_eq!(stop_mode(true), StopMode::ProcessGroup);
+        assert_eq!(stop_mode(false), StopMode::PidOnly);
+    }
+
+    #[test]
+    fn a_missing_home_never_becomes_the_filesystem_root() {
+        assert_eq!(
+            home_workspace(Some("/Users/me".into())),
+            PathBuf::from("/Users/me")
+        );
+        assert_eq!(home_workspace(Some("   ".into())), std::env::temp_dir());
+        assert_eq!(home_workspace(None), std::env::temp_dir());
+        assert_ne!(home_workspace(None), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn a_bad_workspace_is_repaired_in_memory_only() {
+        let dir = std::env::temp_dir().join("dsh-desktop-repair-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let raw = "{\"workspace\": \"/definitely/not/there\"}";
+        std::fs::write(dir.join("config.json"), raw).unwrap();
+        assert_eq!(Config::load(&dir).workspace, default_workspace());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.json")).unwrap(),
+            raw,
+            "repair must not rewrite the user's file"
+        );
+
+        // An existing absolute directory is kept as it is.
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            format!("{{\"workspace\": {:?}}}", workspace.to_string_lossy()),
+        )
+        .unwrap();
+        assert_eq!(Config::load(&dir).workspace, workspace);
+
+        // A relative path cannot serve as the child's working directory either.
+        std::fs::write(dir.join("config.json"), "{\"workspace\": \"relative/dir\"}").unwrap();
+        assert_eq!(Config::load(&dir).workspace, default_workspace());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bad_dsh_path_is_ignored_in_memory_only() {
+        let dir = std::env::temp_dir().join("dsh-desktop-dsh-path-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let raw = "{\"dsh_path\": \"/definitely/not/there/dsh\"}";
+        std::fs::write(dir.join("config.json"), raw).unwrap();
+        assert_eq!(Config::load(&dir).dsh_path, None);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.json")).unwrap(),
+            raw
+        );
+
+        // An existing absolute file is remembered for the locator.
+        let launcher = dir.join("dsh");
+        std::fs::write(&launcher, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            format!("{{\"dsh_path\": {:?}}}", launcher.to_string_lossy()),
+        )
+        .unwrap();
+        assert_eq!(Config::load(&dir).dsh_path, Some(launcher));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn update_only_stops_an_instance_it_is_allowed_to_stop() {

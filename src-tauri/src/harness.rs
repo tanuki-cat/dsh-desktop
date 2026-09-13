@@ -1,7 +1,7 @@
 //! Spawn `dsh web`, stream its output, parse the startup URL, and probe for a live instance.
 
 use crate::locator::DshLocation;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -15,6 +15,8 @@ use url::Url;
 pub const URL_PREFIX: &str = "dsh web:";
 const RING_CAPACITY: usize = 200;
 const LOG_LIMIT_BYTES: u64 = 5 * 1024 * 1024;
+/// Rotated generations kept beside the live file (design §8: 5 MB x 3).
+const LOG_BACKUPS: usize = 3;
 
 /// Last N lines of Harness output, with the launch token redacted.
 #[derive(Clone)]
@@ -239,6 +241,7 @@ pub struct SpawnOptions<'a> {
 /// Launcher flags must precede app flags; the child gets its own process group so the
 /// whole tree can be terminated together.
 pub fn spawn(loc: &DshLocation, opts: &SpawnOptions<'_>) -> std::io::Result<Spawned> {
+    validate_paths(&loc.node, &loc.dsh_js, opts.workspace)?;
     let mut command = Command::new(&loc.node);
     command
         .arg(&loc.dsh_js)
@@ -268,6 +271,17 @@ pub fn spawn(loc: &DshLocation, opts: &SpawnOptions<'_>) -> std::io::Result<Spaw
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
+
+    // A bug report needs the exact command line, and a bad workspace must be visible before
+    // the child fails for a reason that never names it.
+    app_log(&format!(
+        "spawn: {} | cwd: {} | DSH_HOME: {}",
+        describe(&command),
+        opts.workspace.display(),
+        opts.dsh_home
+            .map(|home| home.display().to_string())
+            .unwrap_or_else(|| "<default>".to_string()),
+    ));
 
     let mut child = command.spawn()?;
     let (tx, rx) = mpsc::channel();
@@ -306,6 +320,48 @@ impl Spawned {
     }
 }
 
+/// Every path handed to the child must be absolute, and the workspace must exist.
+///
+/// A relative path is resolved against the child's working directory rather than ours, so the
+/// failure surfaces from inside node and never names the config entry behind it. Naming the
+/// culprit here is what makes the failure page actionable (design §4/§5).
+fn validate_paths(node: &Path, dsh_js: &Path, workspace: &Path) -> std::io::Result<()> {
+    for (label, path) in [("node", node), ("dsh_js", dsh_js), ("workspace", workspace)] {
+        if !path.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{label} 必须是绝对路径: {}", path.display()),
+            ));
+        }
+    }
+    if !workspace.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "workspace 不是已存在的目录（config.json 的 workspace）: {}",
+                workspace.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Command line for the log: `Command` does not implement `Display`, and these arguments are
+/// what a bug report needs. No credential is passed as a flag (the launch token is printed by
+/// the child, and `app_log` redacts it).
+fn describe(command: &Command) -> String {
+    let mut parts = vec![command.get_program().to_string_lossy().to_string()];
+    parts.extend(command.get_args().map(|arg| {
+        let arg = arg.to_string_lossy();
+        if arg.contains(' ') {
+            format!("\"{arg}\"")
+        } else {
+            arg.to_string()
+        }
+    }));
+    parts.join(" ")
+}
+
 fn forward_lines<R: Read + Send + 'static>(
     reader: R,
     tx: mpsc::Sender<Url>,
@@ -337,33 +393,43 @@ pub fn app_log(line: &str) {
     }
 }
 
+/// One `Logger` per path.
+///
+/// Two instances with independent file handles would keep appending to a renamed (rotated)
+/// file, so the shell's own lines would land in a backup or vanish. `init_app_log` and `spawn`
+/// both open the same log, so `open` hands out one shared handle per path.
+static LOGGERS: Mutex<BTreeMap<PathBuf, Logger>> = Mutex::new(BTreeMap::new());
+
 #[derive(Clone)]
 pub struct Logger {
     path: PathBuf,
+    /// Bytes allowed before the file rolls over; a field so tests can use a small limit.
+    limit: u64,
     file: Arc<Mutex<Option<File>>>,
 }
 
 impl Logger {
     pub fn open(path: &Path) -> Self {
+        let mut loggers = LOGGERS.lock().unwrap();
+        if let Some(existing) = loggers.get(path) {
+            return existing.clone();
+        }
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if std::fs::metadata(path)
-            .map(|m| m.len() > LOG_LIMIT_BYTES)
-            .unwrap_or(false)
-        {
-            let rotated = path.with_extension("log.1");
-            let _ = std::fs::rename(path, rotated);
-        }
         let file = OpenOptions::new().create(true).append(true).open(path).ok();
-        Logger {
+        let logger = Logger {
             path: path.to_path_buf(),
+            limit: LOG_LIMIT_BYTES,
             file: Arc::new(Mutex::new(file)),
-        }
+        };
+        loggers.insert(path.to_path_buf(), logger.clone());
+        logger
     }
 
     pub fn write(&self, line: &str) {
         let mut guard = self.file.lock().unwrap();
+        self.rotate_if_oversized(&mut guard);
         if guard.is_none() {
             *guard = OpenOptions::new()
                 .create(true)
@@ -375,11 +441,164 @@ impl Logger {
             let _ = writeln!(file, "{line}");
         }
     }
+
+    /// Roll the live file into `.1` once it passes the limit, keeping `LOG_BACKUPS` generations.
+    ///
+    /// Checked before every write rather than once at startup: a session that runs for hours
+    /// would otherwise grow the file without bound and never apply the threshold.
+    fn rotate_if_oversized(&self, guard: &mut Option<File>) {
+        let oversized = std::fs::metadata(&self.path)
+            .map(|metadata| metadata.len() > self.limit)
+            .unwrap_or(false);
+        if !oversized {
+            return;
+        }
+        // Drop the handle first: the next write reopens whatever ends up at `path`.
+        *guard = None;
+        for index in (1..LOG_BACKUPS).rev() {
+            let _ = std::fs::rename(
+                backup_path(&self.path, index),
+                backup_path(&self.path, index + 1),
+            );
+        }
+        let _ = std::fs::rename(&self.path, backup_path(&self.path, 1));
+    }
+}
+
+/// `harness.log` at index 1 becomes `harness.log.1`.
+fn backup_path(path: &Path, index: usize) -> PathBuf {
+    path.with_extension(format!("log.{index}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_paths_are_named_in_the_error() {
+        let dir = std::env::temp_dir().join("dsh-desktop-spawn-validate-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = dir.join("node");
+        let js = dir.join("bin.js");
+        std::fs::write(&node, "").unwrap();
+        std::fs::write(&js, "").unwrap();
+
+        assert!(validate_paths(&node, &js, &dir).is_ok());
+
+        let error = validate_paths(Path::new("node"), &js, &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("node"),
+            "the failing entry must be named: {error}"
+        );
+        let error = validate_paths(&node, Path::new("bin.js"), &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("dsh_js"),
+            "the failing entry must be named: {error}"
+        );
+        let error = validate_paths(&node, &js, Path::new("relative"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("workspace"),
+            "the failing entry must be named: {error}"
+        );
+
+        // The message a user sees on the failure page must point at the config entry.
+        let error = validate_paths(&node, &js, &dir.join("missing"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("workspace"), "{error}");
+        assert!(error.contains("config.json"), "{error}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotates_while_running_and_keeps_three_backups() {
+        let dir = std::env::temp_dir().join("dsh-desktop-log-rotation-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("harness.log");
+        // A small limit keeps the test fast; the struct literal skips the shared registry so
+        // this test cannot disturb (or be disturbed by) another test on the same path.
+        let logger = Logger {
+            path: path.clone(),
+            limit: 200,
+            file: Arc::new(Mutex::new(None)),
+        };
+        for index in 0..40 {
+            logger.write(&format!("line {index:02} {}", "x".repeat(40)));
+        }
+
+        // The live file stays near the limit instead of holding the whole session.
+        assert!(std::fs::metadata(&path).unwrap().len() <= 260);
+        assert!(dir.join("harness.log.1").is_file());
+        assert!(dir.join("harness.log.2").is_file());
+        assert!(dir.join("harness.log.3").is_file());
+        assert!(
+            !dir.join("harness.log.4").exists(),
+            "only {LOG_BACKUPS} backups are kept"
+        );
+        let newest = std::fs::read_to_string(dir.join("harness.log.1")).unwrap();
+        assert!(
+            newest.contains("line "),
+            "the newest backup must hold log lines"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_oversized_file_rotates_before_the_next_line() {
+        let dir = std::env::temp_dir().join("dsh-desktop-log-leftover-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("harness.log");
+        std::fs::write(&path, "y".repeat(300)).unwrap();
+
+        let logger = Logger {
+            path: path.clone(),
+            limit: 200,
+            file: Arc::new(Mutex::new(None)),
+        };
+        logger.write("fresh line");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh line\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("harness.log.1"))
+                .unwrap()
+                .len(),
+            300
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two writers with their own handles would keep appending to a renamed file after the other
+    /// one rotates it, which loses the shell's own log lines.
+    #[test]
+    fn open_shares_one_logger_per_path() {
+        let dir = std::env::temp_dir().join("dsh-desktop-log-share-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("harness.log");
+
+        let first = Logger::open(&path);
+        let second = Logger::open(&path);
+        assert!(Arc::ptr_eq(&first.file, &second.file));
+        assert_eq!(first.limit, LOG_LIMIT_BYTES);
+
+        first.write("from first");
+        second.write("from second");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("from first") && text.contains("from second"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_plain_url() {

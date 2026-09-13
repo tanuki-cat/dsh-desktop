@@ -379,6 +379,12 @@ pub struct Cache {
     pub installed: String,
     /// Newest version seen, or None when the query failed.
     pub latest: Option<String>,
+    /// Latest version whose install was already attempted while the supervised CLI stayed put
+    /// (npm wrote the package to a prefix this shell does not run from). Suppresses a second
+    /// install of the same cached answer inside the window. The field is newer than existing
+    /// cache files, so it must stay optional on the wire.
+    #[serde(default)]
+    pub attempted: Option<String>,
 }
 
 impl Cache {
@@ -396,6 +402,15 @@ impl Cache {
             return false;
         }
         now.saturating_sub(self.checked_at) < ttl_minutes * 60
+    }
+
+    /// True when `status` is the cached "update available" answer whose install was already
+    /// attempted and changed nothing.
+    pub fn attempted_install(&self, status: &Status) -> bool {
+        match status {
+            Status::UpdateAvailable { to, .. } => self.attempted.as_deref() == Some(to.as_str()),
+            _ => false,
+        }
     }
 }
 
@@ -425,6 +440,9 @@ pub struct Checked {
     pub status: Status,
     /// True when the answer came from the cache instead of the network.
     pub cached: bool,
+    /// True when this cached answer already led to an install that changed nothing, so the
+    /// caller must report it without installing again.
+    pub attempted: bool,
 }
 
 /// Consult the cache first; query the registry only when the entry is stale, then remember
@@ -446,9 +464,11 @@ pub fn check_cached(
                     reason: "上次查询失败（缓存结果）".to_string(),
                 },
             };
+            let attempted = cache.attempted_install(&status);
             return Checked {
                 status,
                 cached: true,
+                attempted,
             };
         }
     }
@@ -464,12 +484,25 @@ pub fn check_cached(
             checked_at: now,
             installed: current.to_string(),
             latest,
+            // A new query opens a new window: the previous attempt no longer suppresses it.
+            attempted: None,
         },
     );
     Checked {
         status,
         cached: false,
+        attempted: false,
     }
+}
+
+/// Remember that installing `latest` did not change the CLI this shell runs, so the cached
+/// "update available" answer is reported but not installed again inside the same window.
+pub fn mark_attempt_ineffective(data_dir: &Path, latest: &str) {
+    let Some(mut cache) = read_cache(data_dir) else {
+        return;
+    };
+    cache.attempted = Some(latest.to_string());
+    let _ = write_cache(data_dir, &cache);
 }
 
 impl std::fmt::Display for Version {
@@ -566,6 +599,7 @@ mod tests {
             checked_at: 1_000,
             installed: installed.to_string(),
             latest: latest.map(|text| text.to_string()),
+            attempted: None,
         };
         // Inside the window, same installed version -> fresh.
         assert!(entry(Some("0.1.5-rc.2"), "0.1.5-rc.1").is_fresh(
@@ -596,9 +630,89 @@ mod tests {
             checked_at: 42,
             installed: "0.1.5-rc.1".into(),
             latest: Some("0.1.5-rc.2".into()),
+            attempted: Some("0.1.5-rc.2".into()),
         };
         write_cache(&dir, &cache).unwrap();
         assert_eq!(read_cache(&dir), Some(cache));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cache file written before the `attempted` field existed must keep working: it is
+    /// what every installation has on disk at the moment it upgrades the app.
+    #[test]
+    fn cache_files_without_the_attempt_field_still_parse() {
+        let dir = std::env::temp_dir().join("dsh-desktop-update-cache-legacy-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            cache_path(&dir),
+            r#"{"checked_at":42,"installed":"0.1.5-rc.1","latest":"0.1.5-rc.2"}"#,
+        )
+        .unwrap();
+        let cache = read_cache(&dir).expect("legacy cache must parse");
+        assert_eq!(cache.attempted, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The repeat-install bug: npm wrote the package somewhere this shell does not run it
+    /// from, so the version never changes and every launch inside the cache window used to
+    /// stop the Harness and rebuild the tree.
+    #[test]
+    fn an_ineffective_install_is_not_retried_inside_the_window() {
+        let dir = std::env::temp_dir().join("dsh-desktop-update-attempt-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        // The cached branch never executes npm, so the path only has to exist as a value.
+        let npm = Path::new("/nonexistent/npm");
+        let tags = vec!["latest".to_string()];
+
+        // What check_cached stores when it finds an update.
+        write_cache(
+            &dir,
+            &Cache {
+                checked_at: now_secs(),
+                installed: "0.1.5-rc.1".into(),
+                latest: Some("0.1.5-rc.2".into()),
+                attempted: None,
+            },
+        )
+        .unwrap();
+        let first = check_cached(npm, PACKAGE, &tags, "0.1.5-rc.1", &dir, 60);
+        assert!(first.cached);
+        assert!(
+            !first.attempted,
+            "a fresh answer must be allowed to install"
+        );
+
+        // The install ran and the supervised CLI did not change.
+        mark_attempt_ineffective(&dir, "0.1.5-rc.2");
+        let second = check_cached(npm, PACKAGE, &tags, "0.1.5-rc.1", &dir, 60);
+        assert!(second.cached);
+        assert!(
+            second.attempted,
+            "the next launch in the same window must not install again"
+        );
+        assert_eq!(
+            second.status,
+            Status::UpdateAvailable {
+                from: "0.1.5-rc.1".into(),
+                to: "0.1.5-rc.2".into()
+            }
+        );
+
+        // A newer version than the one attempted is a new decision, not a repeat.
+        write_cache(
+            &dir,
+            &Cache {
+                checked_at: now_secs(),
+                installed: "0.1.5-rc.1".into(),
+                latest: Some("0.1.5-rc.3".into()),
+                attempted: Some("0.1.5-rc.2".into()),
+            },
+        )
+        .unwrap();
+        let third = check_cached(npm, PACKAGE, &tags, "0.1.5-rc.1", &dir, 60);
+        assert!(!third.attempted, "only the attempted version is suppressed");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
