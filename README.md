@@ -88,9 +88,9 @@ Windows 免安装包实机验证通过），`main` 上未实施，见下方"后�
 | `make run` | 构建后启动 | macOS 用 `open` 打开打包产物；Linux 直接跑 release 二进制 |
 | `make icons` | 由 `icon.png` 重生成 `icon.icns` | 仅 macOS（`sips` + `iconutil`）；Linux 打包直接用 png |
 | `make icon-art` | 由 `src-tauri/icons/make_icon.py` 重绘 `icon.png` | 自绘小黑鲸，需 `python3` + Pillow；改设计改脚本，不要手改 png |
-| `make runtime-fetch` | 下载官方 Node 并按 `SHASUMS256.txt` 校验 | 缓存到 `.runtime-cache/`（48 MB，可复用） |
-| `make runtime-stage` | 组装 `src-tauri/runtime/`：Node + dsh 树 + pnpm + profile 模板 + 许可清单 | 约 **520 MB**；含悬空链接/quarantine/必需文件校验 |
-| `make bundle-bundled` | `runtime-stage` + 打包 | 产出**无需预装 node/dsh** 的 `.app`（约 598 MB），本机实测可跑 |
+| `make runtime-fetch` | 下载官方 Node，并**对照仓库里的 `src-tauri/runtime.lock`** 校验 SHA256 | 缓存到 `.runtime-cache/`（48 MB，可复用）；只校验下载来的 `SHASUMS256.txt` 挡不住清单被换 |
+| `make runtime-stage` | 组装 `src-tauri/runtime/`：Node + dsh 树 + pnpm + profile 模板 + 许可清单 | 约 **520 MB**；先清空整个 `runtime/`（只留 README.md），再跑脚本自检 + 必需文件/悬空链接/**绝对链接**/quarantine/**文件数与体积**闸门 |
+| `make bundle-bundled` | `runtime-stage` + 打包 | 产出**无需预装 node/dsh** 的 `.app`（约 598 MB），本机实测可跑；macOS 上额外把 `minimumSystemVersion` 覆盖为 **11.0**（随包 node 是 `minos 11.0`） |
 | `make runtime-clean` | 回收 staging 与下载缓存 | 保留 `runtime/README.md` |
 | `make clean` | 清理构建产物 | `cargo clean` |
 | `make distclean` | 连依赖缓存一起清理 | 额外删 `node_modules`、`.pnpm-store`、`.cargo-home`、`src-tauri/gen` |
@@ -116,7 +116,7 @@ Windows 免安装包实机验证通过），`main` 上未实施，见下方"后�
 Windows 免安装版也由它构建，见 [Windows 免安装包](#windows-免安装包手动触发)）：
 
 - `make runtime-fetch / runtime-stage / runtime-clean / bundle-bundled` 四个目标全部跑通；
-- staging 自带校验：必需文件、**悬空符号链接**（会让 `tauri build` 失败）、**quarantine 属性**（会带进 .app）；
+- staging 自带校验（`scripts/check-runtime-stage.sh`，`--self-test` 会先用假目录验证闸门本身有效）：必需文件、**悬空符号链接**（会让 `tauri build` 失败）、**绝对符号链接**（会被解引用，把宿主机文件复制进包）、**quarantine 属性**（会带进 .app）、**文件数/体积闸门**（多放 2 万个文件这类残留以前会被静默打包）；
 - profile 模板由真 pnpm 生成（含插件市场 dshmarket，见方案 §2.5）；
 - 实测：`env -i PATH=/usr/bin:/bin` 下自带 node 跑自带 dsh → `0.1.5-rc.2`；
   全新 DSH_HOME + 模板播种 → `dsh web` **6 秒**出 URL、stderr 干净、`.dsh-market` 出现；
@@ -134,12 +134,22 @@ Windows 免安装版也由它构建，见 [Windows 免安装包](#windows-免安
   `PNPM_HOME` 指向可写前缀；核心更新只落到 `app-data/runtime/prefix`；
 - 用系统安装时：**默认仍然就地升级**（`system_updates: install`，与自带运行时之前的行为一致），
   想自己管升级就写 `system_updates: notify`（只提示，不动用户的全局前缀）；
+- **node 与 dsh 分开解析**：系统装了 node 但没装 dsh 时，可以「系统 node + 自带 dsh」混用（方案 §2.4 的那一格以前不可达）；
+- **只有本壳自己的树才算「自带」**：seed（包内）与影子前缀（`app-data/runtime/prefix`）会得到 PATH 前置、
+  `npm_config_prefix`／`PNPM_HOME` 注入与首启播种；`DSH_DESKTOP_DSH`／`DSH_DESKTOP_RUNTIME` 指向的树按**用户的**处理 ——
+  不动它的子进程环境、不往里装更新（排障开关不再带来副作用）；
+- **能力门槛仍然管 `runtime: system`**：node 缺 `module.stripTypeScriptTypes`、或有自带运行时时架构不一致，
+  系统安装会被拒（错误页说明原因）。这是有意为之（旧 node 本来就跑不起 dsh），与方案 §2.4「保留手动覆盖」的措辞
+  有出入，以本条为准；
+- 探测短路：`runtime: bundled` 或两个 `DSH_DESKTOP_*` 都已指定时，跳过系统运行时探测（省掉一次登录 shell + 最长 5 秒的探测）；
+- 首启超时：判定发生在播种**之前**，所以带模板播种的首启仍然是 90 秒预算；播种失败不会留下半棵 profile（先写 `.tmp` 再改名）；
 - 想看效果：`DSH_DESKTOP_RUNTIME_PREFERENCE=bundled|system|auto` 可覆盖 `config.json` 的 `runtime`。
 
 **Windows 免安装包已实机验证通过**（2026-09-13：解压到 `D:\dsh` 双击即启动，自带 node + dsh 拉起 Web GUI，
 插件市场与会话内工具调用正常）。
 
-尚未做：macOS 自带运行时的 **GUI 实机验证**、`minimumSystemVersion` 提到 11.0、签名与公证、Linux 侧 staging。
+尚未做：macOS 自带运行时的 **GUI 实机验证**、**"回退 + last-known-good"**（方案 §2.3 规则 2：选中的树起不来时自动
+换另一个候选重试一次）、签名与公证、Linux 侧 staging。
 细节见[方案文档](docs/design-task-feat-dsh-bundled-runtime.md) §20。
 
 运行时（当前版本）需要系统中已有 `dsh` 与 `node`。
@@ -235,15 +245,21 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
    树被换走后运行中的 harness 下一次 `require()` 会直接 `MODULE_NOT_FOUND`（实测）。所以先 SIGTERM 停实例、
    等端口释放，再安装；不能停时（外部实例且 `take_over_existing=false`、或拿不到 PID）**跳过本次更新**并记日志，
    实例不受任何影响；
-4. 有新版则 `npm install -g --no-fund --no-audit @deepseek-ai/dsh@<解析出的具体版本>`；
-   npm 取自 node 同目录，且 npm 全局前缀 ≠ CLI 实际位置时自动带 `--prefix`；
+4. 有新版则 `npm install -g --no-fund --no-audit --cache <app-data>/runtime/npm-cache @deepseek-ai/dsh@<解析出的具体版本>`；
+   npm 取自 node 同目录，且 npm 全局前缀 ≠ CLI 实际位置时自动带 `--prefix`；`runtime/{prefix,tools,npm-cache}` 在启动时
+   幂等创建；
 5. 所有 npm 子进程都在 PATH 最前面插入 npm 所在目录：npm 是 `#!/usr/bin/env node` 脚本，
    而 GUI 启动的壳只有 launchd 的 PATH（不含 node），不这样处理会直接 `exit 127`（详见设计文档 §13.8）；
-6. 安装后**回读一次 CLI 版本**：版本没变说明 npm 装到了别的前缀（自定义 prefix、pnpm/yarn 布局），
-   此时只记日志、不谎报成功、也不为一次无效更新重启实例；
+6. 安装后**从安装前缀回读** CLI 路径与版本：自带运行时的更新落在影子前缀，回读 seed 会让版本看起来没变，
+   于是本轮继续跑旧核心、日志还指向 npm 前缀；现在版本变了就把受管 CLI 切到新树并在本轮重启实例；
+   只有**确实没变**（npm 装到了别处）才记那条日志，并把这次尝试写进缓存，同一版本不再重复安装；
 7. 刚更新过 → 强制重启实例（否则复用旧进程仍跑旧二进制）。
 
-结果写入日志：`dsh is up to date` / `update available: A -> B` / `dsh updated: A -> B` / `update failed, keeping vA`。
+结果写入日志：`dsh is up to date` / `update available: A -> B` / `dsh updated: A -> B` / `update failed, keeping vA` /
+`update A was already attempted and changed nothing; not installing again`。
+
+**排障**：手工修好 npm 全局前缀（或换安装方式）后，壳在出现更高版本前不会再尝试安装 —— 删掉
+`<app-data>/update-check.json` 即可复位。
 
 ## 启动耗时与性能
 
