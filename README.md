@@ -112,8 +112,16 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
   全新 DSH_HOME + 模板播种 → `dsh web` **6 秒**出 URL、stderr 干净、`.dsh-market` 出现；
 - 实测：`make bundle-bundled` 产出 598 MB 的 `.app`，包内 node 可直接执行、31,090 个文件。
 
-尚未接入：运行时解析已实现为纯策略（`src-tauri/src/runtime.rs` + `runtime` 配置项，含 6 个单测），
-但**还没有接进启动流程**（seed 路径解析、首启播种 profile、PATH 注入、更新落点改到 app-data、签名）。
+**运行时解析已接进启动流程**（`src-tauri/src/runtime.rs` + `lib.rs::resolve_runtime`）：
+
+- 来源：`DSH_DESKTOP_RUNTIME` → 应用资源目录 → `tauri dev` 的 `target/<profile>/runtime`；
+- 候选：显式环境变量 → 系统安装（先过架构与 `stripTypeScriptTypes` 两道门槛）→ 自带（seed 与
+  影子前缀取版本更高者）；一个候选都没有时给「装 node + dsh」错误页；
+- 自带时：首启播种 profile 模板（含插件市场）、PATH 前置自带工具目录、注入 `npm_config_prefix`／
+  `PNPM_HOME` 指向可写前缀；核心更新只落到 `app-data/runtime/prefix`，用系统安装时只提示不安装；
+- 想看效果：`DSH_DESKTOP_RUNTIME_PREFERENCE=bundled|system|auto` 可覆盖 `config.json` 的 `runtime`。
+
+尚未做：带自带的 **GUI 实机验证**、`minimumSystemVersion` 提到 11.0、签名与公证、Linux 侧 staging。
 细节见[方案文档](docs/design-task-feat-dsh-bundled-runtime.md) §20。
 
 运行时（当前版本）需要系统中已有 `dsh` 与 `node`。
