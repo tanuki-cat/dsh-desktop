@@ -53,6 +53,20 @@ pub enum Preference {
     System,
 }
 
+impl Preference {
+    /// `DSH_DESKTOP_RUNTIME_PREFERENCE` overrides `config.json`: the same escape hatch as
+    /// `DSH_DESKTOP_DSH`, and the only way to try the bundled runtime on a machine that has a
+    /// perfectly good installed one.
+    pub fn parse(value: &str) -> Option<Preference> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Preference::Auto),
+            "bundled" => Some(Preference::Bundled),
+            "system" => Some(Preference::System),
+            _ => None,
+        }
+    }
+}
+
 /// One half of the decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pick {
@@ -78,8 +92,8 @@ pub struct Inputs<'a> {
     pub env_dsh: Option<PathBuf>,
     pub system_node: Option<PathBuf>,
     pub system_dsh: Option<PathBuf>,
-    pub seed_node: &'a Path,
-    pub seed_dsh: &'a Path,
+    pub seed_node: Option<&'a Path>,
+    pub seed_dsh: Option<&'a Path>,
     pub shadow_dsh: Option<&'a Path>,
     pub seed_version: Option<&'a str>,
     pub shadow_version: Option<&'a str>,
@@ -106,64 +120,82 @@ impl Decision {
     }
 }
 
-/// Pick the node: explicit override, then the user's install (unless the bundled runtime is
-/// forced), then the seed.
-pub fn decide(input: &Inputs<'_>) -> Decision {
-    let node = pick_node(input);
-    let dsh = pick_dsh(input);
+/// Pick the node and the dsh tree to supervise.
+///
+/// `None` means there was no candidate at all — a build without a bundled runtime on a machine
+/// with no installation either; the caller turns that into the "install node + dsh" error page.
+pub fn decide(input: &Inputs<'_>) -> Option<Decision> {
+    let node = pick_node(input)?;
+    let dsh = pick_dsh(input)?;
     let updates = match dsh.origin {
         Origin::System => Updates::Notify,
         _ => Updates::Shadow,
     };
-    Decision { node, dsh, updates }
+    Some(Decision { node, dsh, updates })
 }
 
-fn pick_node(input: &Inputs<'_>) -> Pick {
+fn pick_node(input: &Inputs<'_>) -> Option<Pick> {
     if let Some(path) = &input.env_node {
-        return Pick {
+        return Some(Pick {
             path: path.clone(),
             origin: Origin::Env,
-        };
+        });
     }
     if matches!(input.preference, Preference::Auto | Preference::System) {
         if let Some(path) = &input.system_node {
-            return Pick {
+            return Some(Pick {
                 path: path.clone(),
                 origin: Origin::System,
-            };
+            });
         }
     }
-    Pick {
-        path: input.seed_node.to_path_buf(),
-        origin: Origin::Seed,
-    }
+    bundled_node(input).or_else(|| {
+        // `bundled` was asked for but this build ships no seed: falling back beats refusing to
+        // start, and the caller logs the mismatch.
+        input.system_node.clone().map(|path| Pick {
+            path,
+            origin: Origin::System,
+        })
+    })
 }
 
-fn pick_dsh(input: &Inputs<'_>) -> Pick {
+fn bundled_node(input: &Inputs<'_>) -> Option<Pick> {
+    input.seed_node.map(|path| Pick {
+        path: path.to_path_buf(),
+        origin: Origin::Seed,
+    })
+}
+
+fn pick_dsh(input: &Inputs<'_>) -> Option<Pick> {
     if let Some(path) = &input.env_dsh {
-        return Pick {
+        return Some(Pick {
             path: path.clone(),
             origin: Origin::Env,
-        };
+        });
     }
     if matches!(input.preference, Preference::Auto | Preference::System) {
         if let Some(path) = &input.system_dsh {
-            return Pick {
+            return Some(Pick {
                 path: path.clone(),
                 origin: Origin::System,
-            };
+            });
         }
     }
-    pick_bundled(input)
+    pick_bundled(input).or_else(|| {
+        input.system_dsh.clone().map(|path| Pick {
+            path,
+            origin: Origin::System,
+        })
+    })
 }
 
 /// The bundled half: shadow prefix and seed, higher version wins (§2.3, so a fresh `.app` with a
 /// newer seed is not shadowed by an older copy under app-data).
-fn pick_bundled(input: &Inputs<'_>) -> Pick {
-    let seed = Pick {
-        path: input.seed_dsh.to_path_buf(),
+fn pick_bundled(input: &Inputs<'_>) -> Option<Pick> {
+    let seed = input.seed_dsh.map(|path| Pick {
+        path: path.to_path_buf(),
         origin: Origin::Seed,
-    };
+    });
     let Some(shadow_path) = input.shadow_dsh else {
         return seed;
     };
@@ -171,20 +203,24 @@ fn pick_bundled(input: &Inputs<'_>) -> Pick {
         path: shadow_path.to_path_buf(),
         origin: Origin::Shadow,
     };
+    // Only the shadow copy exists.
+    let Some(seed) = seed else {
+        return Some(shadow);
+    };
     match (input.seed_version, input.shadow_version) {
         (Some(seed_version), Some(shadow_version)) => {
             match (Version::parse(seed_version), Version::parse(shadow_version)) {
                 (Some(seed_version), Some(shadow_version)) if shadow_version > seed_version => {
-                    shadow
+                    Some(shadow)
                 }
-                (Some(_), Some(_)) => seed,
+                (Some(_), Some(_)) => Some(seed),
                 // Unparsable versions: prefer the copy that exists rather than guessing.
-                _ => shadow,
+                _ => Some(shadow),
             }
         }
-        // Without a version for the shadow copy we cannot tell them apart; the shadow copy only
-        // exists because an update put it there, so it is the one to run.
-        _ => shadow,
+        // Without versions we cannot tell them apart; the shadow copy only exists because an
+        // update put it there, so it is the one to run.
+        _ => Some(shadow),
     }
 }
 
@@ -199,8 +235,10 @@ mod tests {
             env_dsh: None,
             system_node: None,
             system_dsh: None,
-            seed_node: Path::new("/app/Contents/Resources/runtime/node/bin/node"),
-            seed_dsh: Path::new("/app/Contents/Resources/runtime/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"),
+            seed_node: Some(Path::new("/app/Contents/Resources/runtime/node/bin/node")),
+            seed_dsh: Some(Path::new(
+                "/app/Contents/Resources/runtime/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
+            )),
             shadow_dsh: None,
             seed_version: Some("0.1.5-rc.2"),
             shadow_version: None,
@@ -209,7 +247,7 @@ mod tests {
 
     #[test]
     fn nothing_installed_uses_both_bundled_halves() {
-        let decision = decide(&base_inputs(Preference::Auto));
+        let decision = decide(&base_inputs(Preference::Auto)).expect("a candidate exists");
         assert_eq!(decision.node.origin, Origin::Seed);
         assert_eq!(decision.dsh.origin, Origin::Seed);
         assert_eq!(decision.updates, Updates::Shadow);
@@ -224,7 +262,7 @@ mod tests {
             )),
             ..base_inputs(Preference::Auto)
         };
-        let decision = decide(&input);
+        let decision = decide(&input).expect("a candidate exists");
         assert_eq!(decision.node.origin, Origin::System);
         assert_eq!(decision.dsh.origin, Origin::System);
         // The shell must not rewrite a prefix the user manages.
@@ -237,7 +275,7 @@ mod tests {
             system_node: Some(PathBuf::from("/usr/bin/node")),
             ..base_inputs(Preference::Auto)
         };
-        let decision = decide(&node_only);
+        let decision = decide(&node_only).expect("a candidate exists");
         assert_eq!(decision.node.origin, Origin::System);
         assert_eq!(decision.dsh.origin, Origin::Seed);
 
@@ -247,7 +285,7 @@ mod tests {
             )),
             ..base_inputs(Preference::Auto)
         };
-        let decision = decide(&dsh_only);
+        let decision = decide(&dsh_only).expect("a candidate exists");
         assert_eq!(decision.node.origin, Origin::Seed);
         assert_eq!(decision.dsh.origin, Origin::System);
     }
@@ -261,7 +299,7 @@ mod tests {
             )),
             ..base_inputs(Preference::Bundled)
         };
-        let decision = decide(&input);
+        let decision = decide(&input).expect("a candidate exists");
         assert_eq!(decision.node.origin, Origin::Seed);
         assert_eq!(decision.dsh.origin, Origin::Seed);
         assert_eq!(decision.updates, Updates::Shadow);
@@ -278,11 +316,39 @@ mod tests {
             )),
             ..base_inputs(Preference::Auto)
         };
-        let decision = decide(&input);
+        let decision = decide(&input).expect("a candidate exists");
         assert_eq!(decision.node.path, PathBuf::from("/custom/node"));
         assert_eq!(decision.dsh.path, PathBuf::from("/custom/dsh/lib/bin.js"));
         assert_eq!(decision.node.origin, Origin::Env);
         assert_eq!(decision.dsh.origin, Origin::Env);
+    }
+
+    #[test]
+    fn no_candidate_at_all_is_reported_as_none() {
+        // A build without a bundled runtime on a machine with no installation: the caller turns
+        // this into the "install node + dsh" page instead of running something that is not there.
+        let input = Inputs {
+            seed_node: None,
+            seed_dsh: None,
+            ..base_inputs(Preference::Auto)
+        };
+        assert!(decide(&input).is_none());
+    }
+
+    #[test]
+    fn forcing_bundled_without_a_seed_falls_back_to_the_install() {
+        let input = Inputs {
+            seed_node: None,
+            seed_dsh: None,
+            system_node: Some(PathBuf::from("/opt/homebrew/bin/node")),
+            system_dsh: Some(PathBuf::from(
+                "/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
+            )),
+            ..base_inputs(Preference::Bundled)
+        };
+        let decision = decide(&input).expect("the installed runtime is the only candidate");
+        assert_eq!(decision.node.origin, Origin::System);
+        assert_eq!(decision.dsh.origin, Origin::System);
     }
 
     #[test]
@@ -294,7 +360,10 @@ mod tests {
             shadow_version: Some("0.1.6"),
             ..base_inputs(Preference::Auto)
         };
-        assert_eq!(decide(&input).dsh.origin, Origin::Shadow);
+        assert_eq!(
+            decide(&input).expect("a candidate exists").dsh.origin,
+            Origin::Shadow
+        );
 
         // A newer seed must not be shadowed by an older copy under app-data.
         let stale_shadow = Inputs {
@@ -304,6 +373,12 @@ mod tests {
             shadow_version: Some("0.1.4"),
             ..base_inputs(Preference::Auto)
         };
-        assert_eq!(decide(&stale_shadow).dsh.origin, Origin::Seed);
+        assert_eq!(
+            decide(&stale_shadow)
+                .expect("a candidate exists")
+                .dsh
+                .origin,
+            Origin::Seed
+        );
     }
 }

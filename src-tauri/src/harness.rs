@@ -1,6 +1,5 @@
 //! Spawn `dsh web`, stream its output, parse the startup URL, and probe for a live instance.
 
-use crate::locator::DshLocation;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -238,10 +237,10 @@ pub struct SpawnOptions<'a> {
 ///
 /// Launcher flags must precede app flags; the child gets its own process group so the
 /// whole tree can be terminated together.
-pub fn spawn(loc: &DshLocation, opts: &SpawnOptions<'_>) -> std::io::Result<Spawned> {
-    let mut command = Command::new(&loc.node);
+pub fn spawn(node: &Path, dsh_js: &Path, opts: &SpawnOptions<'_>) -> std::io::Result<Spawned> {
+    let mut command = Command::new(node);
     command
-        .arg(&loc.dsh_js)
+        .arg(dsh_js)
         .arg("--profile")
         .arg("web")
         .arg("--patch")

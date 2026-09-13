@@ -27,6 +27,37 @@ pub fn locate(
     })
 }
 
+/// What a node binary can do. The bundled runtime plan §2.4 gates the system installation on
+/// two facts, because a mismatch only shows up as a crash much later:
+/// the architecture (an x64 node under Rosetta cannot load the bundled arm64 prebuilds) and
+/// `module.stripTypeScriptTypes` (the CLI's code-runtime worker needs it; `@deepseek-ai/dsh`
+/// declares no `engines.node`, so a capability probe is the only honest check).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeFacts {
+    pub arch: String,
+    pub strip_types: bool,
+}
+
+/// Probe node once (~80 ms) for the facts above.
+pub fn probe_node(node: &Path) -> Option<NodeFacts> {
+    const SCRIPT: &str =
+        "process.stdout.write(process.arch + \" \" + (typeof require(\"module\").stripTypeScriptTypes))";
+    let output = Command::new(node).arg("-e").arg(SCRIPT).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.split_whitespace();
+    let arch = parts.next()?.to_string();
+    let strip_types = parts.next() == Some("function");
+    Some(NodeFacts { arch, strip_types })
+}
+
+/// Version of a CLI tree, from the package.json that owns the entry script.
+pub fn version_of(dsh_js: &Path) -> Option<String> {
+    version_from_package(dsh_js)
+}
+
 /// Version of the installed CLI. Reading the owning package.json costs ~1 ms, while booting
 /// node for `--version` costs ~80 ms, so the file wins and the CLI is the fallback.
 pub fn version(loc: &DshLocation) -> Option<String> {
@@ -152,6 +183,25 @@ fn real_path(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The probe runs on whatever node this machine has; on a machine without node it is
+    /// simply skipped (`None` is a valid answer the caller must handle).
+    #[test]
+    fn probes_a_real_node_for_arch_and_capability() {
+        let Some(node) = path_lookup("node") else {
+            eprintln!("skipped: no node on PATH");
+            return;
+        };
+        let facts = probe_node(&node).expect("a working node must answer the probe");
+        assert!(!facts.arch.is_empty());
+        // The CLI needs stripTypeScriptTypes; if this machine's node is too old the test tells
+        // us rather than silently asserting the opposite.
+        assert!(
+            facts.strip_types,
+            "node {} lacks stripTypeScriptTypes",
+            facts.arch
+        );
+    }
 
     #[test]
     fn reads_version_from_the_owning_package() {
