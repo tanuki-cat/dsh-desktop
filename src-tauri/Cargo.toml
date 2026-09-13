@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.77"
 description = "Tauri shell that supervises `dsh web` and hosts it in the system WebView"
-license = "BSD-3-Clause"
+license = "MIT"
 
 [lib]
 name = "dsh_desktop_lib"
