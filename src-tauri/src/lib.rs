@@ -1592,7 +1592,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                     window::set_status(app, "复用本应用上次启动的 Harness…", &format!("pid {pid}"));
                     // Adopted, but still ours: quitting must stop it rather than leave an orphan.
                     adopt(pid, data_dir);
-                    if refuse_an_old_webview(app, &version) {
+                    if hand_the_gui_to_the_browser(app, &url, &version) {
                         return Ok(());
                     }
                     return window::create_harness(app, &url, port).map_err(|e| e.to_string());
@@ -1724,7 +1724,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         },
     );
 
-    if refuse_an_old_webview(app, &version) {
+    if hand_the_gui_to_the_browser(app, &url, &version) {
         return Ok(());
     }
     if let Err(error) = window::create_harness(app, &url, actual_port) {
@@ -1745,24 +1745,29 @@ fn fail(app: &AppHandle, status: &str, detail: &str) {
     window::set_status(app, status, detail);
 }
 
-/// Show the failure page instead of the Harness window when this WebView cannot run the dsh
-/// front end. Returns true when it did, so the caller stops before opening anything.
+/// Hand the UI to the system browser when this WebView cannot run it.
+///
+/// Returns true when it did, so the caller stops before opening a window that could only show
+/// the harness's plugin error. The browser is the *same* path `dsh web` has always used on
+/// these machines, and the only one with a current JavaScript engine: the system WebView is
+/// frozen at the WebKit that shipped with the running macOS.
 ///
 /// The splash page probes for this at load (see [`window::WebviewReport`]); the answer is
 /// normally there long before the Harness is up. A missing answer counts as supported, so a
 /// lost diagnostic can never lock the user out of a working GUI.
-fn refuse_an_old_webview(app: &AppHandle, version: &str) -> bool {
+fn hand_the_gui_to_the_browser(app: &AppHandle, url: &url::Url, version: &str) -> bool {
     let Some(report) = window::unsupported_webview() else {
         return false;
     };
     harness::app_log(&format!(
-        "WebView 缺少 dsh 前端必需的能力（{}），改用失败页而不是打开界面",
+        "WebView 缺少 dsh 前端必需的能力（{}），改用默认浏览器打开 {url}",
         report.missing.join("、")
     ));
+    window::open_external(url.as_str());
     window::show_failure(
         app,
-        "系统 WebView 无法运行这个 dsh 版本的界面",
-        &report.describe(version),
+        "系统 WebView 太旧，界面已改在浏览器中打开",
+        &report.browser_fallback_detail(version, url.as_str()),
     );
     true
 }

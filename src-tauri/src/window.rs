@@ -61,6 +61,21 @@ impl WebviewReport {
         self.missing.is_empty()
     }
 
+    /// The text shown when the UI has to move to the system browser: this WebView cannot run
+    /// it, but the browser can.
+    ///
+    /// That is the `dsh web` path these machines have always used: the shell still supervises
+    /// the Harness (updates, stopping it on exit), the browser only renders the UI — with an
+    /// engine that does keep getting updates.
+    pub fn browser_fallback_detail(&self, dsh_version: &str, url: &str) -> String {
+        format!(
+            "{}\n\n界面已在默认浏览器中打开：\n{url}\n\n\
+             这个窗口是 harness 的管理窗口（更新与退出清理都在这里）：在浏览器里操作时请不要关闭它，\
+             关闭它会停止 harness。",
+            self.describe(dsh_version)
+        )
+    }
+
     /// The text of the failure page: what is missing, what this dsh version needs, what to do.
     pub fn describe(&self, dsh_version: &str) -> String {
         let mut text = format!(
@@ -564,6 +579,24 @@ mod tests {
         assert!(text.contains("Safari 18.4"), "补救方向要写清楚：{text}");
         assert!(text.contains("Math.sumPrecise"), "降级项也要列出来");
         assert!(text.contains("AppleWebKit"), "报上当前 WebView 便于排查");
+    }
+
+    #[test]
+    fn the_browser_fallback_tells_the_user_what_to_keep_open() {
+        let report =
+            WebviewReport::parse(r#"{"missing":["Iterator"],"degraded":[],"agent":"old"}"#)
+                .expect("the page's report must parse");
+
+        let text = report.browser_fallback_detail("0.1.5-rc.2", "http://127.0.0.1:3080/?token=t");
+        assert!(
+            text.contains("http://127.0.0.1:3080/?token=t"),
+            "给出地址：{text}"
+        );
+        assert!(text.contains("Iterator"), "说明原因");
+        assert!(
+            text.contains("不要关闭"),
+            "关掉这个窗口会停 harness，必须写明：{text}"
+        );
     }
 
     #[test]
