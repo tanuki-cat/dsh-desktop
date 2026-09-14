@@ -60,9 +60,12 @@ Intel 机器更容易停在旧 macOS，所以现象看起来像「macos-x64 专�
   可能晚于探针脚本出现，所以上报在 1 秒内重试、之后安静放弃。
 - **存储与等待**：`window.rs::record_report` 解析并存进 `static REPORT`；`unsupported_webview()` 最多等
   `PROBE_WAIT`（500 ms）。**从未上报按「支持」处理**（fail-open）：诊断本身出问题不该把人锁在门外。
-- **判定点**：`lib.rs::hand_the_gui_to_the_browser(app, url, version)` 在两处 `create_harness` 之前调用——
-  复用已有实例那条快路径、以及正常 spawn 之后。命中就**改用默认浏览器打开界面**（`window::open_external`）
-  并 `window::show_failure(...)` 留一个管理窗口，不再打开 harness 窗口。
+- **判定点**：`lib.rs::hand_the_gui_to_the_browser(app, url, version)` 在 `create_harness` 之前调用。命中就
+  **改用默认浏览器打开界面**（`window::open_external`）并 `window::show_failure(...)` 留一个管理窗口，
+  不再打开 harness 窗口。
+- **复用已有实例那条路要重启**：session token 是每次启动生成的，复用分支拿到的 `http://127.0.0.1:<port>/`
+  靠的是本 WebView 里的 cookie —— 而浏览器没有这个 cookie。所以探测到不支持时，那条分支改为**终止并重新
+  启动** harness，让新进程打印出浏览器可用的带 token 地址（复用分支的代码里写明了这个理由）。
 
 ### 3.2 为什么是浏览器而不是自己打补丁
 

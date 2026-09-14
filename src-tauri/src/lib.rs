@@ -1587,15 +1587,30 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                 // cookie is still valid for this authority (verified across restarts), so reuse
                 // it as-is instead of restarting it.
                 Some(pid) if !just_updated => {
-                    let url = url::Url::parse(&format!("http://127.0.0.1:{port}/"))
-                        .map_err(|e| e.to_string())?;
-                    window::set_status(app, "复用本应用上次启动的 Harness…", &format!("pid {pid}"));
-                    // Adopted, but still ours: quitting must stop it rather than leave an orphan.
-                    adopt(pid, data_dir);
-                    if hand_the_gui_to_the_browser(app, &url, &version) {
-                        return Ok(());
+                    if window::unsupported_webview().is_some() {
+                        // A browser needs an authenticated URL, and the session token is per
+                        // launch: the reused instance's cookie lives in this WebView, which is
+                        // exactly the thing that cannot render the UI. Restart it instead — the
+                        // fresh launch prints a URL the browser can use (handled after spawn).
+                        window::set_status(
+                            app,
+                            "系统 WebView 太旧，正在重启 Harness 以便在浏览器中打开…",
+                            &format!("pid {pid}"),
+                        );
+                        process::terminate(pid, TERMINATE_GRACE);
+                    } else {
+                        let url = url::Url::parse(&format!("http://127.0.0.1:{port}/"))
+                            .map_err(|e| e.to_string())?;
+                        window::set_status(
+                            app,
+                            "复用本应用上次启动的 Harness…",
+                            &format!("pid {pid}"),
+                        );
+                        // Adopted, but still ours: quitting must stop it rather than leave an
+                        // orphan.
+                        adopt(pid, data_dir);
+                        return window::create_harness(app, &url, port).map_err(|e| e.to_string());
                     }
-                    return window::create_harness(app, &url, port).map_err(|e| e.to_string());
                 }
                 // Our own instance that a fresh update just made obsolete: it is our child, so
                 // its whole process group goes down together, exactly as at exit.
