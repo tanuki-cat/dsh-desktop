@@ -192,6 +192,50 @@ pub fn npm_path(npm: &Path, existing: Option<&OsStr>) -> OsString {
     }
 }
 
+/// Executable names `pnpm` can have on this platform, in the order a shell would try them.
+#[cfg(windows)]
+const PNPM_NAMES: &[&str] = &["pnpm.cmd", "pnpm.exe", "pnpm.bat", "pnpm"];
+#[cfg(not(windows))]
+const PNPM_NAMES: &[&str] = &["pnpm"];
+
+/// `pnpm` as the CLI's own plugin command resolves it: the first executable match on `path`.
+///
+/// `dsh plugin add` is a thin wrapper around pnpm (the CLI just spawns it in the profile
+/// directory), so a plugin install can only work when this returns something. The shell has to
+/// know that *before* it stops the running Harness: without pnpm the CLI exits 127 and the
+/// launch loses its session for nothing (review A1).
+pub fn find_pnpm(path: Option<&OsStr>) -> Option<PathBuf> {
+    let path = path?;
+    for dir in std::env::split_paths(path) {
+        for name in PNPM_NAMES {
+            let candidate = dir.join(name);
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// A file this process can actually execute. On Unix the exec bit decides: a merely readable
+/// `pnpm` would fail inside the CLI with EACCES instead of resolving.
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// npm command that starts whatever PATH the app was launched with.
 fn npm_command(npm: &Path) -> Command {
     let mut command = Command::new(npm);
@@ -422,6 +466,9 @@ fn read_package_json(dir: &Path) -> Option<serde_json::Value> {
 /// `dsh plugin --profile <name> add <package>@<version>` forwards to pnpm inside the profile
 /// directory, so the CLI owns the profile layout and the pnpm invocation; the shell only decides
 /// *when* to run it (after the instance was stopped, exactly like a core update).
+///
+/// `path` is the caller's assembled PATH, not the app's own: pnpm ships in the bundled tools
+/// prefix, which is not on a Finder-launched app's PATH (review A1).
 pub fn install_plugin(
     node: &Path,
     dsh_js: &Path,
@@ -429,6 +476,7 @@ pub fn install_plugin(
     package: &str,
     version: &str,
     dsh_home: Option<&Path>,
+    path: &OsStr,
 ) -> Result<(), String> {
     let mut command = Command::new(node);
     command
@@ -440,7 +488,7 @@ pub fn install_plugin(
         .arg(format!("{package}@{version}"))
         // The CLI forwards to pnpm, another `#!/usr/bin/env node` script: node's directory has
         // to lead PATH for the same reason `npm` needs it (see `npm_path`).
-        .env("PATH", npm_path(node, std::env::var_os("PATH").as_deref()));
+        .env("PATH", npm_path(node, Some(path)));
     if let Some(home) = dsh_home {
         command.env("DSH_HOME", home);
     }
@@ -1080,6 +1128,43 @@ mod tests {
         assert!(
             Version::parse(TESTED_MIN).unwrap() < Version::parse(TESTED_MAX_EXCLUSIVE).unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_pnpm_takes_the_first_executable_match_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join("dsh-desktop-find-pnpm-test");
+        let empty = root.join("empty");
+        let good = root.join("good");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&good).unwrap();
+        let pnpm = good.join("pnpm");
+        std::fs::write(&pnpm, "#!/bin/sh").unwrap();
+
+        let path = std::env::join_paths([&empty, &good]).unwrap();
+        // Readable but not executable: the CLI would die with EACCES instead of resolving it.
+        assert_eq!(find_pnpm(Some(&path)), None);
+
+        let mut mode = std::fs::metadata(&pnpm).unwrap().permissions();
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&pnpm, mode).unwrap();
+        assert_eq!(find_pnpm(Some(&path)), Some(pnpm.clone()));
+
+        // A directory of that name is not a command either.
+        let dir_like = root.join("dir-like");
+        std::fs::create_dir_all(dir_like.join("pnpm")).unwrap();
+        let only_a_directory = std::env::join_paths([&dir_like]).unwrap();
+        assert_eq!(find_pnpm(Some(&only_a_directory)), None);
+
+        // The still-valid match survives the checks above, and no PATH means no pnpm.
+        assert_eq!(find_pnpm(Some(&path)), Some(pnpm));
+        assert_eq!(find_pnpm(None), None);
+        assert_eq!(find_pnpm(Some(OsStr::new(""))), None);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]

@@ -14,6 +14,7 @@ pub mod window;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -725,29 +726,50 @@ fn resolve_runtime(
 /// The login-shell capture: the shell that was run, and the variables it printed.
 type EnvCapture = std::thread::JoinHandle<(String, Option<(String, BTreeMap<String, String>)>)>;
 
+/// What the first-launch seeding did.
+///
+/// `seeded` is not just for the log: the launch that has just written the template must not
+/// go on to check the registry, or "first start downloads nothing" stops being true — the
+/// template already pins a plugin market version (review A2).
+#[derive(Default)]
+struct SeedOutcome {
+    seeded: bool,
+    note: Option<String>,
+}
+
 /// First launch of a bundled build: install the profile template (which carries the plugin
 /// market) into the user's DSH_HOME, unless a profile is already there (plan §2.5).
-fn seed_profile_template(config: &Config, seed: Option<&Path>) -> Option<String> {
-    let seed = seed?;
+fn seed_profile_template(config: &Config, seed: Option<&Path>) -> SeedOutcome {
+    let mut outcome = SeedOutcome::default();
+    let Some(seed) = seed else {
+        return outcome;
+    };
     let template = seed.join("profile-template");
     if !template.join("package.json").is_file() {
-        return None;
+        return outcome;
     }
-    let home = config
+    let Some(home) = config
         .dsh_home
         .clone()
-        .or_else(|| home_dir().map(|home| home.join(".dsh")))?;
+        .or_else(|| home_dir().map(|home| home.join(".dsh")))
+    else {
+        return outcome;
+    };
     let profile = home.join("profiles").join("web");
     if profile.exists() {
-        return None;
+        return outcome;
     }
     match copy_tree(&template, &profile) {
-        Ok(()) => Some(format!(
-            "seeded profile template into {}",
-            profile.display()
-        )),
-        Err(error) => Some(format!("could not seed the profile template: {error}")),
+        Ok(()) => {
+            outcome.seeded = true;
+            outcome.note = Some(format!(
+                "seeded profile template into {}",
+                profile.display()
+            ));
+        }
+        Err(error) => outcome.note = Some(format!("could not seed the profile template: {error}")),
     }
+    outcome
 }
 
 /// Copy a tree into `to`, building a sibling `.tmp` directory first.
@@ -962,6 +984,149 @@ fn looks_like_our_harness(output: &str, parent: Parent) -> bool {
     command.contains("--profile web") && command.contains("dsh") && parent != Parent::Live
 }
 
+/// Why the plugin market cannot be updated this launch, when it cannot.
+///
+/// The decision is taken *before* the running Harness is stopped: `dsh plugin add` is a thin
+/// wrapper around pnpm, so without a resolvable pnpm the CLI exits 127 — stopping the instance
+/// for an install that cannot succeed would turn a no-op into an outage on every launch
+/// (review A1).
+#[derive(Debug, PartialEq, Eq)]
+enum PluginSkip {
+    /// Declared in the profile but not installed: installing it is a repair, not an update, and
+    /// the user may be mid-way through their own plugin surgery.
+    NotInstalled,
+    /// No `pnpm` on the PATH the CLI will run with (the bundled tools prefix is missing, or the
+    /// build has no bundled runtime and the machine has no system pnpm).
+    NoPnpm,
+}
+
+impl PluginSkip {
+    fn reason(&self) -> String {
+        match self {
+            PluginSkip::NotInstalled => {
+                format!("{} 已声明但未安装，跳过自动更新", update::MARKET_PLUGIN)
+            }
+            PluginSkip::NoPnpm => {
+                "PATH 上没有 pnpm，跳过插件市场更新（不停止正在运行的 Harness）".to_string()
+            }
+        }
+    }
+}
+
+fn plugin_skip_reason(installed: Option<&str>, pnpm: Option<&Path>) -> Option<PluginSkip> {
+    if installed.is_none() {
+        return Some(PluginSkip::NotInstalled);
+    }
+    if pnpm.is_none() {
+        return Some(PluginSkip::NoPnpm);
+    }
+    None
+}
+
+/// PATH entries that go in front of whatever the app inherited, in priority order.
+///
+/// The shipped `tools` prefix is what makes plugin management work at all: the CLI forwards to
+/// pnpm, which only lives there (and in the writable prefix updates target) — a Finder-launched
+/// app inherits launchd's PATH, which has neither (review A1).
+fn tool_path_prefix(
+    node: &Path,
+    seed: Option<&Path>,
+    bundled: bool,
+    data_dir: &Path,
+) -> Vec<String> {
+    let mut prefix: Vec<String> = Vec::new();
+    if let Some(dir) = node.parent() {
+        prefix.push(dir.to_string_lossy().to_string());
+    }
+    if bundled {
+        // npm puts shims in `bin/` on Unix and directly in the prefix on Windows; PATH entries
+        // that do not exist are harmless, so both are offered.
+        let tools = data_dir.join("runtime").join("tools");
+        prefix.push(tools.join("bin").to_string_lossy().to_string());
+        prefix.push(tools.to_string_lossy().to_string());
+        if let Some(seed) = seed {
+            let shipped = seed.join("tools");
+            prefix.push(shipped.join("bin").to_string_lossy().to_string());
+            prefix.push(shipped.to_string_lossy().to_string());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // A macOS GUI app inherits launchd's PATH; Homebrew lives here.
+        prefix.push("/opt/homebrew/bin".to_string());
+        prefix.push("/usr/local/bin".to_string());
+    }
+    #[cfg(windows)]
+    {
+        // A launcher may hand us a sanitized environment; `cmd.exe` and friends still expect
+        // the system directories to be on PATH.
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            let root = PathBuf::from(root);
+            prefix.push(root.join("System32").to_string_lossy().to_string());
+            prefix.push(root.to_string_lossy().to_string());
+        }
+    }
+    prefix
+}
+
+/// The environment this shell's children run with, assembled once.
+///
+/// `path` is what the plugin install gets, and it is the very value the pnpm probe looked at,
+/// so the answer to "is pnpm there?" and the install cannot disagree. The npm calls that check
+/// and install the CLI keep their own node-first PATH: they only ever run npm, which needs
+/// nothing beyond the node sitting next to it.
+struct ChildEnv {
+    /// `PATH` as a string, for the commands the shell runs itself.
+    path: String,
+    /// The full environment handed to the Harness.
+    vars: Vec<(String, String)>,
+}
+
+impl ChildEnv {
+    /// `imported` is the login shell capture, when there was one.
+    fn assemble(
+        config: &Config,
+        node: &Path,
+        seed: Option<&Path>,
+        bundled: bool,
+        data_dir: &Path,
+        imported: &BTreeMap<String, String>,
+    ) -> ChildEnv {
+        let prefix = tool_path_prefix(node, seed, bundled, data_dir);
+        let merged = shellenv::merge_path(
+            &prefix,
+            imported.get("PATH").map(String::as_str),
+            std::env::var("PATH").ok().as_deref(),
+        );
+        let mut vars: Vec<(String, String)> = imported
+            .iter()
+            .filter(|(key, _)| key.as_str() != "PATH")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        vars.push(("PATH".to_string(), merged.clone()));
+        if bundled {
+            // Recentred global installs: with the read-only seed in front of PATH, `npm i -g`
+            // from the harness would target the app bundle. Point it (and pnpm) at the writable
+            // tools prefix.
+            let tools = data_dir.join("runtime").join("tools");
+            vars.retain(|(key, _)| key != "npm_config_prefix" && key != "PNPM_HOME");
+            vars.push((
+                "npm_config_prefix".to_string(),
+                tools.to_string_lossy().to_string(),
+            ));
+            vars.push((
+                "PNPM_HOME".to_string(),
+                tools.join("bin").to_string_lossy().to_string(),
+            ));
+        }
+        for (key, value) in &config.env {
+            vars.retain(|(existing, _)| existing != key);
+            vars.push((key.clone(), value.clone()));
+        }
+        ChildEnv { path: merged, vars }
+    }
+}
+
 fn startup(app: AppHandle) {
     let data_dir = match app.path().app_data_dir() {
         Ok(dir) => dir,
@@ -1071,8 +1236,11 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     // place before the CLI starts, so the marketplace exists without any download (§2.5).
     // Only for the shell's own runtime: the template pins a dshmarket version, and a user who
     // installed or pointed at their own tree should not be given one (review P1-7).
+    let mut seeded_this_run = false;
     if resolved.bundled() {
-        if let Some(note) = seed_profile_template(&config, resolved.seed.as_deref()) {
+        let outcome = seed_profile_template(&config, resolved.seed.as_deref());
+        seeded_this_run = outcome.seeded;
+        if let Some(note) = outcome.note {
             harness::app_log(&note);
         }
     }
@@ -1218,20 +1386,66 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         }
     }
 
+    // 3b4) Assemble the environment every child of this shell gets: a GUI-launched app inherits
+    //      launchd's environment, not the login shell's, so the CLI would miss DEEPSEEK_API_KEY
+    //      and friends. This runs before the plugin step because `dsh plugin add` forwards to
+    //      pnpm, and pnpm only exists in the bundled tools prefix or on the login shell PATH
+    //      (review A1); the Harness then gets this very PATH, so the shell and everything it
+    //      spawns share one toolchain.
+    let mut imported: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(handle) = env_capture {
+        let captured = handle.join().ok();
+        let shell = captured
+            .as_ref()
+            .map(|(shell, _)| shell.clone())
+            .unwrap_or_else(|| "登录 shell".to_string());
+        match captured.and_then(|(_, imported)| imported) {
+            Some((flag, vars)) => {
+                let names: Vec<String> = vars.keys().cloned().collect();
+                // Names only: values may be credentials.
+                harness::app_log(&format!(
+                    "imported {} env vars via {shell} {flag}: {}",
+                    names.len(),
+                    names.join(", ")
+                ));
+                imported = vars;
+            }
+            None => harness::app_log(&format!(
+                "login shell env import failed ({shell}); using the app environment"
+            )),
+        }
+    }
+    let child = ChildEnv::assemble(
+        &config,
+        &resolved.node,
+        resolved.seed.as_deref(),
+        resolved.bundled(),
+        data_dir,
+        &imported,
+    );
+    harness::app_log(&format!("child PATH = {}", child.path));
+
     // 3b3) The plugin market lives in the user profile rather than in the CLI tree, but it ages
     //      the same way: check the dist-tags, stop the instance that is using the profile, install,
     //      and let the new plugin load. `auto_update_plugins` turns the whole step off.
-    if config.auto_update && config.auto_update_plugins {
+    let check_market = config.auto_update && config.auto_update_plugins;
+    if check_market && seeded_this_run {
+        // The template this launch just wrote already pins a plugin market version; asking the
+        // registry right after it would make a first start download, which is the one thing the
+        // seeded template exists to avoid (review A2).
+        harness::app_log("刚播种 profile 模板，本轮不检查插件市场（下次启动再查）");
+    }
+    if check_market && !seeded_this_run {
         let profile_dir = home.join("profiles").join("web");
         if update::declares_plugin(&profile_dir, update::MARKET_PLUGIN) {
-            match update::installed_plugin(&profile_dir, update::MARKET_PLUGIN) {
-                // Declared but not installed: installing it is a repair, not an update, and the
-                // user may be mid-way through their own plugin surgery.
-                None => harness::app_log(&format!(
-                    "{} 已声明但未安装，跳过自动更新",
-                    update::MARKET_PLUGIN,
-                )),
-                Some(current) => match update::npm_for(&resolved.node) {
+            let installed = update::installed_plugin(&profile_dir, update::MARKET_PLUGIN);
+            // Resolve pnpm before anything is stopped: it is what actually installs a plugin,
+            // and without it the CLI exits 127 after the instance is already gone (review A1).
+            let pnpm = update::find_pnpm(Some(OsStr::new(&child.path)));
+            if let Some(skip) = plugin_skip_reason(installed.as_deref(), pnpm.as_deref()) {
+                harness::app_log(&skip.reason());
+            } else if let Some(current) = installed {
+                match update::npm_for(&resolved.node) {
                     None => harness::app_log("找不到 npm，跳过插件市场更新检查"),
                     Some(npm) => {
                         let interval = config.update_check_interval_minutes;
@@ -1274,6 +1488,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                                         update::MARKET_PLUGIN,
                                         &to,
                                         config.dsh_home.as_deref(),
+                                        OsStr::new(&child.path),
                                     ) {
                                         Ok(()) => {
                                             let after = update::installed_plugin(
@@ -1300,9 +1515,15 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                                                 ));
                                             }
                                         }
-                                        Err(reason) => harness::app_log(&format!(
-                                            "plugin update failed, keeping v{from}: {reason}"
-                                        )),
+                                        Err(reason) => {
+                                            // Same guard as the "installed but unchanged"
+                                            // branch above: a broken environment must not stop
+                                            // the Harness again on the next launch (review A1).
+                                            update::mark_plugin_attempt_ineffective(data_dir, &to);
+                                            harness::app_log(&format!(
+                                                "plugin update failed, keeping v{from}: {reason}"
+                                            ));
+                                        }
                                     },
                                 }
                             }
@@ -1316,7 +1537,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                             )),
                         }
                     }
-                },
+                }
             }
         }
     }
@@ -1414,102 +1635,13 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
 
     let log_path = data_dir.join("logs").join("harness.log");
 
-    // 3d) A GUI-launched app inherits launchd's environment, not the login shell's, so the
-    //     supervised CLI would miss DEEPSEEK_API_KEY and friends. Import them here.
-    let mut child_env: Vec<(String, String)> = Vec::new();
-    let mut shell_path: Option<String> = None;
-    if let Some(handle) = env_capture {
-        let captured = handle.join().ok();
-        let shell = captured
-            .as_ref()
-            .map(|(shell, _)| shell.clone())
-            .unwrap_or_else(|| "登录 shell".to_string());
-        match captured.and_then(|(_, imported)| imported) {
-            Some((flag, imported)) => {
-                let names: Vec<String> = imported.keys().cloned().collect();
-                // Names only: values may be credentials.
-                harness::app_log(&format!(
-                    "imported {} env vars via {shell} {flag}: {}",
-                    names.len(),
-                    names.join(", ")
-                ));
-                shell_path = imported.get("PATH").cloned();
-                child_env.extend(imported.into_iter().filter(|(key, _)| key != "PATH"));
-            }
-            None => harness::app_log(&format!(
-                "login shell env import failed ({shell}); using the app environment"
-            )),
-        }
-    }
-
-    let mut prefix: Vec<String> = Vec::new();
-    if let Some(dir) = resolved.node.parent() {
-        prefix.push(dir.to_string_lossy().to_string());
-    }
-    // Bundled runtime: the shipped pnpm (and the writable tools prefix taking precedence) go in
-    // front so plugins, MCP servers and agent commands use the same toolchain as the shell (§5).
-    if resolved.bundled() {
-        // npm puts shims in `bin/` on Unix and directly in the prefix on Windows; PATH entries
-        // that do not exist are harmless, so both are offered.
-        let tools = data_dir.join("runtime").join("tools");
-        prefix.push(tools.join("bin").to_string_lossy().to_string());
-        prefix.push(tools.to_string_lossy().to_string());
-        if let Some(seed) = &resolved.seed {
-            prefix.push(seed.join("tools").join("bin").to_string_lossy().to_string());
-            prefix.push(seed.join("tools").to_string_lossy().to_string());
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // A macOS GUI app inherits launchd's PATH; Homebrew lives here.
-        prefix.push("/opt/homebrew/bin".to_string());
-        prefix.push("/usr/local/bin".to_string());
-    }
-    #[cfg(windows)]
-    {
-        // A launcher may hand us a sanitized environment; `cmd.exe` and friends still expect
-        // the system directories to be on PATH.
-        if let Some(root) = std::env::var_os("SystemRoot") {
-            let root = PathBuf::from(root);
-            prefix.push(root.join("System32").to_string_lossy().to_string());
-            prefix.push(root.to_string_lossy().to_string());
-        }
-    }
-    let merged = shellenv::merge_path(
-        &prefix,
-        shell_path.as_deref(),
-        std::env::var("PATH").ok().as_deref(),
-    );
-    child_env.retain(|(key, _)| key != "PATH");
-    child_env.push(("PATH".to_string(), merged));
-    // Recentred global installs: with the read-only seed in front of PATH, `npm i -g` from the
-    // harness would target the app bundle. Point it (and pnpm) at the writable tools prefix.
-    if resolved.bundled() {
-        let tools = data_dir.join("runtime").join("tools");
-        child_env.retain(|(key, _)| key != "npm_config_prefix" && key != "PNPM_HOME");
-        child_env.push((
-            "npm_config_prefix".to_string(),
-            tools.to_string_lossy().to_string(),
-        ));
-        child_env.push((
-            "PNPM_HOME".to_string(),
-            tools.join("bin").to_string_lossy().to_string(),
-        ));
-    }
-    for (key, value) in &config.env {
-        child_env.retain(|(existing, _)| existing != key);
-        child_env.push((key.clone(), value.clone()));
-    }
-    if let Some((_, path)) = child_env.iter().find(|(key, _)| key == "PATH") {
-        harness::app_log(&format!("child PATH = {path}"));
-    }
     let options = harness::SpawnOptions {
         workspace: &config.workspace,
         overlay: &overlay,
         dsh_home: config.dsh_home.as_deref(),
         port,
         log_path: &log_path,
-        env: &child_env,
+        env: &child.vars,
     };
 
     // The window may already be closed: spawning now would leave an orphan nobody stops.
@@ -2068,5 +2200,100 @@ mod tests {
         assert!(absolute(Path::new("runtime/node")).is_absolute());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Look one variable up in an assembled child environment.
+    fn value_of(env: &ChildEnv, key: &str) -> Option<String> {
+        env.vars
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+    }
+
+    #[test]
+    fn a_missing_pnpm_skips_the_plugin_step_before_anything_is_stopped() {
+        let pnpm = Path::new("/opt/runtime/tools/bin/pnpm");
+        // Declared but not installed: installing it is a repair the user may be mid-way through.
+        assert_eq!(
+            plugin_skip_reason(None, Some(pnpm)),
+            Some(PluginSkip::NotInstalled)
+        );
+        // No pnpm: `dsh plugin add` forwards to pnpm and exits 127 — after the shell already
+        // stopped the Harness, so the decision has to be made here (review A1).
+        assert_eq!(
+            plugin_skip_reason(Some("1.0.0"), None),
+            Some(PluginSkip::NoPnpm)
+        );
+        // Both halves present: the update may proceed.
+        assert_eq!(plugin_skip_reason(Some("1.0.0"), Some(pnpm)), None);
+        // The skip has to explain itself; this is the log line the user sees.
+        assert!(PluginSkip::NoPnpm.reason().contains("pnpm"));
+        assert!(PluginSkip::NotInstalled
+            .reason()
+            .contains(update::MARKET_PLUGIN));
+    }
+
+    #[test]
+    fn the_child_path_carries_the_bundled_tools_that_hold_pnpm() {
+        let data_dir = std::env::temp_dir().join("dsh-desktop-child-env-test");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let config = Config::load(&data_dir);
+        let node = Path::new("/opt/app/runtime/node/bin/node");
+        let seed = Path::new("/opt/app/runtime");
+        let tools = data_dir.join("runtime/tools");
+
+        let bundled =
+            ChildEnv::assemble(&config, node, Some(seed), true, &data_dir, &BTreeMap::new());
+        assert!(bundled.path.starts_with("/opt/app/runtime/node/bin"));
+        assert!(bundled
+            .path
+            .contains(&tools.join("bin").to_string_lossy().to_string()));
+        assert!(bundled.path.contains("/opt/app/runtime/tools/bin"));
+        // Global installs land in the writable prefix, never in the signed bundle.
+        assert_eq!(
+            value_of(&bundled, "PNPM_HOME"),
+            Some(tools.join("bin").to_string_lossy().to_string())
+        );
+        assert_eq!(
+            value_of(&bundled, "npm_config_prefix"),
+            Some(tools.to_string_lossy().to_string())
+        );
+        assert_eq!(value_of(&bundled, "PATH"), Some(bundled.path.clone()));
+
+        // A system install is the user's own tree: no toolchain of ours is pushed into it.
+        let system = ChildEnv::assemble(&config, node, None, false, &data_dir, &BTreeMap::new());
+        assert!(!system.path.contains(&tools.to_string_lossy().to_string()));
+        assert_eq!(value_of(&system, "PNPM_HOME"), None);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn seeding_reports_itself_so_the_first_launch_stays_offline() {
+        let root = std::env::temp_dir().join("dsh-desktop-seed-outcome-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let seed = root.join("runtime");
+        let template = seed.join("profile-template");
+        std::fs::create_dir_all(template.join("node_modules/dshmarket")).unwrap();
+        std::fs::write(template.join("package.json"), "{}").unwrap();
+        std::fs::write(template.join("node_modules/dshmarket/package.json"), "{}").unwrap();
+        let home = root.join("dsh-home");
+        let config = Config {
+            dsh_home: Some(home.clone()),
+            ..Config::load(&root.join("app-data"))
+        };
+
+        // First launch: the template is copied and the caller is told, so the plugin check can
+        // stay offline this once (review A2).
+        let outcome = seed_profile_template(&config, Some(&seed));
+        assert!(outcome.seeded);
+        assert!(outcome.note.is_some());
+        assert!(home.join("profiles/web/package.json").is_file());
+
+        // Second launch: the profile exists, so this is not a first start any more.
+        let again = seed_profile_template(&config, Some(&seed));
+        assert!(!again.seeded);
+        assert!(again.note.is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
