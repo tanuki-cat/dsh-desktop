@@ -852,3 +852,20 @@ dshmarket@1.46.1`，4.3 s 装好。
 `FAILED_RETRY_MINUTES`（5 分钟）内抑制，窗口一到自动重试。
 
 细节与未做项见那份审查文档 §10 与 §11.3。
+
+---
+
+## 24. macOS WebView 下限：启动前判定（2026-09-14）
+
+用户反馈 macos-x64 产物启动后界面停在 `Failed to load plugins` / `Can't find variable: Iterator`。
+根因不在架构也不在本仓库：随包的 `dsh-client-ui-sidebar-documentpreview`（dsh 0.1.5-rc.2）内联了
+pdfjs-dist 6.3.289，其中给 `Iterator.prototype.join` 打补丁的那行没先判断全局 `Iterator` 是否存在，
+而该全局是 **Safari 18.4（macOS 15.4）** 才有的 —— 比 §22 里 `minimumSystemVersion` 11.0 高得多。
+
+壳侧已在打开 harness 窗口**之前**判定：splash 注入探针（ES5）→ 经 `core:event:emit` 上报 →
+`window::unsupported_webview()` 最多等 500 ms → `lib.rs::refuse_an_old_webview` 命中就显示写明原因的
+失败页并记日志；探测缺失按支持处理（fail-open）。必需项只有 `Iterator`，`Math.sumPrecise` 等只作为
+「降级项」上报。
+
+完整结论、证据链（BCD／WebKit 发布说明／pdfjs 那行源码）、影响面与未做项（上游修 + 真机验证）见
+[`design-task-fix-webview-compat-audit.md`](./design-task-fix-webview-compat-audit.md)。测试 77 → 82。

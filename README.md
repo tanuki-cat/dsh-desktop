@@ -10,6 +10,11 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 > `.github/workflows/release.yml` 在打 tag 时产出，见[发布](#发布github-actions)与
 > [自带运行时](#自带运行时已并入-main)。
 >
+> **macOS 的 WebView 下限**：dsh 的前端需要 **Safari 18.4（macOS 15.4）或更新的 WebKit** —— 随包的
+> document-preview 插件在更旧的引擎上会在加载期抛 `Can't find variable: Iterator`。壳会在打开界面前
+> 探测 WebView，不满足时给出写明原因的失败页，而不是 harness 那句 `Failed to load plugins`。
+> `minimumSystemVersion` 仍是 11.0：那只约束安装与进程启动，界面另有这道运行时判定（见[已知坑](#已知坑)）。
+>
 > **分支策略**：自带运行时开发用的 `feat/bundled-runtime` 已合并回 `main`（2026-09-13），
 > 后续开发直接在 `main` 上进行；该分支只作历史快照保留。
 
@@ -119,6 +124,11 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - Linux 首次构建前请先 `make doctor` 装齐系统依赖；即便将来采用自带 Node/dsh 的发行方式，
   **WebKitGTK 仍来自系统**（见后续实施计划）。
 - `make test-live` 与首次 `make bundle` 需要网络（查 registry / 拉 Tauri CLI）。
+- **旧 macOS 的界面会加载失败**（`Failed to load plugins` / `Can't find variable: Iterator`）：随包的
+  `dsh-client-ui-sidebar-documentpreview` 内联 pdfjs，其中给 `Iterator.prototype.join` 打补丁的那行
+  没有先判断全局 `Iterator` 是否存在，而该全局是 **Safari 18.4** 才有的（macOS ≤ 12 拿不到，13/14 需要装
+  Safari 18.4 更新）。壳现在会在启动阶段探测并给出失败页（`window.rs::WebviewReport`）；彻底修法在上游
+  的插件包里。Intel 机器更容易停在旧系统，所以这个现象看着像「macos-x64 专属」。
 
 ### 自带运行时（已并入 main）
 
@@ -155,7 +165,11 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
   有出入，以本条为准；
 - 探测短路：`runtime: bundled` 或两个 `DSH_DESKTOP_*` 都已指定时，跳过系统运行时探测（省掉一次登录 shell + 最长 5 秒的探测）；
 - 首启超时：判定发生在播种**之前**，所以带模板播种的首启仍然是 90 秒预算；播种失败不会留下半棵 profile（先写 `.tmp` 再改名）；
-- 想看效果：`DSH_DESKTOP_RUNTIME_PREFERENCE=bundled|system|auto` 可覆盖 `config.json` 的 `runtime`。
+- 想看效果：`DSH_DESKTOP_RUNTIME_PREFERENCE=bundled|system|auto` 可覆盖 `config.json` 的 `runtime`；
+- **WebView 能力探测**：splash 页面（我们自己的页面，唯一持有 core 权限的窗口）在加载时探测 `Iterator`
+  等 API 并上报，壳在打开 harness 窗口**之前**判定 —— 不满足就显示写明「缺什么 + 需要 Safari 18.4」的
+  失败页并记日志（`window.rs::WebviewReport`、`lib.rs::refuse_an_old_webview`）；探测没上报时按支持处理，
+  不会因为诊断本身出问题而把人挡在门外。
 
 **Windows 免安装包已实机验证通过**（2026-09-13：解压到 `D:\dsh` 双击即启动，自带 node + dsh 拉起 Web GUI，
 插件市场与会话内工具调用正常）。
