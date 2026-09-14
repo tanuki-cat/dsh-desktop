@@ -52,7 +52,7 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
   `plugin update available: dshmarket 1.45.1 -> 1.46.1, installing`、`plugin updated: dshmarket 1.45.1 -> 1.46.1`，
   随后 harness 重启并正常服务；profile 的依赖范围被改写为 `^1.46.1`、`node_modules` 内实装 1.46.1，
   且 `plugin-check.json` 与核心的 `update-check.json` 各自独立（时间戳与内容互不影响）。
-- 离线测试：`cargo test` **71 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
+- 离线测试：`cargo test` **75 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
   缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口与跨窗口都不重复安装"、npm PATH 前缀、沉默对端探针超时、
   package.json 版本解析、部分/损坏 config.json 处理、workspace / dsh_path 回退不改文件、HOME 缺失不回落 `/`、
@@ -91,7 +91,7 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 | `make doctor` | 检查工具链与平台依赖 | Linux 用 `pkg-config` 查 `webkit2gtk-4.1` / `gtk+-3.0` / `libsoup-3.0` 并给出 Debian/Fedora/Arch 安装命令；macOS 提示装 Xcode CLT |
 | `make check` | `cargo check --all-targets` | 与 CI 口径一致 |
 | `make fmt` / `make fmt-check` / `make clippy` | 格式化 / 只检查格式（CI 门禁用，不改工作区）/ lint（`clippy -D warnings`） | |
-| `make test` | 离线单元测试（当前 **71** 个） | 不联网 |
+| `make test` | 离线单元测试（当前 **75** 个） | 不联网 |
 | `make test-live` | 联网集成测试（全部） | 自动设 `DSH_DESKTOP_LIVE_TESTS=1`：查真实 registry、对比冷/热缓存耗时，并在「PATH 里没有 node」的模拟 GUI 环境下验证 npm 仍可运行 |
 | `make dev` | 运行 debug 版 | 等价 `cargo run --manifest-path src-tauri/Cargo.toml` |
 | `make build` | 编译 release 可执行文件 | 产物 `src-tauri/target/release/dsh-desktop` |
@@ -296,6 +296,13 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 - 有新版时走与核心相同的顺序：**先停实例**（pnpm 原地重写 profile 的 `node_modules`，运行中的
   harness 下次 lazy require 会崩）→ `dsh plugin --profile web add dshmarket@<版本>`（CLI 自己转发 pnpm，
   属于你的 profile 文件会被改写）→ 回读版本 → 本轮重启实例让新插件生效；
+- 子进程用的是壳**组装好的那份 PATH**（node 目录 → 可写的 `<app-data>/runtime/tools/bin` →
+  随包的 `<seed>/tools/bin` → 登录 shell 的 PATH），pnpm 就装在随包的 `tools` 前缀里 ——
+  Finder 启动的应用继承的是 launchd 的 PATH，本来找不到它；
+- 动手前先解析 pnpm：解析不到就只记一条 `PATH 上没有 pnpm，跳过插件市场更新`，**不会先把实例停掉
+  再失败**，这条失败也写进缓存，同一窗口内不重复尝试；核心更新失败同理；
+- **首启播种 profile 模板的那一轮不查插件市场**：模板已经钉住一个版本，首启不该产生联网下载，
+  从下一次启动起照常检查；
 - 装了但版本没变（pnpm 写到了别处）只记日志，并把这次尝试写进缓存，同一版本不重复装；
 - 不想要就设 `"auto_update_plugins": false`（核心的 `auto_update` 不受影响）。
 

@@ -827,4 +827,21 @@ tauri 调用同时带上 `--target` 与 `--config`（resources + `minimumSystemV
 YAML 解析；本机用假目录跑通「挪走精简版 → 再打自带运行时版 → 生成校验和」的分支逻辑，并验证体积比闸门在
 劣化（bundled 与精简版一样大）时会失败。
 
-**未验证**：CI 上尚未实跑（要等下一次 tag 触发），Linux 侧（x64/arm64）也还没在真机上启动过。
+~~**未验证**：CI 上尚未实跑（要等下一次 tag 触发）~~ **已补（2026-09-14，v0.2.0 的发布 run）**：
+全平台两种产物都产出了，Linux staging 31072 文件 / 562 MB、macOS x64 用的是 `darwin-x64` 的 node、
+两道产物断言与 staging 缓存命中都在真实发布里跑过。仍未做的只剩 Linux 侧的**实机启动**验证。
+
+---
+
+## 23. v0.2.0 之后的插件市场修复（2026-09-14，`main`）
+
+`docs/design-task-fix-v0-2-0-post-merge-audit.md` 的 A1／A2 已修，两处都落在这份方案的范围内：
+
+| 项 | 症状 | 修法 |
+|---|---|---|
+| A1 | 插件市场自动更新在 GUI 启动下必失败：`install_plugin` 的 PATH 只有 node 目录 + 应用自身 PATH，而 `dsh plugin add` 要转发给 pnpm（随包在 `<seed>/tools`）；失败前还先把实例停了，`Err` 分支又不写 attempted，于是每次启动重来 | 子进程环境组装（登录 shell 导入 + 工具前缀 + `npm_config_prefix`／`PNPM_HOME`）从 3d 提到 3b4，产物 `ChildEnv { path, vars }` 同时供插件安装与 harness 使用；安装前用 `update::find_pnpm` 解析 pnpm，解析不到就跳过（**不停实例**）；`Err` 分支补 `mark_plugin_attempt_ineffective` |
+| A2 | 首启播种 profile 模板后立刻查 registry，破坏"首启不下载" | `seed_profile_template` 返回 `SeedOutcome { seeded, note }`，播过种的那一轮不查插件市场 |
+
+测试 71 → 75（`find_pnpm`、跳过策略、子进程 PATH、播种返回值四个用例）；命令行端到端：用组装出的
+PATH 在全新 `DSH_HOME` 上跑 `dsh plugin --profile web add dshmarket@1.46.1`，4.3 s 装好。
+细节与未做项见那份审查文档 §10。
