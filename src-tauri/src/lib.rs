@@ -2318,10 +2318,14 @@ mod tests {
         // `merge_path` drops anything that is not absolute — so these paths are built from
         // `temp_dir` instead of being hard-coded. The Windows CI gate caught the original
         // version (a bare `/opt/...` compared as a whole-PATH string prefix).
+        // Built with one `join` per component, exactly like the product does: a component such
+        // as "runtime/tools" keeps its `/` on Windows while the product's `PNPM_HOME` renders
+        // as `\runtime\tools\bin`, and the two strings then differ only in separators. The
+        // Windows gate caught that too.
         let app = data_dir.join("app");
-        let node = app.join("runtime/node/bin/node");
+        let node = app.join("runtime").join("node").join("bin").join("node");
         let seed = app.join("runtime");
-        let tools = data_dir.join("runtime/tools");
+        let tools = data_dir.join("runtime").join("tools");
 
         let bundled = ChildEnv::assemble(
             &config,
