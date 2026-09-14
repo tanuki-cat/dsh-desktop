@@ -1464,6 +1464,15 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                                     update::MARKET_PLUGIN
                                 ));
                             }
+                            update::Status::UpdateAvailable { to, .. }
+                                if checked.failed_recently =>
+                            {
+                                harness::app_log(&format!(
+                                    "plugin {} {to} failed to install last time; not retrying for {} minutes",
+                                    update::MARKET_PLUGIN,
+                                    update::FAILED_RETRY_MINUTES
+                                ));
+                            }
                             update::Status::UpdateAvailable { from, to } => {
                                 window::set_status(
                                     app,
@@ -1516,10 +1525,12 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                                             }
                                         }
                                         Err(reason) => {
-                                            // Same guard as the "installed but unchanged"
-                                            // branch above: a broken environment must not stop
-                                            // the Harness again on the next launch (review A1).
-                                            update::mark_plugin_attempt_ineffective(data_dir, &to);
+                                            // A failed install is usually transient, so it only
+                                            // suppresses the next attempt for a few minutes —
+                                            // long enough not to stop the Harness again right
+                                            // away, short enough to recover on its own
+                                            // (review A1/A5).
+                                            update::mark_plugin_attempt_failed(data_dir, &to);
                                             harness::app_log(&format!(
                                                 "plugin update failed, keeping v{from}: {reason}"
                                             ));

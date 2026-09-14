@@ -520,6 +520,15 @@ pub struct Cache {
     /// install of the same answer; newer than existing cache files, hence optional on the wire.
     #[serde(default)]
     pub attempted: Option<String>,
+    /// Version whose install *failed* outright — the CLI could not run it at all — with the
+    /// time of that failure. A failure is usually transient (a registry hiccup, a locked
+    /// profile, a broken pnpm), so unlike [`Cache::attempted`] this marker expires after
+    /// [`FAILED_RETRY_MINUTES`]: the shell tries again instead of leaving the version behind
+    /// for as long as the registry head stays put.
+    #[serde(default)]
+    pub failed: Option<String>,
+    #[serde(default)]
+    pub failed_at: u64,
 }
 
 impl Cache {
@@ -544,6 +553,18 @@ impl Cache {
     pub fn attempted_install(&self, status: &Status) -> bool {
         match status {
             Status::UpdateAvailable { to, .. } => self.attempted.as_deref() == Some(to.as_str()),
+            _ => false,
+        }
+    }
+
+    /// True when `status` is an update whose install failed recently enough that the shell
+    /// should not stop the Harness for it yet.
+    pub fn failed_recently(&self, now: u64, status: &Status) -> bool {
+        match status {
+            Status::UpdateAvailable { to, .. } => {
+                self.failed.as_deref() == Some(to.as_str())
+                    && now.saturating_sub(self.failed_at) < FAILED_RETRY_MINUTES * 60
+            }
             _ => false,
         }
     }
@@ -595,6 +616,10 @@ pub struct Checked {
     /// True when this answer already led to an install that changed nothing, so the caller
     /// must report it without installing again.
     pub attempted: bool,
+    /// True when the last install of this answer failed and its short retry window has not
+    /// passed yet. Weaker than `attempted`: the caller must leave it alone *this* launch, but
+    /// the marker disappears on its own — a failed install is usually worth retrying.
+    pub failed_recently: bool,
 }
 
 /// Consult the cache first; query the registry only when the entry is stale, then remember
@@ -655,10 +680,12 @@ fn check_cached_at(
                 },
             };
             let attempted = cache.attempted_install(&status);
+            let failed_recently = cache.failed_recently(now, &status);
             return Checked {
                 status,
                 cached: true,
                 attempted,
+                failed_recently,
             };
         }
     }
@@ -671,23 +698,25 @@ fn check_cached_at(
     // An expired window is not news about the CLI: keep the marker while the answer is still the
     // version that was already tried, so a mismatched npm prefix does not reinstall for ever.
     let attempted = carried_attempt(previous.as_ref(), latest.as_deref());
-    let suppress = matches!(
-        &status,
-        Status::UpdateAvailable { to, .. } if attempted.as_deref() == Some(to.as_str())
-    );
-    let _ = write_cache_at(
-        cache_file,
-        &Cache {
-            checked_at: now,
-            installed: current.to_string(),
-            latest,
-            attempted,
-        },
-    );
+    let failed = carried_failure(previous.as_ref(), latest.as_deref(), now);
+    let fresh = Cache {
+        checked_at: now,
+        installed: current.to_string(),
+        latest,
+        attempted,
+        failed: failed.as_ref().map(|(version, _)| version.clone()),
+        failed_at: failed.as_ref().map(|(_, at)| *at).unwrap_or(0),
+    };
+    // Asked of the answer that is about to be stored, so both paths through this function
+    // answer the caller the same way.
+    let suppress = fresh.attempted_install(&status);
+    let failed_recently = fresh.failed_recently(now, &status);
+    let _ = write_cache_at(cache_file, &fresh);
     Checked {
         status,
         cached: false,
         attempted: suppress,
+        failed_recently,
     }
 }
 
@@ -704,6 +733,23 @@ pub fn carried_attempt(previous: Option<&Cache>, latest: Option<&str>) -> Option
     }
 }
 
+/// Which "the install failed" marker a fresh registry answer should carry forward.
+///
+/// Like [`carried_attempt`] it only survives the same version — a new release is a new
+/// decision — but it is also dropped once its window has passed, so a transient failure cannot
+/// pin the shell to an old version until the next release.
+fn carried_failure(
+    previous: Option<&Cache>,
+    latest: Option<&str>,
+    now: u64,
+) -> Option<(String, u64)> {
+    let previous = previous?;
+    let failed = previous.failed.clone()?;
+    let same_version = latest == Some(failed.as_str());
+    let in_window = now.saturating_sub(previous.failed_at) < FAILED_RETRY_MINUTES * 60;
+    (same_version && in_window).then_some((failed, previous.failed_at))
+}
+
 /// Remember that installing `latest` did not change the CLI this shell runs, so the cached
 /// answer is reported but not installed again.
 pub fn mark_attempt_ineffective(data_dir: &Path, latest: &str) {
@@ -713,6 +759,23 @@ pub fn mark_attempt_ineffective(data_dir: &Path, latest: &str) {
 /// The plugin counterpart of [`mark_attempt_ineffective`].
 pub fn mark_plugin_attempt_ineffective(data_dir: &Path, latest: &str) {
     mark_attempt_in(&plugin_cache_path(data_dir), latest);
+}
+
+/// Remember that installing the plugin market `latest` failed. The install ran and the CLI
+/// exited with an error (network, registry, a pnpm that is there but broken), which is usually
+/// transient: this suppresses the next attempt only for [`FAILED_RETRY_MINUTES`], so a bad
+/// minute does not cost the project every later release of the plugin.
+pub fn mark_plugin_attempt_failed(data_dir: &Path, latest: &str) {
+    mark_failed_in(&plugin_cache_path(data_dir), latest);
+}
+
+fn mark_failed_in(cache_file: &Path, latest: &str) {
+    let Some(mut cache) = read_cache_at(cache_file) else {
+        return;
+    };
+    cache.failed = Some(latest.to_string());
+    cache.failed_at = now_secs();
+    let _ = write_cache_at(cache_file, &cache);
 }
 
 fn mark_attempt_in(cache_file: &Path, latest: &str) {
@@ -818,6 +881,8 @@ mod tests {
             installed: installed.to_string(),
             latest: latest.map(|text| text.to_string()),
             attempted: None,
+            failed: None,
+            failed_at: 0,
         };
         // Inside the window, same installed version -> fresh.
         assert!(entry(Some("0.1.5-rc.2"), "0.1.5-rc.1").is_fresh(
@@ -849,6 +914,8 @@ mod tests {
             installed: "0.1.5-rc.1".into(),
             latest: Some("0.1.5-rc.2".into()),
             attempted: Some("0.1.5-rc.2".into()),
+            failed: None,
+            failed_at: 0,
         };
         write_cache(&dir, &cache).unwrap();
         assert_eq!(read_cache(&dir), Some(cache));
@@ -868,6 +935,8 @@ mod tests {
         .unwrap();
         let cache = read_cache(&dir).expect("legacy cache must parse");
         assert_eq!(cache.attempted, None);
+        assert_eq!(cache.failed, None);
+        assert_eq!(cache.failed_at, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -879,6 +948,8 @@ mod tests {
             installed: "0.1.5-rc.1".into(),
             latest: latest.map(str::to_string),
             attempted: attempted.map(str::to_string),
+            failed: None,
+            failed_at: 0,
         };
         assert_eq!(
             carried_attempt(
@@ -927,6 +998,8 @@ mod tests {
             installed: "0.1.5-rc.1".into(),
             latest: Some(latest.into()),
             attempted: Some("0.1.5-rc.2".into()),
+            failed: None,
+            failed_at: 0,
         };
         let wanted = vec!["latest".to_string()];
         std::fs::write(&tags, r#"{"latest":"0.1.5-rc.2"}"#).unwrap();
@@ -972,6 +1045,8 @@ mod tests {
                 installed: "0.1.5-rc.1".into(),
                 latest: Some("0.1.5-rc.2".into()),
                 attempted: None,
+                failed: None,
+                failed_at: 0,
             },
         )
         .unwrap();
@@ -1006,6 +1081,8 @@ mod tests {
                 installed: "0.1.5-rc.1".into(),
                 latest: Some("0.1.5-rc.3".into()),
                 attempted: Some("0.1.5-rc.2".into()),
+                failed: None,
+                failed_at: 0,
             },
         )
         .unwrap();
@@ -1013,6 +1090,92 @@ mod tests {
         assert!(!third.attempted, "only the attempted version is suppressed");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed install is not the same as an install that changed nothing: the first is
+    /// usually transient, so it must not pin the plugin (or the CLI) to an old version until
+    /// the registry head moves on (review A5).
+    #[test]
+    fn a_failed_install_only_suppresses_its_short_window() {
+        let dir = std::env::temp_dir().join("dsh-desktop-plugin-failed-attempt-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        // The cached branch never executes npm, so the path only has to exist as a value.
+        let npm = Path::new("/nonexistent/npm");
+        let tags = vec!["latest".to_string()];
+        let now = now_secs();
+        let cache = |failed_at: u64| Cache {
+            checked_at: now,
+            installed: "1.45.1".into(),
+            latest: Some("1.46.1".into()),
+            attempted: None,
+            failed: Some("1.46.1".into()),
+            failed_at,
+        };
+
+        // Just failed: this launch must report the update without stopping the Harness.
+        let plugin_cache = plugin_cache_path(&dir);
+        write_cache_at(&plugin_cache, &cache(now)).unwrap();
+        let just_failed = check_plugin_cached(npm, MARKET_PLUGIN, &tags, "1.45.1", &dir, 60);
+        assert!(just_failed.failed_recently);
+        assert!(
+            !just_failed.attempted,
+            "a failure is not the long-lived ineffective marker"
+        );
+
+        // What the shell records when the install itself fails: the failure marker only, never
+        // the long-lived "environment is wrong" one.
+        mark_plugin_attempt_failed(&dir, "1.46.1");
+        let stored = read_cache_at(&plugin_cache).unwrap();
+        assert_eq!(stored.failed.as_deref(), Some("1.46.1"));
+        assert_eq!(stored.attempted, None);
+        assert!(
+            stored.failed_at > 0,
+            "the marker carries the time it was set"
+        );
+
+        // Past the short window the shell tries again, even though the answer is still cached.
+        write_cache_at(&plugin_cache, &cache(now - FAILED_RETRY_MINUTES * 60 - 1)).unwrap();
+        let later = check_plugin_cached(npm, MARKET_PLUGIN, &tags, "1.45.1", &dir, 60);
+        assert!(later.cached, "the answer itself is still inside its window");
+        assert!(
+            !later.failed_recently,
+            "one bad minute must not pin this version for ever"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_attempt_is_carried_only_inside_its_window() {
+        let failed = |at: u64| Cache {
+            checked_at: at,
+            installed: "1.45.1".into(),
+            latest: Some("1.46.1".into()),
+            attempted: None,
+            failed: Some("1.46.1".into()),
+            failed_at: at,
+        };
+
+        // Same version, inside the window: the marker survives a fresh registry answer.
+        assert_eq!(
+            carried_failure(Some(&failed(1_000)), Some("1.46.1"), 1_000 + 60),
+            Some(("1.46.1".to_string(), 1_000))
+        );
+        // Window over: dropped, so the next launch may install.
+        assert_eq!(
+            carried_failure(
+                Some(&failed(1_000)),
+                Some("1.46.1"),
+                1_000 + FAILED_RETRY_MINUTES * 60
+            ),
+            None
+        );
+        // A newer version is a new decision, not a repeat.
+        assert_eq!(
+            carried_failure(Some(&failed(1_000)), Some("1.46.2"), 1_000),
+            None
+        );
+        assert_eq!(carried_failure(None, Some("1.46.1"), 1_000), None);
     }
 
     #[test]
@@ -1059,6 +1222,8 @@ mod tests {
                 installed: "0.1.5-rc.1".into(),
                 latest: Some("0.1.5-rc.2".into()),
                 attempted: None,
+                failed: None,
+                failed_at: 0,
             },
         )
         .unwrap();
@@ -1071,6 +1236,8 @@ mod tests {
                 installed: "1.45.1".into(),
                 latest: Some("1.46.1".into()),
                 attempted: None,
+                failed: None,
+                failed_at: 0,
             })
             .unwrap(),
         )
