@@ -839,9 +839,16 @@ YAML 解析；本机用假目录跑通「挪走精简版 → 再打自带运行�
 
 | 项 | 症状 | 修法 |
 |---|---|---|
-| A1 | 插件市场自动更新在 GUI 启动下必失败：`install_plugin` 的 PATH 只有 node 目录 + 应用自身 PATH，而 `dsh plugin add` 要转发给 pnpm（随包在 `<seed>/tools`）；失败前还先把实例停了，`Err` 分支又不写 attempted，于是每次启动重来 | 子进程环境组装（登录 shell 导入 + 工具前缀 + `npm_config_prefix`／`PNPM_HOME`）从 3d 提到 3b4，产物 `ChildEnv { path, vars }` 同时供插件安装与 harness 使用；安装前用 `update::find_pnpm` 解析 pnpm，解析不到就跳过（**不停实例**）；`Err` 分支补 `mark_plugin_attempt_ineffective` |
+| A1 | 插件市场自动更新在 GUI 启动下必失败：`install_plugin` 的 PATH 只有 node 目录 + 应用自身 PATH，而 `dsh plugin add` 要转发给 pnpm（随包在 `<seed>/tools`）；失败前还先把实例停了，`Err` 分支又不写 attempted，于是每次启动重来 | 子进程环境组装（登录 shell 导入 + 工具前缀 + `npm_config_prefix`／`PNPM_HOME`）从 3d 提到 3b4，产物 `ChildEnv { path, vars }` 同时供插件安装与 harness 使用；安装前用 `update::find_pnpm` 解析 pnpm，解析不到就跳过（**不停实例**）；`Err` 分支补一个**短期**失败标记（`mark_plugin_attempt_failed`，5 分钟，见下） |
 | A2 | 首启播种 profile 模板后立刻查 registry，破坏"首启不下载" | `seed_profile_template` 返回 `SeedOutcome { seeded, note }`，播过种的那一轮不查插件市场 |
 
-测试 71 → 75（`find_pnpm`、跳过策略、子进程 PATH、播种返回值四个用例）；命令行端到端：用组装出的
-PATH 在全新 `DSH_HOME` 上跑 `dsh plugin --profile web add dshmarket@1.46.1`，4.3 s 装好。
-细节与未做项见那份审查文档 §10。
+测试 71 → 77（`find_pnpm`、跳过策略、子进程 PATH、播种返回值，以及失败标记的短期窗口与续期边界六个
+用例）；命令行端到端：用组装出的 PATH 在全新 `DSH_HOME` 上跑 `dsh plugin --profile web add
+dshmarket@1.46.1`，4.3 s 装好。
+
+**失败标记为什么要短期**（审查文档 A5）：`attempted` 的语义是"装了但没生效，重试也没用"，会一直留到
+下次发版；而安装失败（网络、registry、pnpm 自身出错）几乎都是瞬时的。若也写长存标记，一次抖动就会让
+这个版本在 dshmarket 发布下一个版本之前都不再更新。所以 `Cache` 另加 `failed`/`failed_at`，只在
+`FAILED_RETRY_MINUTES`（5 分钟）内抑制，窗口一到自动重试。
+
+细节与未做项见那份审查文档 §10 与 §11.3。

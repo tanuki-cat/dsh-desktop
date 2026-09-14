@@ -15,7 +15,8 @@
 
 合并本身是干净的：两轮审查的全部修复都在，`#[cfg(windows)] compile_error!` 也已按"Windows 成为正式产物"
 正确移除。新增的 CI 比建议做得更严。问题集中在**新功能**上 —— 插件市场自动更新在 GUI 启动下必然失败，
-并且每次启动都会先停一次 Harness。A1/A2 已在同一轮修掉并由单测 + 命令行复现守住，见 §10。
+并且每次启动都会先停一次 Harness。A1/A2 已在同一轮修掉并由单测 + 命令行复现守住，见 §10；
+复核那次修复时又发现两处小项（A5/A6），见 §11 —— **A5 已按"短期失败标记"修掉（§11.3），A6 只记录备查**。
 
 | # | 级别 | 问题 | 位置 | 处理状态 |
 |---|---|---|---|---|
@@ -23,6 +24,8 @@
 | A2 | P2 | 首启播种后立刻联网装插件市场，与"离线首启"目标冲突 | `src-tauri/src/lib.rs:1075` 与 `1221` | **已修**（§10.2） |
 | A3 | P3 | `system_updates: notify` 与 `auto_update_plugins` 策略不一致：前者承诺不动用户的安装，后者仍重写用户 profile | `src-tauri/src/lib.rs:1221` 一带 | 待定 |
 | A4 | P3 | `is_session_supervisor` 仍是子串匹配（上一轮已提出，未改） | `src-tauri/src/lib.rs::is_session_supervisor` | 可不改 |
+| A5 | P3 | 插件安装的 `Err` 分支记 attempted，与 `carried_attempt` 叠加后把"瞬时失败"变成"永久不再尝试" | `src-tauri/src/lib.rs`（3b3 的 `Err` 分支）、`update.rs::carried_attempt` | **已修**（§11.3） |
+| A6 | P3 | 复用分支现在也要等登录 shell 抓取（`ChildEnv` 前移的副作用） | `src-tauri/src/lib.rs`（3b4） | 记录备查（§11.2） |
 
 **独立验证**：`cargo test` **71 passed / 0 failed**、`cargo clippy --all-targets -- -D warnings` **0 warning**、
 `cargo fmt --check` 通过。
@@ -266,3 +269,75 @@ A1 与 A2 一起修（同一块代码），A3／A4 未动。
   同一条命令去掉 `tools/bin` 仍是 `pnpm not found on PATH`（exit 127）—— 也就是修复前 Finder 启动会落进的
   那条路；
 - **仍未做**：GUI 实机验证（需要一次"registry 上有新版 + Finder 启动"的实跑），以及 A3 的策略决定。
+
+---
+
+## 11. 复核 A1/A2 修复时的新发现（2026-09-14）
+
+对 `efe93fb` 的复核结论：A1/A2 的修法正确、结构上排除了"探到了却装不了"的不一致，
+独立复跑 `cargo test` **75 passed**、`clippy` 0 warning、`fmt --check` 通过，
+并用仓库里已 staging 的自带运行时实测确认了"加上 `tools/bin` 后 `dsh plugin` 能解析到 pnpm"。
+以下两项是复核中新看到的，都不影响上述结论。
+
+### 11.1 A5（P3）：`Err` 分支记 attempted，会把瞬时失败变成永久不再尝试
+
+**位置**：`src-tauri/src/lib.rs` 步骤 3b3 的 `Err` 分支、`src-tauri/src/update.rs::carried_attempt`
+
+A1 的修法之一是"插件安装失败也记 attempted，同一缓存窗口内不重复尝试"。但
+`carried_attempt` 的规则是"registry 头版本不变就把 `attempted` 一直带下去"（那是 N4 为
+"装了但版本没变"设计的语义）。两者叠加后：
+
+> 一次网络抖动导致的 `dsh plugin add` 失败 ⇒ 插件市场**在 dshmarket 发布下一个版本之前都不再更新**。
+
+对比核心 `dsh` 的更新路径：它只在"装完了但被监管的 CLI 版本没变"时记 attempted，`Err` 不记 ——
+因为 `Err` 多半是可重试的。插件这条现在比核心更激进。
+
+**判断**：这是 A1 修复的合理副作用，但可以更贴切 —— "环境坏了"里最常见的那种（PATH 上没有 pnpm）
+已经被前置的 `find_pnpm` 探测挡住，不会再走到安装；`Err` 剩下的基本是网络、registry、pnpm 自身的
+瞬时故障。
+
+**修法（二选一）**：
+
+- 让 `Err` 沿用核心路径的语义（不记 attempted），把"别反复停实例"完全交给已经存在的 pnpm 探测；
+- 或区分两种标记：`attempted`（装了但无效，长期抑制）与一个带短 TTL 的失败标记
+  （例如复用 `FAILED_RETRY_MINUTES` 的 5 分钟窗口）。
+
+**顺带**：用户侧的复位手段是删 `<app-data>/plugin-check.json`，而 README 的排障目前只写了核心的
+`update-check.json` —— 无论选哪条修法，这一句都该补上。
+
+**已按第二条修掉（2026-09-14）**：见 §11.3；顺带那一句也一并补进 README 了。
+
+### 11.2 A6（P3，记录备查）：复用分支现在也要等登录 shell 抓取
+
+**位置**：`src-tauri/src/lib.rs` 步骤 3b4
+
+`ChildEnv::assemble` 前移之后，登录 shell 捕获线程在 3b4 被**无条件** join；而"复用本应用上次启动的
+Harness"会在其后的检测步骤直接返回 —— 这条路径以前不需要等这个结果。
+
+实测成本约 160 ms，上限 8 s（`shellenv::CAPTURE_TIMEOUT` 到期即 kill），可以接受。
+记在这里只是为了：以后排查"复用为什么比预期慢"时，不必再从头找这条依赖。
+
+若要优化，可以把 join 推迟到"确定要 spawn"之后，但那会让插件安装重新拿不到登录 shell 的 PATH ——
+除非把插件步骤也挪到检测之后。不建议为这 160 ms 动这块顺序。
+
+### 11.3 A5 的修复（2026-09-14）
+
+按 §11.1 的第二个方案做：**区分"装了但没生效"与"安装失败"**。
+
+| 项 | 改法 |
+|---|---|
+| 缓存结构 | `Cache` 增加 `failed: Option<String>` 与 `failed_at: u64`（都带 `#[serde(default)]`，旧文件照常解析）。长存的 `attempted` 语义不变：环境坏了、重试也没用 |
+| 判定 | `Cache::failed_recently(now, status)`：同一个版本 **且** `now - failed_at < FAILED_RETRY_MINUTES`（沿用既有的 5 分钟常量）。`Checked` 新增 `failed_recently: bool`，与 `attempted` 并列，调用点两个守卫各写各的日志 |
+| 跨查询续期 | 新增 `carried_failure(previous, latest, now)`：与 `carried_attempt` 一样只在同一版本上续，但**窗口一到就丢**，所以一次瞬时失败不会把某个版本钉到下一次发版 |
+| 标记函数 | `mark_plugin_attempt_failed`（写入 `failed`/`failed_at`），替换 3b3 `Err` 分支里原来的 `mark_plugin_attempt_ineffective`；"装了但版本没变"那条分支仍然用长存标记 |
+| 日志 | 新增 `plugin dshmarket <ver> failed to install last time; not retrying for 5 minutes`；原 `already attempted and changed nothing` 文案与语义都不变 |
+
+新增两个用例，`make test` **77 passed**（75 + 2）：
+
+| 用例 | 覆盖 |
+|---|---|
+| `update::tests::a_failed_install_only_suppresses_its_short_window` | 刚失败 → `failed_recently` 为真且 `attempted` 仍为假；窗口过后同一个缓存答案**重新允许安装**；`mark_plugin_attempt_failed` 只写失败标记，不碰长存标记 |
+| `update::tests::a_failed_attempt_is_carried_only_inside_its_window` | `carried_failure` 的三个边界：同版本窗口内续期、窗口到期丢弃、换版本丢弃 |
+
+顺带补的文档：README 的排障段现在写明两个缓存文件各管各的（核心 `update-check.json`、插件
+`plugin-check.json`），并说明失败只抑制 5 分钟、会自动重试。A6 依 §11.2 的结论不动。
