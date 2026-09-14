@@ -1,10 +1,11 @@
 //! Splash window, Harness window, and navigation policy.
 
 use crate::harness;
+use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::webview::{DownloadEvent, NewWindowResponse, PageLoadEvent};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -13,11 +14,161 @@ use url::Url;
 pub const SPLASH: &str = "splash";
 pub const HARNESS: &str = "harness";
 
+/// The event the splash page uses to report what this WebView can actually run.
+pub const PROBE_EVENT: &str = "dsh-desktop:webview-probe";
+
+/// APIs whose absence kills the dsh front end while it loads.
+///
+/// `Iterator` is the one that actually happened (2026-09-14, an Intel Mac): the bundled
+/// document-preview plugin evaluates `Iterator.prototype.join` without checking that the global
+/// exists, so a WebView whose JavaScriptCore predates Safari 18.4 throws during `import` and the
+/// window ends up showing the harness's opaque "Failed to load plugins" page. The `Iterator`
+/// global arrived in Safari 18.4 — macOS 15.4, or the Safari 18.4 update for macOS 13/14 — which
+/// is far newer than the macOS versions this bundle still allows (11.0).
+const REQUIRED_APIS: &[&str] = &["Iterator"];
+
+/// APIs whose absence only costs a feature. Reported, never fatal: the bundled PDF writer uses
+/// `Math.sumPrecise`, which no Safari release ships yet.
+const OPTIONAL_APIS: &[&str] = &[
+    "Promise.withResolvers",
+    "Math.sumPrecise",
+    "structuredClone",
+];
+
+/// What the splash page found missing in this WebView.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct WebviewReport {
+    /// Required APIs that are absent: the dsh front end cannot load.
+    #[serde(default)]
+    pub missing: Vec<String>,
+    /// Optional APIs that are absent: some feature will misbehave.
+    #[serde(default)]
+    pub degraded: Vec<String>,
+    /// `navigator.userAgent`, for the log and the failure page.
+    #[serde(default)]
+    pub agent: String,
+}
+
+impl WebviewReport {
+    /// Parse what the page sent. A payload this shell cannot read is not a reason to refuse to
+    /// start — it only costs the diagnostics.
+    pub fn parse(payload: &str) -> Option<WebviewReport> {
+        serde_json::from_str(payload).ok()
+    }
+
+    /// False when the dsh front end cannot load in this WebView.
+    pub fn supported(&self) -> bool {
+        self.missing.is_empty()
+    }
+
+    /// The text of the failure page: what is missing, what this dsh version needs, what to do.
+    pub fn describe(&self, dsh_version: &str) -> String {
+        let mut text = format!(
+            "系统 WebView 缺少 dsh {dsh_version} 前端必需的 JavaScript 能力：{}。\n\
+             这个版本的界面需要 Safari 18.4（macOS 15.4）或更新的 WebKit，升级系统或安装 Safari 更新后重试。",
+            self.missing.join("、")
+        );
+        if !self.degraded.is_empty() {
+            text.push_str(&format!(
+                "\n另外缺少（只影响部分功能）：{}。",
+                self.degraded.join("、")
+            ));
+        }
+        if !self.agent.is_empty() {
+            text.push_str(&format!("\n当前 WebView：{}", self.agent));
+        }
+        text
+    }
+}
+
+/// What the splash page reported, once.
+///
+/// `None` means "never reported" (the probe could not run, or the page never loaded). That is
+/// treated as supported: refusing to start because a *diagnostic* is missing would be worse than
+/// the bug it detects.
+static REPORT: Mutex<Option<WebviewReport>> = Mutex::new(None);
+
+/// How long to wait for that report. The splash page loads long before the Harness is up, so
+/// only the fast path — reusing a live instance — can arrive here first.
+const PROBE_WAIT: Duration = Duration::from_millis(500);
+
+/// Store what the page reported (called from the event listener in `run`).
+pub fn record_report(payload: &str) {
+    let Some(report) = WebviewReport::parse(payload) else {
+        harness::app_log(&format!("无法解析 WebView 能力探测的上报：{payload}"));
+        return;
+    };
+    *REPORT.lock().unwrap() = Some(report);
+}
+
+/// The reason this WebView cannot host the dsh front end, when the page reported one.
+///
+/// `None` means "no reason known" — either the report says the WebView is fine or the probe
+/// never arrived (see [`REPORT`]).
+pub fn unsupported_webview() -> Option<WebviewReport> {
+    let deadline = Instant::now() + PROBE_WAIT;
+    loop {
+        if let Some(report) = REPORT.lock().unwrap().as_ref() {
+            return (!report.supported()).then(|| report.clone());
+        }
+        if Instant::now() >= deadline {
+            harness::app_log("WebView 能力探测没有上报，按支持处理");
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The script that asks the page what this WebView can run.
+///
+/// It is injected into the splash window, which is our own page and the only one holding core
+/// capabilities (`capabilities/splash.json`); the Harness window deliberately gets none.
+fn probe_script() -> String {
+    let mut checks = String::new();
+    for (list, names) in [("missing", REQUIRED_APIS), ("degraded", OPTIONAL_APIS)] {
+        for name in names {
+            checks.push_str(&format!(
+                "  try {{ if (typeof {name} === \"undefined\") {list}.push(\"{name}\"); }} catch (error) {{ {list}.push(\"{name}\"); }}\n"
+            ));
+        }
+    }
+    PROBE_TEMPLATE
+        .replace("%CHECKS%", &checks)
+        .replace("%EVENT%", PROBE_EVENT)
+}
+
+/// The probe's JavaScript. ES5 on purpose: it has to run on the very engines this exists to
+/// diagnose. `window.__TAURI_INTERNALS__` may not exist yet (Tauri installs its IPC bridge in
+/// its own initialization script), so the report retries briefly and then gives up quietly.
+const PROBE_TEMPLATE: &str = r#"
+(function () {
+  var missing = [];
+  var degraded = [];
+%CHECKS%
+  var payload = { missing: missing, degraded: degraded, agent: navigator.userAgent };
+  function report(attempt) {
+    try {
+      if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) {
+        window.__TAURI_INTERNALS__.invoke("plugin:event|emit", { event: "%EVENT%", payload: payload });
+        return;
+      }
+    } catch (error) {
+      // An old WebView can throw here; fall through to the retry, then give up quietly.
+    }
+    if (attempt < 40) setTimeout(function () { report(attempt + 1); }, 25);
+  }
+  report(0);
+})();
+"#;
+
 pub fn create_splash(app: &AppHandle) -> tauri::Result<()> {
     let window = WebviewWindowBuilder::new(app, SPLASH, WebviewUrl::App("index.html".into()))
         .title("DeepSeek Harness")
         .inner_size(460.0, 300.0)
         .resizable(false)
+        // Ask this WebView what it can run before anything is spawned: an engine older than
+        // Safari 18.4 cannot load the current dsh front end at all (see `WebviewReport`).
+        .initialization_script(probe_script())
         .build()?;
     // Tauri keeps the app alive when its last window closes, so a status window the user
     // dismisses (typically after a failed start) would leave a windowless app behind. Only
@@ -395,6 +546,83 @@ mod tests {
         assert!(!allow("javascript:alert(1)"));
         assert!(!allow("data:text/html,<script>alert(1)</script>"));
         assert!(!allow("mailto:someone@example.com"));
+    }
+
+    #[test]
+    fn a_missing_required_api_makes_the_webview_unsupported() {
+        let report = WebviewReport::parse(
+            r#"{"missing":["Iterator"],"degraded":["Math.sumPrecise"],"agent":"Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15"}"#,
+        )
+        .expect("the page's report must parse");
+
+        assert!(!report.supported());
+        let text = report.describe("0.1.5-rc.2");
+        assert!(text.contains("Iterator"), "缺什么要写清楚：{text}");
+        assert!(text.contains("0.1.5-rc.2"), "是哪个 dsh 版本要写清楚");
+        // The user has to be told what to do about it — that is what the opaque plugin error
+        // this replaces never did.
+        assert!(text.contains("Safari 18.4"), "补救方向要写清楚：{text}");
+        assert!(text.contains("Math.sumPrecise"), "降级项也要列出来");
+        assert!(text.contains("AppleWebKit"), "报上当前 WebView 便于排查");
+    }
+
+    #[test]
+    fn a_degraded_but_complete_webview_still_starts() {
+        let report =
+            WebviewReport::parse(r#"{"missing":[],"degraded":["Math.sumPrecise"],"agent":"x"}"#)
+                .expect("the page's report must parse");
+        assert!(
+            report.supported(),
+            "a missing optional API must never block the GUI"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_report_is_not_a_reason_to_refuse_to_start() {
+        assert_eq!(WebviewReport::parse("not json"), None);
+        // An empty report is a WebView that found nothing missing: supported.
+        assert_eq!(
+            WebviewReport::parse("{}").map(|report| report.supported()),
+            Some(true)
+        );
+    }
+
+    /// One test owns the process-wide report slot on purpose: `record_report` overwrites it,
+    /// and every assertion here depends on what was reported last.
+    #[test]
+    fn the_gate_reads_what_the_page_reported() {
+        record_report(r#"{"missing":["Iterator"],"degraded":[],"agent":"old"}"#);
+        let refused = unsupported_webview().expect("a missing Iterator must be refused");
+        assert_eq!(refused.missing, ["Iterator"]);
+
+        // A payload this shell cannot read keeps the previous answer (logged, not fatal).
+        record_report("not json");
+        assert!(
+            unsupported_webview().is_some(),
+            "a broken report must not clear a refusal"
+        );
+
+        // A complete WebView starts, however many optional APIs are missing.
+        record_report(r#"{"missing":[],"degraded":["Math.sumPrecise"],"agent":"new"}"#);
+        assert!(
+            unsupported_webview().is_none(),
+            "a complete WebView must start"
+        );
+    }
+
+    #[test]
+    fn the_probe_asks_about_the_api_that_broke_the_ui() {
+        let script = probe_script();
+        // The one that actually failed in the field (see REQUIRED_APIS).
+        assert!(script.contains("typeof Iterator === \"undefined\""));
+        assert!(script.contains("Math.sumPrecise"));
+        // It reports through the splash window's core capability.
+        assert!(script.contains(PROBE_EVENT));
+        assert!(script.contains("plugin:event|emit"));
+        // It runs on exactly the engines it exists to diagnose: keep it ES5.
+        assert!(!script.contains("=>"), "the probe must stay ES5");
+        assert!(!script.contains('`'), "the probe must stay ES5");
+        assert!(!script.contains("??"), "the probe must stay ES5");
     }
 
     #[test]

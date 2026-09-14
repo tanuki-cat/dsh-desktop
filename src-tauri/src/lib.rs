@@ -20,7 +20,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager, RunEvent};
+use tauri::{AppHandle, Listener, Manager, RunEvent};
 
 /// First run may initialise a profile; later runs are fast (measured ~4s on macOS).
 const STARTUP_TIMEOUT_FIRST: Duration = Duration::from_secs(90);
@@ -352,6 +352,11 @@ pub fn run() {
             }
         }))
         .setup(|app| {
+            // The splash page reports what this WebView can run; the listener has to exist
+            // before that page loads (see `window::WebviewReport`).
+            app.listen(window::PROBE_EVENT, |event| {
+                window::record_report(event.payload());
+            });
             let handle = app.handle().clone();
             window::create_splash(&handle)?;
             std::thread::spawn(move || startup(handle));
@@ -1587,6 +1592,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                     window::set_status(app, "复用本应用上次启动的 Harness…", &format!("pid {pid}"));
                     // Adopted, but still ours: quitting must stop it rather than leave an orphan.
                     adopt(pid, data_dir);
+                    if refuse_an_old_webview(app, &version) {
+                        return Ok(());
+                    }
                     return window::create_harness(app, &url, port).map_err(|e| e.to_string());
                 }
                 // Our own instance that a fresh update just made obsolete: it is our child, so
@@ -1716,6 +1724,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         },
     );
 
+    if refuse_an_old_webview(app, &version) {
+        return Ok(());
+    }
     if let Err(error) = window::create_harness(app, &url, actual_port) {
         return abort_start(pid, error.to_string());
     }
@@ -1732,6 +1743,28 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
 
 fn fail(app: &AppHandle, status: &str, detail: &str) {
     window::set_status(app, status, detail);
+}
+
+/// Show the failure page instead of the Harness window when this WebView cannot run the dsh
+/// front end. Returns true when it did, so the caller stops before opening anything.
+///
+/// The splash page probes for this at load (see [`window::WebviewReport`]); the answer is
+/// normally there long before the Harness is up. A missing answer counts as supported, so a
+/// lost diagnostic can never lock the user out of a working GUI.
+fn refuse_an_old_webview(app: &AppHandle, version: &str) -> bool {
+    let Some(report) = window::unsupported_webview() else {
+        return false;
+    };
+    harness::app_log(&format!(
+        "WebView 缺少 dsh 前端必需的能力（{}），改用失败页而不是打开界面",
+        report.missing.join("、")
+    ));
+    window::show_failure(
+        app,
+        "系统 WebView 无法运行这个 dsh 版本的界面",
+        &report.describe(version),
+    );
+    true
 }
 
 #[cfg(test)]
