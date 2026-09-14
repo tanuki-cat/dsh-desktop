@@ -12,7 +12,8 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 >
 > **macOS 的 WebView 下限**：dsh 的前端需要 **Safari 18.4（macOS 15.4）或更新的 WebKit** —— 随包的
 > document-preview 插件在更旧的引擎上会在加载期抛 `Can't find variable: Iterator`。壳会在打开界面前
-> 探测 WebView，不满足时给出写明原因的失败页，而不是 harness 那句 `Failed to load plugins`。
+> 探测 WebView：**不满足就改用默认浏览器打开界面**（就是 `dsh web` 一直在用的那条路，浏览器有独立的
+> JS 引擎、会持续更新），并在状态窗口里写清原因 —— 不会再把用户丢给 harness 那句 `Failed to load plugins`。
 > `minimumSystemVersion` 仍是 11.0：那只约束安装与进程启动，界面另有这道运行时判定（见[已知坑](#已知坑)）。
 >
 > **分支策略**：自带运行时开发用的 `feat/bundled-runtime` 已合并回 `main`（2026-09-13），
@@ -127,8 +128,10 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - **旧 macOS 的界面会加载失败**（`Failed to load plugins` / `Can't find variable: Iterator`）：随包的
   `dsh-client-ui-sidebar-documentpreview` 内联 pdfjs，其中给 `Iterator.prototype.join` 打补丁的那行
   没有先判断全局 `Iterator` 是否存在，而该全局是 **Safari 18.4** 才有的（macOS ≤ 12 拿不到，13/14 需要装
-  Safari 18.4 更新）。壳现在会在启动阶段探测并给出失败页（`window.rs::WebviewReport`）；彻底修法在上游
-  的插件包里。Intel 机器更容易停在旧系统，所以这个现象看着像「macos-x64 专属」。
+  Safari 18.4 更新）。壳现在会在启动阶段探测：**旧系统自动改用默认浏览器打开界面**（`window.rs::WebviewReport`
+  + `lib.rs::hand_the_gui_to_the_browser`），状态窗口里保留 harness 的管理职责（更新、退出清理），
+  关掉它就停 harness。彻底修法仍在上游的插件包里。Intel 机器更容易停在旧系统，所以这个现象看着像
+  「macos-x64 专属」。
 
 ### 自带运行时（已并入 main）
 

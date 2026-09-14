@@ -863,9 +863,12 @@ pdfjs-dist 6.3.289，其中给 `Iterator.prototype.join` 打补丁的那行没�
 而该全局是 **Safari 18.4（macOS 15.4）** 才有的 —— 比 §22 里 `minimumSystemVersion` 11.0 高得多。
 
 壳侧已在打开 harness 窗口**之前**判定：splash 注入探针（ES5）→ 经 `core:event:emit` 上报 →
-`window::unsupported_webview()` 最多等 500 ms → `lib.rs::refuse_an_old_webview` 命中就显示写明原因的
-失败页并记日志；探测缺失按支持处理（fail-open）。必需项只有 `Iterator`，`Math.sumPrecise` 等只作为
-「降级项」上报。
+`window::unsupported_webview()` 最多等 500 ms → `lib.rs::hand_the_gui_to_the_browser` 命中就**改用默认
+浏览器打开界面**（`window::open_external`）并留一个写明原因的管理窗口（关掉它会停 harness）；探测缺失
+按支持处理（fail-open）。必需项只有 `Iterator`，`Math.sumPrecise` 等只作为「降级项」上报。
+
+走浏览器而不是在 WebView 里打补丁，是因为旧系统上 `dsh web` 一直可用（浏览器引擎会更新，系统 WebView
+不会），而补丁集既没法在本仓库验证、也会随 dsh 升级继续漂移 —— 理由与证据见那份审查文档 §3.2。
 
 完整结论、证据链（BCD／WebKit 发布说明／pdfjs 那行源码）、影响面与未做项（上游修 + 真机验证）见
 [`design-task-fix-webview-compat-audit.md`](./design-task-fix-webview-compat-audit.md)。测试 77 → 82。
