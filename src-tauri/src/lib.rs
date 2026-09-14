@@ -2246,6 +2246,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// PATH as a list of entries, with one separator convention for both platforms.
+    fn path_entries(path: &str) -> Vec<String> {
+        std::env::split_paths(path)
+            .map(|entry| slashy(&entry))
+            .collect()
+    }
+
+    /// Render a path the same way on Windows and elsewhere, for assertions.
+    fn slashy(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
     /// Look one variable up in an assembled child environment.
     fn value_of(env: &ChildEnv, key: &str) -> Option<String> {
         env.vars
@@ -2282,17 +2294,36 @@ mod tests {
         let data_dir = std::env::temp_dir().join("dsh-desktop-child-env-test");
         let _ = std::fs::remove_dir_all(&data_dir);
         let config = Config::load(&data_dir);
-        let node = Path::new("/opt/app/runtime/node/bin/node");
-        let seed = Path::new("/opt/app/runtime");
+        // Absolute on the host platform: a leading `/` is root-relative on Windows, and
+        // `merge_path` drops anything that is not absolute — so these paths are built from
+        // `temp_dir` instead of being hard-coded. The Windows CI gate caught the original
+        // version (a bare `/opt/...` compared as a whole-PATH string prefix).
+        let app = data_dir.join("app");
+        let node = app.join("runtime/node/bin/node");
+        let seed = app.join("runtime");
         let tools = data_dir.join("runtime/tools");
 
-        let bundled =
-            ChildEnv::assemble(&config, node, Some(seed), true, &data_dir, &BTreeMap::new());
-        assert!(bundled.path.starts_with("/opt/app/runtime/node/bin"));
-        assert!(bundled
-            .path
-            .contains(&tools.join("bin").to_string_lossy().to_string()));
-        assert!(bundled.path.contains("/opt/app/runtime/tools/bin"));
+        let bundled = ChildEnv::assemble(
+            &config,
+            &node,
+            Some(&seed),
+            true,
+            &data_dir,
+            &BTreeMap::new(),
+        );
+        // Compare entries as normalised strings: Windows renders `/` as `\` on the way through
+        // `join_paths`, so a whole-PATH string prefix is not portable either.
+        let entries = path_entries(&bundled.path);
+        let node_dir = slashy(node.parent().expect("the test node has a directory"));
+        let writable = slashy(&tools.join("bin"));
+        let shipped = slashy(&seed.join("tools").join("bin"));
+        assert_eq!(
+            entries.first().map(String::as_str),
+            Some(node_dir.as_str()),
+            "the node directory must lead PATH"
+        );
+        assert!(entries.contains(&writable), "可写 tools 前缀在 PATH 上");
+        assert!(entries.contains(&shipped), "随包 tools 前缀在 PATH 上");
         // Global installs land in the writable prefix, never in the signed bundle.
         assert_eq!(
             value_of(&bundled, "PNPM_HOME"),
@@ -2305,7 +2336,7 @@ mod tests {
         assert_eq!(value_of(&bundled, "PATH"), Some(bundled.path.clone()));
 
         // A system install is the user's own tree: no toolchain of ours is pushed into it.
-        let system = ChildEnv::assemble(&config, node, None, false, &data_dir, &BTreeMap::new());
+        let system = ChildEnv::assemble(&config, &node, None, false, &data_dir, &BTreeMap::new());
         assert!(!system.path.contains(&tools.to_string_lossy().to_string()));
         assert_eq!(value_of(&system, "PNPM_HOME"), None);
 
