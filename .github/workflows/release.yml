@@ -286,6 +286,10 @@ jobs:
           自带运行时版首次启动会用包内的 Node + dsh 拉起 Web GUI，不需要联网下载；dsh 核心与插件市场
           dshmarket 之后跟随 npm registry 自动更新（默认开启，可用 config.json 的 auto_update 关闭）。
 
+          > 🖥 **macOS 的界面需要 Safari 18.4（macOS 15.4）或更新的 WebKit**：随包的 document-preview 插件
+          > 在更旧的引擎上会在加载期抛 `Can't find variable: Iterator`。壳会先探测再决定是否打开界面，
+          > 不满足时给出写明原因的提示（不会再看到 `Failed to load plugins`）。
+
           > ⚠️ 这些构建**未签名也未公证**：macOS 首次打开请右键 →「打开」，或执行
           > xattr -dr com.apple.quarantine "/Applications/DSH Desktop.app"。Linux 上 WebKitGTK 仍来自系统。
 
