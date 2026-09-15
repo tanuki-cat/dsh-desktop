@@ -22,6 +22,13 @@ pub const PROBE_EVENT: &str = "dsh-desktop:webview-probe";
 /// The event the status page uses to ask for another attempt at starting the Harness.
 pub const RESTART_EVENT: &str = "dsh-desktop:restart-harness";
 
+/// The event the takeover question answers on. The page names it as a string literal; a test
+/// binds the two, because renaming one side alone would silently drop every answer.
+pub const CHOICE_EVENT: &str = "dsh-desktop:takeover-choice";
+
+/// Question ids, so an answer that crossed a retry cannot be mistaken for the current one.
+static NEXT_QUESTION: AtomicU64 = AtomicU64::new(0);
+
 /// APIs the compat layer can install when this WebView lacks them (see [`compat_script`]).
 ///
 /// `Iterator` is the one that actually happened (2026-09-14, an Intel Mac): the bundled
@@ -257,6 +264,172 @@ fn wait_for<T>(read: impl Fn() -> Option<T>) -> Option<T> {
 /// The last report the splash page sent, for the startup log and the status page.
 pub fn report() -> Option<WebviewReport> {
     REPORT.lock().unwrap().clone()
+}
+
+/// One button of a takeover question.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ChoiceOption {
+    /// Sent back by the page; the shell matches on it rather than on the label.
+    pub id: String,
+    /// What the user reads. Built by the shell, so it can name the pid, the command and the port.
+    pub label: String,
+}
+
+/// The answer to a takeover question, and the id that produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub question: u64,
+    pub id: String,
+}
+
+/// The question the shell is waiting on, and its answer when it arrives.
+struct Asked {
+    question: u64,
+    answer: Mutex<Option<Choice>>,
+}
+
+static ASKED: Mutex<Option<Asked>> = Mutex::new(None);
+
+/// How long a takeover question stays on screen before the shell answers it itself.
+///
+/// A window nobody is looking at — a headless launch, or a user who walked away — must not park
+/// the startup thread for ever. The timeout picks the safe answer (leave the other instance
+/// alone), which is also the default the shell had before it asked at all.
+pub const CHOICE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long to wait for the answer to question @@id@@, giving up after @@timeout@@.
+///
+/// A function of its reader so the waiting is testable without a window, and so the timeout can
+/// be a few milliseconds in a test.
+pub fn wait_for_choice(
+    id: u64,
+    timeout: Duration,
+    read: impl Fn() -> Option<Choice>,
+) -> Option<Choice> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(choice) = read() {
+            if choice.question == id {
+                return Some(choice);
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Ask the user what to do about a Harness this shell did not start, and wait for the answer.
+///
+/// Returns @@None@@ when the question could not be put (no status window, a page that never
+/// loaded) or when the timeout ran out. The caller answers that with the safe option: leaving
+/// another instance alone is always recoverable, killing one is not.
+pub fn ask_choice(
+    app: &AppHandle,
+    status: &str,
+    detail: &str,
+    options: &[ChoiceOption],
+    hint: &str,
+) -> Option<String> {
+    let question = NEXT_QUESTION.fetch_add(1, Ordering::SeqCst) + 1;
+    {
+        let mut asked = ASKED.lock().unwrap();
+        *asked = Some(Asked {
+            question,
+            answer: Mutex::new(None),
+        });
+    }
+    // The status page is where the question is drawn, so it has to be the page in front — the
+    // same call the failure paths use, which rebuilds it when an earlier one was destroyed.
+    if !present_status_page(app) {
+        *ASKED.lock().unwrap() = None;
+        return None;
+    }
+    let options = options.to_vec();
+    let script = choice_script(question, status, detail, &options, hint);
+    if let Some(window) = app.get_webview_window(SPLASH) {
+        let _ = window.eval(script);
+    }
+    let answer = wait_for_choice(question, CHOICE_TIMEOUT, || {
+        ASKED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|asked| asked.answer.lock().unwrap().clone())
+    });
+    *ASKED.lock().unwrap() = None;
+    match answer {
+        Some(choice) => {
+            harness::app_log(&format!("接管确认：用户选择 {}", choice.id));
+            Some(choice.id)
+        }
+        None => {
+            harness::app_log("接管确认没有收到答复（超时或页面未加载），按最安全的选项处理");
+            None
+        }
+    }
+}
+
+/// Record the page's answer. Ignored when no question is outstanding, or when it names one that
+/// is not the current question (a click that crossed a retry).
+pub fn record_choice(payload: &str) {
+    let Some(parsed) = ChoiceAnswer::parse(payload) else {
+        harness::app_log(&format!("无法解析接管确认的回答：{payload}"));
+        return;
+    };
+    let guard = ASKED.lock().unwrap();
+    let Some(asked) = guard.as_ref() else {
+        return;
+    };
+    if parsed.question != asked.question {
+        return;
+    }
+    *asked.answer.lock().unwrap() = Some(Choice {
+        question: asked.question,
+        id: parsed.id,
+    });
+}
+
+/// What the page reports when a button is clicked.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ChoiceAnswer {
+    pub question: u64,
+    pub id: String,
+}
+
+impl ChoiceAnswer {
+    pub fn parse(payload: &str) -> Option<ChoiceAnswer> {
+        serde_json::from_str(payload).ok()
+    }
+}
+
+/// Ask the page to draw the question. Escaping lives here so it is testable without a window.
+fn choice_script(
+    question: u64,
+    status: &str,
+    detail: &str,
+    options: &[ChoiceOption],
+    hint: &str,
+) -> String {
+    let status = json!(status);
+    let detail = json!(detail);
+    let options = json!(options);
+    let hint = json!(hint);
+    format!(
+        "(function () {{\n\
+         var ask = function () {{\n\
+         if (!window.__askChoice) return false;\n\
+         window.__askChoice({question}, {status}, {detail}, {options}, {hint});\n\
+         return true;\n\
+         }};\n\
+         if (ask()) return;\n\
+         var attempts = 0;\n\
+         var timer = setInterval(function () {{\n\
+         if (ask() || ++attempts > 40) clearInterval(timer);\n\
+         }}, 25);\n\
+         }})()"
+    )
 }
 
 /// The script that asks the page what this WebView can run.
@@ -2007,6 +2180,39 @@ mod tests {
             page.contains("plugin:event|emit"),
             "只走 splash 窗口已有的 core 事件能力，不新增 capability"
         );
+    }
+
+    /// The takeover question is a second event on the same bridge, and the answer is matched
+    /// on the question id: a click that crossed a retry must not be read as the current answer.
+    #[test]
+    fn the_takeover_question_and_its_answer_stay_in_step() {
+        let page = include_str!("../../src/index.html");
+        assert!(
+            page.contains(CHOICE_EVENT),
+            "页面的回答事件名要和壳常量一致"
+        );
+        assert!(page.contains("__askChoice"), "页面要有提问入口");
+        assert!(page.contains("question: question"), "回答必须带回问题 id");
+        // The labels come from the shell and are drawn as text: a process command line must
+        // never be able to become markup on this page.
+        assert!(page.contains("textContent = option.label"), "{page}");
+        assert!(!page.contains("innerHTML"), "提问面板不能用 innerHTML 渲染");
+    }
+
+    /// The question script escapes what it carries: a command line can hold quotes, and a
+    /// broken script would leave the user with a page that never asks anything.
+    #[test]
+    fn the_choice_script_escapes_its_payload() {
+        let options = vec![ChoiceOption {
+            id: "take-over".to_string(),
+            label: "终止 \"node\" 并接管".to_string(),
+        }];
+        let script = choice_script(7, "标题", "详情", &options, "提示");
+        assert!(script.contains("window.__askChoice(7,"), "{script}");
+        assert!(script.contains(r#"\"node\""#), "{script}");
+        // The retry wrapper is the same one the status page uses: an eval that lands before
+        // the page parsed its head must not be lost.
+        assert!(script.contains("setInterval"), "{script}");
     }
 
     #[test]

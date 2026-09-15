@@ -93,6 +93,49 @@ fn run_in_node(name: &str, driver: &str, script: &str, extra_arg: Option<&str>) 
     stdout
 }
 
+/// Like [`run_in_node`], but the driver gets the splash page **in full**.
+///
+/// The compat probe only needs the head: it is a diagnostic that runs before the body exists. The
+/// status page is the opposite — its buttons and panels live in the body — so a driver for that
+/// half has to be handed the whole document.
+fn run_in_node_with_page(
+    name: &str,
+    driver: &str,
+    script: &str,
+    extra_arg: Option<&str>,
+) -> String {
+    let Some(node) = path_lookup("node") else {
+        eprintln!("skipped: node is not on PATH");
+        return String::new();
+    };
+    let dir = std::env::temp_dir().join(format!("dsh-desktop-{name}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir must be creatable");
+    let driver_path = dir.join("driver.js");
+    let script_path = dir.join("script.js");
+    let page_path = dir.join("index.html");
+    std::fs::write(&driver_path, driver).expect("driver must be writable");
+    std::fs::write(&script_path, script).expect("generated script must be writable");
+    std::fs::write(&page_path, include_str!("../../src/index.html"))
+        .expect("page must be writable");
+
+    let mut command = Command::new(&node);
+    command.arg(&driver_path).arg(&script_path);
+    if let Some(arg) = extra_arg {
+        command.arg(arg);
+    }
+    command.arg(&page_path);
+    let output = command.output().expect("node must be spawnable");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "{name} failed in node:\n{stdout}\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    stdout
+}
+
 /// A probe run stands in for the splash page: the page's head scripts run first (they produce the
 /// syntax verdict the probe waits for), and `window.__TAURI_INTERNALS__` captures the report.
 const PROBE_DRIVER: &str = r#"
@@ -264,6 +307,112 @@ fn the_compat_layer_revives_an_engine_without_those_apis() {
         .join(", ");
     let driver = DRIVER.replace("%PATHS%", &format!("[{paths}]"));
     let stdout = run_in_node("dsh-desktop-compat-shim-test", &driver, &script, None);
+    println!("{}", stdout.trim());
+}
+
+/// Runs the whole splash page — head and body — against a minimal DOM.
+///
+/// The status page's behaviour is DOM work, and the Rust-side tests can only assert that certain
+/// strings appear in the file. That is not the same claim: an index into the wrong buffer slot
+/// renders an empty panel while every string is present (found exactly that way, 2026-09-16).
+/// Node has no DOM, so the driver supplies the smallest one the page actually uses and records
+/// what the page does with it.
+const CHOICE_DRIVER: &str = r#"
+const assert = require("assert");
+const fs = require("fs");
+const vm = require("vm");
+
+// Every element the page touches, with just enough behaviour to observe the result.
+const makeElement = function (tag) {
+  const element = {
+    tagName: tag.toUpperCase(),
+    children: [],
+    hidden: false,
+    disabled: false,
+    listeners: {},
+    _text: "",
+    appendChild(child) { this.children.push(child); return child; },
+    removeChild(child) { this.children = this.children.filter((c) => c !== child); return child; },
+    addEventListener(name, fn) { (this.listeners[name] = this.listeners[name] || []).push(fn); },
+    click() { (this.listeners.click || []).forEach((fn) => fn.call(this)); },
+    querySelectorAll() {
+      const found = [];
+      const walk = (node) => { if (node.tagName === "BUTTON") found.push(node); node.children.forEach(walk); };
+      this.children.forEach(walk);
+      return found;
+    },
+    classList: { toggle() {} }
+  };
+  Object.defineProperty(element, "firstChild", { get() { return this.children[0] || null; } });
+  Object.defineProperty(element, "textContent", {
+    get() { return this._text; },
+    set(value) { this._text = String(value); this.children = []; }
+  });
+  return element;
+};
+
+const byId = {};
+const sent = [];
+globalThis.document = {
+  body: makeElement("body"),
+  getElementById(id) { return (byId[id] = byId[id] || makeElement("div")); },
+  createElement(tag) { return makeElement(tag); }
+};
+globalThis.window = globalThis;
+globalThis.__TAURI_INTERNALS__ = {
+  invoke(command, args) { sent.push({ command: command, args: args }); return Promise.resolve(); }
+};
+
+// The shipped page, in full: every script block runs, in document order.
+// argv: node, driver.js, script, <extra arg>, page — the extra arg is the event name here.
+const page = fs.readFileSync(process.argv[4], "utf8");
+const bodies = [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+assert.ok(bodies.length >= 4, "the page must ship its head and body scripts");
+bodies.forEach((body) => vm.runInThisContext(body, { filename: "page.js" }));
+
+// Rust asks the question, exactly as `window::choice_script` does.
+const options = [
+  { id: "take-over", label: "终止 pid 4242 并接管端口 3080" },
+  { id: "browser", label: "保留它，用系统浏览器打开" },
+  { id: "cancel", label: "什么都不做，退出本应用" }
+];
+globalThis.__askChoice(7, "检测到其它 Harness", "进程: pid 4242\nworkspace: /Users/me/project", options, "120 秒内没有选择将按配置处理。");
+
+const panel = byId.choice;
+assert.strictEqual(panel.hidden, false, "the question must show the panel");
+assert.strictEqual(byId.status.textContent, "检测到其它 Harness");
+assert.ok(byId.detail.textContent.indexOf("pid 4242") >= 0, "the detail must carry the process");
+assert.strictEqual(byId.retry.hidden, true, "the restart button must not race the answer");
+
+const buttons = panel.querySelectorAll();
+assert.strictEqual(buttons.length, options.length, "one button per option, no more");
+assert.strictEqual(buttons[0].textContent, options[0].label);
+assert.strictEqual(buttons[2].textContent, options[2].label);
+assert.ok(panel.children.length > options.length, "the timeout hint is shown as well");
+
+buttons[1].click();
+assert.strictEqual(sent.length, 1, "one click, one answer");
+assert.strictEqual(sent[0].command, "plugin:event|emit");
+assert.strictEqual(sent[0].args.event, process.argv[3]);
+assert.strictEqual(sent[0].args.payload.question, 7, "the answer must name its question");
+assert.strictEqual(sent[0].args.payload.id, "browser");
+assert.ok(buttons.every((b) => b.disabled), "a second click must not answer twice");
+assert.strictEqual(buttons[1].textContent, "已选择：" + options[1].label);
+
+// Clearing the question takes the panel away again.
+globalThis.__askChoice(8, "正在启动 Harness…", "", [], "");
+assert.strictEqual(panel.hidden, true, "an empty question hides the panel");
+console.log("choice panel ok: " + buttons.length + " options, answer " + sent[0].args.payload.id);
+"#;
+
+#[test]
+fn the_takeover_panel_renders_its_options_and_reports_the_click() {
+    let stdout = run_in_node_with_page(
+        "dsh-desktop-choice-panel-test",
+        CHOICE_DRIVER,
+        "",
+        Some(window::CHOICE_EVENT),
+    );
     println!("{}", stdout.trim());
 }
 

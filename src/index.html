@@ -33,6 +33,15 @@
       }
       #retry:disabled { opacity: .6; cursor: default; }
       #retry[hidden] { display: none; }
+      #choice { display: flex; flex-direction: column; gap: 8px; width: 100%; max-width: 420px; }
+      #choice[hidden] { display: none; }
+      #choice button {
+        font: inherit; padding: 7px 12px; border-radius: 6px; cursor: pointer; text-align: left;
+        color: CanvasText; background: color-mix(in srgb, CanvasText 8%, transparent);
+        border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+      }
+      #choice button:disabled { opacity: .6; cursor: default; }
+      #choice .hint { opacity: .65; font-size: 12px; }
     </style>
     <!--
       Syntax the dsh front end needs that no polyfill can add. The probe cannot compile this
@@ -68,6 +77,14 @@
         window.__pendingStatus = [status, detail, true];
         if (window.__applyStatus) window.__applyStatus();
       };
+      //
+      // The takeover question. Same buffering rule as the status: Rust may ask before the body
+      // exists. An empty list clears the question.
+      window.__pendingChoice = null;
+      window.__askChoice = function (question, status, detail, options, hint) {
+        window.__pendingChoice = [question, status, detail, options || [], hint || ""];
+        if (window.__applyChoice) window.__applyChoice();
+      };
     </script>
   </head>
   <body>
@@ -76,6 +93,12 @@
     <div id="status">正在启动…</div>
     <div id="detail"></div>
     <button id="retry" hidden>重新启动 Harness</button>
+    <!--
+      The takeover question. Rust writes the labels (they carry the pid, the command line and the
+      port), the page only draws them and reports which one was clicked: the buttons are created
+      here rather than injected as HTML so nothing from a process command line can become markup.
+    -->
+    <div id="choice" hidden></div>
     <script>
       // Render whatever Rust has already sent (and every later update).
       window.__applyStatus = function () {
@@ -91,6 +114,55 @@
           // A previous click may have left it disabled and mid-word.
           retry.disabled = false;
           retry.textContent = "重新启动 Harness";
+        }
+      };
+
+      // Draw the takeover question, and report the click back to Rust.
+      window.__applyChoice = function () {
+        var pending = window.__pendingChoice;
+        var box = document.getElementById("choice");
+        if (!pending) return;
+        var question = pending[0];
+        var options = pending[3] || [];
+        document.getElementById("status").textContent = pending[1];
+        document.getElementById("detail").textContent = pending[2] || "";
+        document.body.classList.toggle("error", false);
+        // The question replaces the restart button: two live buttons on one page would let a
+        // click race the answer the shell is already waiting for.
+        document.getElementById("retry").hidden = true;
+        while (box.firstChild) box.removeChild(box.firstChild);
+        if (!options.length) {
+          box.hidden = true;
+          return;
+        }
+        box.hidden = false;
+        for (var i = 0; i < options.length; i++) {
+          (function (option) {
+            var button = document.createElement("button");
+            button.type = "button";
+            button.textContent = option.label;
+            button.addEventListener("click", function () {
+              var buttons = box.querySelectorAll("button");
+              for (var j = 0; j < buttons.length; j++) buttons[j].disabled = true;
+              button.textContent = "已选择：" + option.label;
+              try {
+                window.__TAURI_INTERNALS__.invoke("plugin:event|emit", {
+                  event: "dsh-desktop:takeover-choice",
+                  payload: { question: question, id: option.id }
+                });
+              } catch (error) {
+                // Rust never heard the answer: say so instead of leaving a dead page.
+                button.textContent = "选择没有送达，请关闭窗口重开";
+              }
+            });
+            box.appendChild(button);
+          })(options[i]);
+        }
+        if (pending[4]) {
+          var hint = document.createElement("div");
+          hint.className = "hint";
+          hint.textContent = pending[4];
+          box.appendChild(hint);
         }
       };
 
@@ -114,6 +186,7 @@
       });
 
       window.__applyStatus();
+      window.__applyChoice();
     </script>
   </body>
 </html>

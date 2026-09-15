@@ -9,6 +9,7 @@ pub mod locator;
 pub mod process;
 pub mod runtime;
 pub mod shellenv;
+pub mod transaction;
 pub mod update;
 pub mod window;
 
@@ -428,6 +429,11 @@ pub fn run() {
             app.listen(window::RESTART_EVENT, move |_event| {
                 request_restart(&restart_handle);
             });
+            // The takeover question is answered through the same window core capability as
+            // the restart button: no other IPC surface is granted.
+            app.listen(window::CHOICE_EVENT, |event| {
+                window::record_choice(event.payload());
+            });
             let handle = app.handle().clone();
             window::create_splash(&handle)?;
             std::thread::spawn(move || startup(handle));
@@ -456,6 +462,11 @@ pub fn run() {
 /// May the instance currently owning the port be stopped so an update can rewrite the CLI tree
 /// it serves from? Node loads modules lazily, so updating a live tree breaks the running
 /// Harness on its next `require()` — the tree must not be touched while it is in use.
+///
+/// `is_ours` is the state-file match and nothing else. A foreign instance is not refused here
+/// when `take_over_existing` is on: it is asked about instead (see
+/// [`stop_instance_before_update`]), because the config says what an unanswered question
+/// means, not that the question may be skipped.
 fn may_stop_before_update(
     probe: &harness::Probe,
     is_ours: bool,
@@ -521,6 +532,14 @@ fn stop_instance_before_update(
             "端口 {port} 上已有 Harness，但无法确定它的进程（lsof 不可用），跳过本次更新"
         ));
     };
+    // A foreign instance is somebody else session, and an update stops it for reasons that
+    // have nothing to do with what they were doing: ask before touching it. Declining turns
+    // this into a deferred update, which is what the config-only version used to do.
+    if ours.is_none() && !confirm_takeover(app, config, port, pid) {
+        return Err(format!(
+            "端口 {port} 上的外部 Harness（pid {pid}）没有被接管，跳过本次更新"
+        ));
+    }
     let mode = stop_mode(ours.is_some());
     window::set_status(
         app,
@@ -548,6 +567,358 @@ fn stop_instance_before_update(
         mode.describe()
     ));
     Ok(())
+}
+
+/// Where the update transaction keeps its working copies.
+///
+/// All of them live under the app data directory, which is the one tree the shell owns: staging a
+/// new CLI tree must never need space inside the prefix being replaced, or a full disk would
+/// take the live tree down with it.
+struct UpdatePaths {
+    staging: PathBuf,
+    rollback: PathBuf,
+    swap: PathBuf,
+    /// Where a profile is copied before pnpm rewrites it.
+    profiles: PathBuf,
+}
+
+impl UpdatePaths {
+    fn new(runtime_root: &Path) -> UpdatePaths {
+        UpdatePaths {
+            staging: runtime_root.join("staging"),
+            rollback: runtime_root.join("rollback"),
+            swap: runtime_root.join("update-swap.json"),
+            profiles: runtime_root.join("profile-backup"),
+        }
+    }
+}
+
+/// Install a newer plugin market into the profile, with a snapshot to fall back on.
+///
+/// Returns whether the profile now loads a different version, which is what forces a restart.
+/// pnpm owns this install — `dsh plugin add` is a thin wrapper around it — so unlike a core
+/// update there is no staged tree to verify first. What makes it reversible is the snapshot
+/// taken before pnpm is allowed to touch the profile: a half-written plugin tree is not
+/// something the next launch can repair on its own.
+#[allow(clippy::too_many_arguments)]
+fn update_market_plugin(
+    app: &AppHandle,
+    data_dir: &Path,
+    paths: &UpdatePaths,
+    profile_dir: &Path,
+    resolved: &ResolvedRuntime,
+    child_path: &OsStr,
+    config: &Config,
+    port: u16,
+    from: &str,
+    to: &str,
+) -> bool {
+    // Same hazard as a core update: pnpm rewrites the profile node_modules in place and a
+    // running harness would break on its next lazy require().
+    if let Err(reason) = stop_instance_before_update(app, data_dir, port, config) {
+        harness::app_log(&format!(
+            "plugin update deferred, keeping v{from}: {reason}"
+        ));
+        return false;
+    }
+    let snapshot = match snapshot_profile(paths, profile_dir, to) {
+        Ok(snapshot) => snapshot,
+        Err(reason) => {
+            // Without a snapshot the install would be one-way, and the plugin market is not
+            // worth an unrecoverable profile.
+            harness::app_log(&format!(
+                "plugin update deferred, keeping v{from}: 无法快照 profile: {reason}"
+            ));
+            return false;
+        }
+    };
+    let installed = update::install_plugin(
+        &resolved.node,
+        &resolved.dsh_js,
+        "web",
+        update::MARKET_PLUGIN,
+        to,
+        config.dsh_home.as_deref(),
+        child_path,
+    );
+    match installed {
+        Ok(()) => {
+            let after =
+                update::installed_plugin(profile_dir, update::MARKET_PLUGIN).unwrap_or_default();
+            if after == from {
+                // pnpm wrote the package somewhere the profile does not load it from: report
+                // and remember the attempt instead of retrying on every launch.
+                update::mark_plugin_attempt_ineffective(data_dir, to);
+                harness::app_log(&format!(
+                    "plugin installed but the profile still loads {} {from}",
+                    update::MARKET_PLUGIN
+                ));
+                return false;
+            }
+            harness::app_log(&format!(
+                "plugin updated: {} {from} -> {after}",
+                update::MARKET_PLUGIN
+            ));
+            true
+        }
+        Err(reason) => {
+            // pnpm may have rewritten the profile before it gave up: put the snapshot back so
+            // the profile is what it was, rather than something neither version can load.
+            let restored = restore_profile(&snapshot, profile_dir);
+            // A failed install is usually transient, so it only suppresses the next attempt for
+            // a few minutes — long enough not to stop the Harness again right away, short
+            // enough to recover on its own (review A1/A5).
+            update::mark_plugin_attempt_failed(data_dir, to);
+            harness::app_log(&format!(
+                "plugin update failed, keeping v{from}: {reason}{}",
+                match restored {
+                    Ok(()) => "（已从快照恢复 profile）".to_string(),
+                    Err(error) => format!("（profile 恢复失败: {error}）"),
+                }
+            ));
+            false
+        }
+    }
+}
+
+/// Copy a profile aside before pnpm rewrites it, so a failed plugin install can be undone.
+///
+/// Unlike the core update there is no staged tree to build first: `dsh plugin add` owns the
+/// profile layout and pnpm is what installs, so the only way to make the install reversible is
+/// to keep what was there. The entries the running Harness keeps writing are skipped (see
+/// [`transaction::PROFILE_LIVE_ENTRIES`]): restoring stale credentials over live ones would be
+/// a second, worse failure.
+fn snapshot_profile(
+    paths: &UpdatePaths,
+    profile_dir: &Path,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let snapshot = paths.profiles.join(version_label(label));
+    transaction::snapshot_tree(profile_dir, &snapshot, transaction::PROFILE_LIVE_ENTRIES)?;
+    // Keep one generation per plugin version; the directory is a full copy of node_modules.
+    transaction::prune(&paths.profiles, PROFILE_SNAPSHOTS);
+    Ok(snapshot)
+}
+
+/// How many profile snapshots to keep. Each is a copy of the profile dependency tree, so this
+/// is a size decision as much as a history one.
+const PROFILE_SNAPSHOTS: usize = 2;
+
+/// Put a profile snapshot back after a failed plugin install.
+fn restore_profile(snapshot: &Path, profile_dir: &Path) -> Result<(), String> {
+    transaction::restore_tree(snapshot, profile_dir, transaction::PROFILE_LIVE_ENTRIES)
+}
+
+/// A core update that has been staged and verified, and may now be committed.
+///
+/// Holding the staging guard is what makes deferring the commit safe: a launch that fails
+/// before it ever boots the new tree — a busy port, a foreign Harness, a rejected version —
+/// drops this value and takes the staged tree with it, leaving the live one untouched.
+struct StagedUpdate {
+    _staging: transaction::Staging,
+    /// The staged package directory, about to become the live one.
+    dir: PathBuf,
+    version: String,
+    /// The live package directory this will replace.
+    target: PathBuf,
+    /// Where the live tree goes while the new one proves it boots.
+    backup: PathBuf,
+}
+
+/// The package directory a CLI would occupy inside `prefix`, whether or not it is there yet.
+///
+/// npm uses `<prefix>/lib/node_modules` on Unix and `<prefix>/node_modules` on Windows. The
+/// directory is named rather than searched for because the interesting case is a prefix that has
+/// no CLI yet: a bundled build installs into the shadow prefix for the first time this way.
+fn package_dir_in(prefix: &Path) -> PathBuf {
+    // The same two layouts `DSH_JS_SUFFIXES` names, minus the entry script. npm puts global
+    // packages under `lib/` on Unix and directly under the prefix on Windows, and a swap has
+    // to name the directory npm will actually write.
+    #[cfg(windows)]
+    {
+        prefix.join("node_modules").join(DSH_PACKAGE_NAME)
+    }
+    #[cfg(not(windows))]
+    {
+        prefix
+            .join("lib")
+            .join("node_modules")
+            .join(DSH_PACKAGE_NAME)
+    }
+}
+
+/// Build the new CLI tree somewhere else and check it before anything is replaced.
+///
+/// This is the whole point of the transaction: npm writes into a directory nobody is running
+/// from, and a registry that answered with the wrong version, a truncated download or a prefix
+/// npm ignored is a report here instead of a broken install there.
+///
+/// `target_prefix` is where the tree will end up, which is not always where the running CLI
+/// lives: a bundled build runs the read-only seed inside the app bundle and updates the writable
+/// shadow prefix under app-data (review P0-2).
+fn stage_core_update(
+    npm: &Path,
+    to: &str,
+    target_prefix: &Path,
+    paths: &UpdatePaths,
+    cache: &Path,
+) -> Result<StagedUpdate, String> {
+    let staging = transaction::Staging::create(&paths.staging, to)?;
+    let prefix = staging.prefix();
+    update::install(npm, update::PACKAGE, to, Some(&prefix), Some(cache))?;
+    let verified = transaction::verify_install(&prefix, update::PACKAGE, to)?;
+    let target = package_dir_in(target_prefix);
+    // A staged tree that resolves to the live tree would make the swap a no-op that still
+    // reports success; saying so is better than moving a directory onto itself.
+    if verified.dir == target {
+        return Err(format!(
+            "暂存目录与正在使用的 CLI 是同一个: {}",
+            target.display()
+        ));
+    }
+    let backup = paths.rollback.join(version_label(to));
+    Ok(StagedUpdate {
+        _staging: staging,
+        dir: verified.dir,
+        version: verified.version,
+        target,
+        backup,
+    })
+}
+
+/// A version string that is safe as a directory name.
+fn version_label(version: &str) -> String {
+    version
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Put the staged tree in place, recording the swap before the live tree is touched.
+///
+/// The record is what makes a launch that dies between here and the first successful boot
+/// recoverable: it names the tree to put back, and [`recover_pending_swap`] reads it before
+/// anything else runs.
+fn commit_core_update(
+    staged: StagedUpdate,
+    paths: &UpdatePaths,
+) -> Result<(PathBuf, String), String> {
+    transaction::write_swap(
+        &paths.swap,
+        &transaction::SwapRecord {
+            target: staged.target.to_string_lossy().to_string(),
+            backup: staged.backup.to_string_lossy().to_string(),
+            version: staged.version.clone(),
+            at: update::now_secs(),
+        },
+    )?;
+    if let Err(error) = transaction::commit(&staged.target, &staged.dir, &staged.backup) {
+        // Nothing was replaced, so the record would only mislead the next launch into rolling
+        // back a tree that is still the old one.
+        transaction::clear_swap(&paths.swap);
+        return Err(error);
+    }
+    // The entry script moved with its package directory, so it is named from the new location
+    // rather than from the staging one it was verified in.
+    let entry = staged.target.join("lib").join("bin.js");
+    Ok((entry, staged.version))
+}
+
+/// Undo a swap this launch made, because the new tree never printed its startup URL.
+///
+/// Returns whether the previous tree is back in place. The swap record is the only source of
+/// truth here: without it there is nothing to put back, and the caller says so instead of
+/// claiming a rollback that did not happen.
+fn roll_back_core_update(paths: &UpdatePaths) -> bool {
+    let Some(record) = transaction::read_swap(&paths.swap) else {
+        return false;
+    };
+    match transaction::rollback(Path::new(&record.target), Path::new(&record.backup)) {
+        Ok(()) => {
+            harness::app_log(&format!(
+                "v{} 未能启动，已回滚到上一棵树（{}）",
+                record.version, record.backup
+            ));
+            transaction::clear_swap(&paths.swap);
+            transaction::prune(&paths.rollback, ROLLBACK_GENERATIONS);
+            true
+        }
+        Err(error) => {
+            // Keep the record: the next launch retries the rollback rather than booting a tree
+            // that has already failed once.
+            harness::app_log(&format!("回滚失败，保留记录以便下次重试: {error}"));
+            false
+        }
+    }
+}
+
+/// The new tree booted: the swap is real, so the record and the older generations can go.
+fn confirm_core_update(paths: &UpdatePaths) {
+    transaction::clear_swap(&paths.swap);
+    transaction::prune(&paths.rollback, ROLLBACK_GENERATIONS);
+}
+
+/// How many previous CLI trees to keep. One is enough to undo one bad update; more only costs
+/// the ~290 MB each of them takes.
+const ROLLBACK_GENERATIONS: usize = 2;
+
+/// Remove staged trees a killed process left behind.
+///
+/// A staged tree only has a reason to exist inside the launch that built it: the commit moves it
+/// into place or the guard drops it. One left on disk is therefore always debris from a process
+/// that died mid-update, and it is ~290 MB of it. The whole directory goes rather than the
+/// generations being counted, because nothing in it is referenced by anything.
+fn clear_stale_staging(paths: &UpdatePaths) {
+    let Ok(entries) = std::fs::read_dir(&paths.staging) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => harness::app_log(&format!("清理上次遗留的暂存目录 {}", path.display())),
+            Err(error) => harness::app_log(&format!("无法清理 {}: {error}", path.display())),
+        }
+    }
+}
+
+/// Undo a swap that a previous launch made and never confirmed.
+///
+/// Reached at the very start of a launch, before the runtime is resolved: the tree the record
+/// names is the one the previous launch replaced, and a launch that finds this file is by
+/// definition one where the new tree never printed its startup URL — the process was killed, or
+/// the boot timed out.
+fn recover_pending_swap(paths: &UpdatePaths) {
+    let Some(record) = transaction::read_swap(&paths.swap) else {
+        return;
+    };
+    let target = PathBuf::from(&record.target);
+    let backup = PathBuf::from(&record.backup);
+    harness::app_log(&format!(
+        "上次更新到 v{} 的切换没有完成（CLI 未启动成功），正在回滚到 {} 中的上一棵树",
+        record.version,
+        backup.display()
+    ));
+    match transaction::rollback(&target, &backup) {
+        Ok(()) => {
+            harness::app_log(&format!("已回滚 {}", target.display()));
+            transaction::clear_swap(&paths.swap);
+            transaction::prune(&paths.rollback, ROLLBACK_GENERATIONS);
+        }
+        Err(error) => {
+            // Keep the record: the next launch should try again rather than leave a tree
+            // nobody can boot and no record of what to put back.
+            harness::app_log(&format!("回滚失败，保留记录以便下次重试: {error}"));
+        }
+    }
 }
 
 /// The supervised runtime, resolved once at startup.
@@ -628,25 +999,6 @@ const DSH_JS_SUFFIXES: [&str; 2] = [
     "lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
     "node_modules/@deepseek-ai/dsh/lib/bin.js",
 ];
-
-/// Which CLI a successful install left the shell to run, and the version of that tree.
-///
-/// A shadow install lands in the prefix, while `resolved.dsh_js` still points at the seed
-/// resolved at startup: reading the version back from the seed made an update look ineffective,
-/// so the launch kept the old core and reinstalled on every start (review P0-2). Pure apart from
-/// file reads, so the switch is testable on a temp tree.
-fn installed_cli(prefix: Option<&Path>, supervised: &Path, fallback: &str) -> (PathBuf, String) {
-    let installed = prefix.and_then(dsh_js_in).filter(|path| path.is_file());
-    let version = installed
-        .as_deref()
-        .and_then(locator::version_of)
-        .or_else(|| locator::version_of(supervised))
-        .unwrap_or_else(|| fallback.to_string());
-    (
-        installed.unwrap_or_else(|| supervised.to_path_buf()),
-        version,
-    )
-}
 
 /// The CLI entry script inside an npm prefix, when it is there.
 fn dsh_js_in(prefix: &Path) -> Option<PathBuf> {
@@ -1112,6 +1464,12 @@ fn take_over_handoff_and_start(
                 "端口 {port} 上的 pid {pid} 按 Harness 协议应答，但无法确认它就是 dsh web；\n\
                  为避免误杀其它程序，本应用不会接管它。请先手动停止该进程，或在 config.json 里换一个端口。"
             ));
+        } else if !confirm_takeover(app, &config, port, pid) {
+            // The question came back "keep it", or nobody answered and the config says not
+            // to take over. Either way the port stays with that instance.
+            harness::app_log(&format!(
+                "端口 {port} 上的 Harness pid {pid} 未被接管：交回启动流程处理"
+            ));
         } else {
             harness::app_log(&format!(
                 "端口 {port} 上出现了外部重启的 Harness pid {pid}：停掉它，用本壳的 workspace 重新启动"
@@ -1135,6 +1493,14 @@ fn take_over_handoff_and_start(
             Some(pid) if !identified_dsh_web(pid) => {
                 harness::app_log(&format!(
                     "端口 {port} 由 pid {pid} 服务，但无法确认它是 dsh web：不接管"
+                ));
+                Err(reason)
+            }
+            // A retry is still this shell deciding to end somebody else instance, so it is
+            // the same question.
+            Some(pid) if !confirm_takeover(app, &config, port, pid) => {
+                harness::app_log(&format!(
+                    "本次启动失败（{reason}），端口 {port} 上的 pid {pid} 未被接管：保留该实例"
                 ));
                 Err(reason)
             }
@@ -1162,6 +1528,10 @@ enum ForeignAction {
     UseBrowser,
     /// Leave it running and explain why this shell cannot use the port.
     Refuse { reason: String },
+    /// A Harness this shell can identify, and the user asked to be consulted before it is
+    /// signalled. The caller puts the question and turns the answer back into one of the arms
+    /// above.
+    Ask { pid: u32 },
 }
 
 /// Decide what to do about a foreign Harness, from the two identity signals.
@@ -1171,6 +1541,9 @@ enum ForeignAction {
 /// signalled: the fence proves a Harness protocol is on the port, and the command line proves the
 /// process is the CLI rather than an unrelated server that happens to answer the same way. A
 /// missing command line is treated as "not proven", which is why takeover also needs `allow`.
+///
+/// `allow` is the config default for a question nobody answered, not the answer itself: with it
+/// on the user is asked first, and the config only decides what an unanswered question means.
 fn foreign_instance_action(
     allow: bool,
     owner: Option<u32>,
@@ -1183,8 +1556,10 @@ fn foreign_instance_action(
             reason: "端口上有进程按 Harness 协议应答，但无法确认它就是 dsh web（读不到命令行，或命令行不像 dsh）。为避免误杀其它程序，本应用不会接管它。请先手动停止该进程，或在 config.json 里换一个端口。"
                 .to_string(),
         },
+        // Identified and allowed: ask, because stopping it kills a session someone may be
+        // watching and restarts the instance under a different workspace.
+        (true, Some(pid), true) => ForeignAction::Ask { pid },
         (false, _, true) => ForeignAction::UseBrowser,
-        (true, Some(pid), true) => ForeignAction::TakeOver { pid },
         // `identified` already proved a command line exists, so this arm is unreachable; it keeps
         // the match total without a panic in a startup path.
         (true, None, true) => ForeignAction::Refuse {
@@ -1192,6 +1567,105 @@ fn foreign_instance_action(
                 .to_string(),
         },
     }
+}
+
+/// The ids the takeover question answers with.
+const CHOICE_TAKE_OVER: &str = "take-over";
+const CHOICE_BROWSER: &str = "browser";
+const CHOICE_CANCEL: &str = "cancel";
+
+/// The question put to the user when a Harness this shell did not start is in the way.
+///
+/// The detail is the whole point of asking: a pid alone does not tell the user which terminal
+/// session, agent run or workspace they are about to end, so the command line and this shell's
+/// own workspace are both spelled out.
+fn takeover_question(
+    port: u16,
+    pid: u32,
+    command: Option<&str>,
+    workspace: &Path,
+) -> (String, String) {
+    let detail = format!(
+        "端口 127.0.0.1:{port} 上已有一个不是本应用启动的 Harness。\n\n\
+         进程: pid {pid}\n\
+         命令行: {}\n\n\
+         接管会先终止该进程（它当前的会话、正在执行的 agent 任务与浏览器里已打开的页面都会断开），\
+         然后用本应用的 workspace 重新启动：\n{}\n\n\
+         不接管则用系统浏览器打开那个实例，本应用退出。",
+        command.unwrap_or("<读不到命令行>"),
+        workspace.display()
+    );
+    ("检测到其它 Harness".to_string(), detail)
+}
+
+/// Put the takeover question and turn the answer into an action.
+///
+/// Every way of not getting a real answer — no window, a page that never loaded, the timeout —
+/// falls back to what `allow` says an unanswered question means, which is the behaviour the
+/// shell had before it asked at all. The browser option is always offered, so a user who does not
+/// want to decide can leave the instance running.
+fn resolve_foreign_action(
+    app: &AppHandle,
+    config: &Config,
+    port: u16,
+    action: ForeignAction,
+) -> ForeignAction {
+    let ForeignAction::Ask { pid } = action else {
+        return action;
+    };
+    let command = harness::process_command(pid);
+    let (status, detail) = takeover_question(port, pid, command.as_deref(), &config.workspace);
+    let options = vec![
+        window::ChoiceOption {
+            id: CHOICE_TAKE_OVER.to_string(),
+            label: format!("终止 pid {pid} 并接管端口 {port}"),
+        },
+        window::ChoiceOption {
+            id: CHOICE_BROWSER.to_string(),
+            label: "保留它，用系统浏览器打开".to_string(),
+        },
+        window::ChoiceOption {
+            id: CHOICE_CANCEL.to_string(),
+            label: "什么都不做，退出本应用".to_string(),
+        },
+    ];
+    let hint = format!(
+        "{} 秒内没有选择将按 config.json 的 take_over_existing={} 处理。",
+        window::CHOICE_TIMEOUT.as_secs(),
+        config.take_over_existing
+    );
+    window::set_status(app, &status, &detail);
+    match window::ask_choice(app, &status, &detail, &options, &hint).as_deref() {
+        Some(CHOICE_TAKE_OVER) => ForeignAction::TakeOver { pid },
+        Some(CHOICE_BROWSER) => ForeignAction::UseBrowser,
+        Some(CHOICE_CANCEL) => ForeignAction::Refuse {
+            reason: format!(
+                "已按你的选择保留端口 {port} 上的 Harness（pid {pid}），本应用没有接管它。"
+            ),
+        },
+        // Unanswered: the config decides, which is what the shell did before it could ask.
+        _ => {
+            if config.take_over_existing {
+                ForeignAction::TakeOver { pid }
+            } else {
+                ForeignAction::UseBrowser
+            }
+        }
+    }
+}
+
+/// The same question for a Harness that appeared during a handoff or a restart.
+///
+/// Returns whether the caller may signal it. `allow` false never asks: that instance is exactly
+/// what the user asked the shell to keep.
+fn confirm_takeover(app: &AppHandle, config: &Config, port: u16, pid: u32) -> bool {
+    if !config.take_over_existing {
+        return false;
+    }
+    matches!(
+        resolve_foreign_action(app, config, port, ForeignAction::Ask { pid }),
+        ForeignAction::TakeOver { .. }
+    )
 }
 
 /// The pid serving `port` as a Harness, when one is.
@@ -1699,6 +2173,15 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         })
     });
 
+    // 2b) Finish what a previous launch started. A swap record that is still here means that
+    //     launch replaced the CLI tree and never saw the new one print its startup URL, so the
+    //     tree it replaced goes back before anything resolves a runtime: otherwise this launch
+    //     would pick the same unproven tree again and fail the same way.
+    let runtime_root = data_dir.join("runtime");
+    let paths = UpdatePaths::new(&runtime_root);
+    recover_pending_swap(&paths);
+    clear_stale_staging(&paths);
+
     // 3) Resolve the runtime: bundled seed / shadow prefix / the user's install (§2.3/§2.4).
     window::set_status(app, "正在解析运行时…", "");
     let mut resolved =
@@ -1728,15 +2211,19 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     }
 
     // The update path installs into `runtime/prefix` and keeps npm's cache there: create both
-    // up front (idempotent), like the plan's §3 step 2 asks (review P2-11).
-    let runtime_root = data_dir.join("runtime");
-    for name in ["prefix", "tools", "npm-cache"] {
-        if let Err(error) = std::fs::create_dir_all(runtime_root.join(name)) {
-            harness::app_log(&format!(
-                "无法创建 {}/{}: {error}",
-                runtime_root.display(),
-                name
-            ));
+    // up front (idempotent), like the plan's §3 step 2 asks (review P2-11). The staging and
+    // rollback directories belong to the update transaction and are created for the same
+    // reason: a missing directory discovered mid-update is a failed update.
+    for dir in [
+        runtime_root.join("prefix"),
+        runtime_root.join("tools"),
+        runtime_root.join("npm-cache"),
+        paths.staging.clone(),
+        paths.rollback.clone(),
+        paths.profiles.clone(),
+    ] {
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            harness::app_log(&format!("无法创建 {}: {error}", dir.display()));
         }
     }
 
@@ -1748,6 +2235,14 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         ));
     }
     let mut just_updated = false;
+    // Held until the moment the new tree is actually booted: everything between here and the
+    // spawn can still decide not to start a Harness at all (a busy port, a foreign instance,
+    // a rejected version), and a swap made for a launch that never happens is a rollback the
+    // next launch has to clean up for no reason.
+    let mut staged_update: Option<StagedUpdate> = None;
+    // Separate from `just_updated`: the plugin step sets that one too, and only a core swap
+    // has a rollback record to confirm or undo.
+    let mut core_swapped = false;
     if config.auto_update && may_update {
         match update::npm_for(&resolved.node) {
             None => harness::app_log("找不到 npm，跳过更新检查"),
@@ -1826,48 +2321,40 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                                     "update deferred, keeping v{from}: {reason}"
                                 )),
                                 Ok(()) => {
-                                    let prefix = resolved
+                                    let cache = runtime_root.join("npm-cache");
+                                    // Which tree the new version belongs in: this shell own
+                                    // shadow prefix, or the user prefix when they asked for
+                                    // in-place upgrades of their own installation.
+                                    let target_prefix = resolved
                                         .update_prefix(data_dir)
                                         .or_else(|| update::install_prefix(&resolved.dsh_js));
-                                    let cache = runtime_root.join("npm-cache");
-                                    match update::install(
-                                        &npm,
-                                        update::PACKAGE,
-                                        &to,
-                                        prefix.as_deref(),
-                                        Some(&cache),
-                                    ) {
-                                        Ok(()) => {
-                                            // A shadow install lands in a different tree than the
-                                            // seed resolved at startup (review P0-2).
-                                            let (installed_path, installed_version) = installed_cli(
-                                                prefix.as_deref(),
-                                                &resolved.dsh_js,
-                                                &to,
-                                            );
-                                            version = installed_version;
-                                            if version == from {
-                                                // npm installed the package somewhere other than where
-                                                // this CLI lives (custom prefix, pnpm/yarn/volta layout),
-                                                // so the supervised binary is unchanged. Say so instead of
-                                                // claiming an update and restarting for nothing, and
-                                                // remember the attempt so the cached answer does not
-                                                // repeat it on the next launch.
-                                                update::mark_attempt_ineffective(data_dir, &to);
-                                                harness::app_log(&format!(
-                                                "update installed but the supervised CLI is still {from}; check npm global prefix"
-                                            ));
-                                            } else {
-                                                resolved.dsh_js = installed_path;
-                                                just_updated = true;
-                                                harness::app_log(&format!(
-                                                    "dsh updated: {from} -> {to}"
-                                                ));
-                                            }
-                                        }
-                                        Err(reason) => harness::app_log(&format!(
-                                            "update failed, keeping v{from}: {reason}"
+                                    // Build and verify the new tree next to the live one. Nothing
+                                    // is replaced until that succeeded, so a registry that fails
+                                    // half-way leaves the CLI the user has exactly as it was.
+                                    let staged = match target_prefix.as_deref() {
+                                        // No prefix to speak of: a CLI whose layout names no
+                                        // npm prefix at all (a hand-built tree). There is
+                                        // nothing to swap, so say that instead of guessing.
+                                        None => Err(format!(
+                                            "无法确定 {} 所属的 npm 前缀，不做原地更新",
+                                            resolved.dsh_js.display()
                                         )),
+                                        Some(prefix) => {
+                                            stage_core_update(&npm, &to, prefix, &paths, &cache)
+                                        }
+                                    };
+                                    match staged {
+                                        Err(reason) => harness::app_log(&format!(
+                                            "update staged but not committed, keeping v{from}: {reason}"
+                                        )),
+                                        // Verified, not yet in place: the swap waits until the
+                                        // launch is committed to booting it.
+                                        Ok(staged) => {
+                                            harness::app_log(&format!(
+                                                "update staged: {from} -> {to}（校验通过，待切换）"
+                                            ));
+                                            staged_update = Some(staged);
+                                        }
                                     }
                                 }
                             }
@@ -1986,59 +2473,19 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                                     "plugin update available: {} {from} -> {to}, installing",
                                     update::MARKET_PLUGIN
                                 ));
-                                // Same hazard as a core update: pnpm rewrites profile
-                                // node_modules in place and a running harness would break on its
-                                // next lazy require().
-                                match stop_instance_before_update(app, data_dir, port, &config) {
-                                    Err(reason) => harness::app_log(&format!(
-                                        "plugin update deferred, keeping v{from}: {reason}"
-                                    )),
-                                    Ok(()) => match update::install_plugin(
-                                        &resolved.node,
-                                        &resolved.dsh_js,
-                                        "web",
-                                        update::MARKET_PLUGIN,
-                                        &to,
-                                        config.dsh_home.as_deref(),
-                                        OsStr::new(&child.path),
-                                    ) {
-                                        Ok(()) => {
-                                            let after = update::installed_plugin(
-                                                &profile_dir,
-                                                update::MARKET_PLUGIN,
-                                            )
-                                            .unwrap_or_default();
-                                            if after == from {
-                                                // pnpm wrote the package somewhere the profile
-                                                // does not load it from: report and remember the
-                                                // attempt instead of retrying on every launch.
-                                                update::mark_plugin_attempt_ineffective(
-                                                    data_dir, &to,
-                                                );
-                                                harness::app_log(&format!(
-                                                    "plugin installed but the profile still loads {} {from}",
-                                                    update::MARKET_PLUGIN
-                                                ));
-                                            } else {
-                                                just_updated = true;
-                                                harness::app_log(&format!(
-                                                    "plugin updated: {} {from} -> {after}",
-                                                    update::MARKET_PLUGIN
-                                                ));
-                                            }
-                                        }
-                                        Err(reason) => {
-                                            // A failed install is usually transient, so it only
-                                            // suppresses the next attempt for a few minutes —
-                                            // long enough not to stop the Harness again right
-                                            // away, short enough to recover on its own
-                                            // (review A1/A5).
-                                            update::mark_plugin_attempt_failed(data_dir, &to);
-                                            harness::app_log(&format!(
-                                                "plugin update failed, keeping v{from}: {reason}"
-                                            ));
-                                        }
-                                    },
+                                if update_market_plugin(
+                                    app,
+                                    data_dir,
+                                    &paths,
+                                    &profile_dir,
+                                    &resolved,
+                                    OsStr::new(&child.path),
+                                    &config,
+                                    port,
+                                    &from,
+                                    &to,
+                                ) {
+                                    just_updated = true;
                                 }
                             }
                             update::Status::UpToDate { version } => harness::app_log(&format!(
@@ -2081,10 +2528,14 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                 .filter(|pid| Some(*pid) == owner && process::is_alive(*pid));
 
             match ours {
-                // Our own instance from an earlier run, and no update touched its CLI tree: its
-                // cookie is still valid for this authority (verified across restarts), so reuse
-                // it as-is instead of restarting it.
-                Some(pid) if !just_updated => {
+                // Our own instance from an earlier run, and no update is about to touch its CLI
+                // tree: its cookie is still valid for this authority (verified across
+                // restarts), so reuse it as-is instead of restarting it.
+                //
+                // A staged core update counts here even though it has not been committed yet:
+                // it is committed just before the spawn, so reusing this instance would leave
+                // the new tree staged and never booted.
+                Some(pid) if !just_updated && staged_update.is_none() => {
                     if window::unsupported_webview(config.webkit_compat).is_some() {
                         // A browser needs an authenticated URL, and the session token is per
                         // launch: the reused instance's cookie lives in this WebView, which is
@@ -2112,8 +2563,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                             .map_err(|e| e.to_string());
                     }
                 }
-                // Our own instance that a fresh update just made obsolete: it is our child, so
-                // its whole process group goes down together, exactly as at exit.
+                // Our own instance that a fresh update (or one about to be committed) just
+                // made obsolete: it is our child, so its whole process group goes down
+                // together, exactly as at exit.
                 Some(pid) => {
                     window::set_status(app, "更新完成，正在重启 Harness…", &format!("pid {pid}"));
                     process::terminate(pid, TERMINATE_GRACE);
@@ -2123,11 +2575,15 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                     // start is signalled: the auth fence named a Harness, and the command line
                     // names the CLI. Either one alone is a guess.
                     let command = owner.and_then(harness::process_command);
-                    match foreign_instance_action(
+                    let action = foreign_instance_action(
                         config.take_over_existing,
                         owner,
                         command.as_deref(),
-                    ) {
+                    );
+                    // An identified instance the config allows taking over is still a question:
+                    // it may be a terminal session or an agent run the user wants to keep.
+                    let action = resolve_foreign_action(app, &config, port, action);
+                    match action {
                         ForeignAction::UseBrowser => {
                             window::open_external(&format!("http://127.0.0.1:{port}/"));
                             return Err(format!(
@@ -2137,15 +2593,19 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                             ));
                         }
                         ForeignAction::Refuse { reason } => return Err(reason),
+                        // The startup path answers the question through
+                        // `resolve_foreign_action`, so reaching this arm means a caller
+                        // forgot to; refuse rather than signal silently.
+                        ForeignAction::Ask { pid } => {
+                            return Err(format!(
+                                "端口 {port} 上的 Harness（pid {pid}）没有得到处理，已放弃本次启动。"
+                            ));
+                        }
                         ForeignAction::TakeOver { pid } => {
                             // Stop it, then start our own so the window receives a fresh
                             // authenticated URL. Never a group signal: its process group belongs
                             // to whatever started it (a terminal, or an agent run).
-                            window::set_status(
-                                app,
-                                "检测到其它 Harness，正在接管…",
-                                &format!("pid {pid}"),
-                            );
+                            window::set_status(app, "正在接管其它 Harness…", &format!("pid {pid}"));
                             process::terminate_pid(pid, TERMINATE_GRACE);
                         }
                     }
@@ -2165,6 +2625,23 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
             ));
         }
         harness::Probe::Closed => {}
+    }
+
+    // 3d) The launch is now committed to booting a Harness: put the verified tree in place.
+    //     Everything above could still have returned without starting one, and a swap made for
+    //     a launch that never happens would leave a rollback record for the next launch to
+    //     undo. From here on, a failure to boot is exactly what the record is for.
+    if let Some(staged) = staged_update.take() {
+        let from = version.clone();
+        match commit_core_update(staged, &paths) {
+            Ok((installed_path, installed_version)) => {
+                version = installed_version;
+                resolved.dsh_js = installed_path;
+                core_swapped = true;
+                harness::app_log(&format!("dsh updated: {from} -> {to}", to = version));
+            }
+            Err(reason) => harness::app_log(&format!("update failed, keeping v{from}: {reason}")),
+        }
     }
 
     // 4) Force the startup URL line with a launcher-level overlay patch.
@@ -2237,10 +2714,29 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
             // The CLI may still be starting even though nothing answered in time. Stopping it
             // keeps the failure page honest and leaves the port free for the next attempt.
             let tail = spawned.ring.tail();
-            return abort_start(pid, format!("{reason}\n\n最近输出:\n{tail}"));
+            // A tree that was just swapped in and never printed its URL is not one to keep:
+            // put the previous one back now, while the reason is still in hand, instead of
+            // making the user hit the same wall on the next launch.
+            let rolled_back = core_swapped && roll_back_core_update(&paths);
+            return abort_start(
+                pid,
+                format!(
+                    "{reason}{}\n\n最近输出:\n{tail}",
+                    if rolled_back {
+                        "\n\n新版本未能启动，已回滚到上一个版本。"
+                    } else {
+                        ""
+                    }
+                ),
+            );
         }
     };
 
+    // The new tree booted and printed its URL: the swap is real. Until this line the previous
+    // tree was still the fallback a launch would roll back to.
+    if core_swapped {
+        confirm_core_update(&paths);
+    }
     let actual_port = url.port().unwrap_or(port);
     let _ = process::write_state(
         data_dir,
@@ -2449,39 +2945,174 @@ mod tests {
         assert_eq!(classify_parent(0), Parent::Gone);
     }
 
+    /// A staged update is verified and swapped, and a launch that never confirmed it is undone by
+    /// the next one. This is the whole P2-10 contract, minus the npm call.
     #[test]
-    fn an_install_switches_the_supervised_cli_to_the_shadow_prefix() {
-        let root = std::env::temp_dir().join("dsh-desktop-installed-cli-test");
+    fn a_staged_update_swaps_the_tree_and_an_unconfirmed_one_is_rolled_back() {
+        let root = std::env::temp_dir().join("dsh-desktop-core-swap-test");
         let _ = std::fs::remove_dir_all(&root);
-        let supervised = root.join("seed/lib/node_modules/@deepseek-ai/dsh/lib/bin.js");
-        std::fs::create_dir_all(supervised.parent().unwrap()).unwrap();
-        std::fs::write(&supervised, "#!/usr/bin/env node\n").unwrap();
+        let runtime = root.join("runtime");
+        let paths = UpdatePaths::new(&runtime);
+        std::fs::create_dir_all(&paths.staging).unwrap();
+        std::fs::create_dir_all(&paths.rollback).unwrap();
+
+        // The live tree, in the shadow prefix layout the shell updates.
+        let prefix = runtime.join("prefix");
+        let live = prefix.join("lib/node_modules/@deepseek-ai/dsh");
+        std::fs::create_dir_all(live.join("lib")).unwrap();
+        std::fs::write(live.join("lib/bin.js"), "old\n").unwrap();
+        std::fs::write(live.join("package.json"), r#"{"name":"@deepseek-ai/dsh"}"#).unwrap();
+
+        // What `stage_core_update` leaves behind once npm and the verifier are done: a complete
+        // tree inside the staging prefix, verified by name and version.
+        let staging = transaction::Staging::create(&paths.staging, "0.1.6").unwrap();
+        let staged_dir = staging.prefix().join("lib/node_modules/@deepseek-ai/dsh");
+        std::fs::create_dir_all(staged_dir.join("lib")).unwrap();
+        std::fs::write(staged_dir.join("lib/bin.js"), "new\n").unwrap();
         std::fs::write(
-            root.join("seed/lib/node_modules/@deepseek-ai/dsh/package.json"),
-            r#"{"name":"@deepseek-ai/dsh","version":"0.1.5-rc.1"}"#,
+            staged_dir.join("package.json"),
+            r#"{"name":"@deepseek-ai/dsh","version":"0.1.6"}"#,
+        )
+        .unwrap();
+        let verified =
+            transaction::verify_install(&staging.prefix(), "@deepseek-ai/dsh", "0.1.6").unwrap();
+        assert_eq!(verified.version, "0.1.6");
+        let staged = StagedUpdate {
+            _staging: staging,
+            dir: verified.dir,
+            version: verified.version,
+            target: live.clone(),
+            backup: paths.rollback.join("0.1.6"),
+        };
+
+        let (entry, version) = commit_core_update(staged, &paths).unwrap();
+        assert_eq!(version, "0.1.6");
+        // The entry script moved with its package directory: the spawn uses this path.
+        assert!(entry.is_file());
+        assert!(entry.starts_with(&live), "{}", entry.display());
+        assert_eq!(
+            std::fs::read_to_string(live.join("lib/bin.js")).unwrap(),
+            "new\n"
+        );
+        // The staging shell is gone: the tree it held is the live one now.
+        assert!(!paths.staging.join("staging-0.1.6").exists());
+        // The swap is recorded but not confirmed: a launch that dies here must be recoverable.
+        let record = transaction::read_swap(&paths.swap).expect("the swap is recorded");
+        assert_eq!(record.version, "0.1.6");
+        assert_eq!(record.target, live.to_string_lossy());
+
+        // The next launch finds the record and puts the previous tree back.
+        recover_pending_swap(&paths);
+        assert_eq!(
+            std::fs::read_to_string(live.join("lib/bin.js")).unwrap(),
+            "old\n"
+        );
+        assert!(transaction::read_swap(&paths.swap).is_none());
+        // The tree that failed is kept as evidence rather than deleted.
+        assert_eq!(
+            std::fs::read_to_string(transaction::failed_path(&live).join("lib/bin.js")).unwrap(),
+            "new\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A staged tree a killed process left behind is ~290 MB of debris nothing refers to, so the
+    /// next launch removes it. The directory itself stays: this launch stages into it.
+    #[test]
+    fn a_stale_staging_tree_is_cleared_without_taking_the_directory_with_it() {
+        let root = std::env::temp_dir().join("dsh-desktop-stale-staging-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = UpdatePaths::new(&root.join("runtime"));
+        std::fs::create_dir_all(paths.staging.join("staging-0.1.5")).unwrap();
+        std::fs::create_dir_all(paths.staging.join("staging-0.1.6/prefix")).unwrap();
+        std::fs::write(
+            paths.staging.join("staging-0.1.6/prefix/junk"),
+            "half-written",
         )
         .unwrap();
 
-        // Nothing was installed into the prefix: stay on the supervised tree.
-        let (path, version) = installed_cli(Some(&root.join("empty")), &supervised, "0.1.5-rc.2");
-        assert_eq!(path, supervised);
-        assert_eq!(version, "0.1.5-rc.1");
+        clear_stale_staging(&paths);
+        assert!(!paths.staging.join("staging-0.1.5").exists());
+        assert!(!paths.staging.join("staging-0.1.6").exists());
+        assert!(
+            paths.staging.is_dir(),
+            "the staging root itself must survive"
+        );
 
-        // A shadow install adds a new tree next to the seed: path *and* version must switch, or
-        // the launch keeps the old core and logs "check npm global prefix" (review P0-2).
-        let prefix = root.join("prefix");
-        let shadow = prefix.join("lib/node_modules/@deepseek-ai/dsh");
-        std::fs::create_dir_all(shadow.join("lib")).unwrap();
-        std::fs::write(shadow.join("lib/bin.js"), "#!/usr/bin/env node\n").unwrap();
+        // Nothing to clean is not an error, and neither is a staging root that never existed.
+        clear_stale_staging(&paths);
+        clear_stale_staging(&UpdatePaths::new(&root.join("elsewhere/runtime")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A profile snapshot is taken before pnpm may rewrite the profile, and a failed install is
+    /// undone from it without touching the state the running Harness keeps writing.
+    #[test]
+    fn a_profile_snapshot_makes_a_failed_plugin_install_reversible() {
+        let root = std::env::temp_dir().join("dsh-desktop-profile-snapshot-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = UpdatePaths::new(&root.join("runtime"));
+        std::fs::create_dir_all(&paths.profiles).unwrap();
+
+        let profile = root.join("profiles/web");
+        std::fs::create_dir_all(profile.join("node_modules/dshmarket")).unwrap();
+        std::fs::create_dir_all(profile.join("data")).unwrap();
         std::fs::write(
-            shadow.join("package.json"),
-            r#"{"name":"@deepseek-ai/dsh","version":"0.1.5-rc.2"}"#,
+            profile.join("package.json"),
+            r#"{"name":"dsh-profile-web"}"#,
         )
         .unwrap();
-        let (path, version) = installed_cli(Some(&prefix), &supervised, "0.1.5-rc.2");
-        assert_eq!(path, shadow.join("lib/bin.js"));
-        assert_eq!(version, "0.1.5-rc.2");
+        std::fs::write(profile.join("node_modules/dshmarket/version"), "1.0.0").unwrap();
+        std::fs::write(profile.join("data/usage.json"), "before").unwrap();
 
+        let snapshot = snapshot_profile(&paths, &profile, "2.0.0").unwrap();
+        assert!(snapshot.join("node_modules/dshmarket/version").is_file());
+        // Credentials and session state are not part of the snapshot.
+        assert!(!snapshot.join("data").exists());
+
+        // pnpm got half-way and died: the tree is neither version.
+        std::fs::write(profile.join("node_modules/dshmarket/version"), "2.0.0").unwrap();
+        std::fs::write(profile.join("node_modules/dshmarket/half"), "junk").unwrap();
+        // The Harness kept writing live state the whole time.
+        std::fs::write(profile.join("data/usage.json"), "after").unwrap();
+
+        restore_profile(&snapshot, &profile).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(profile.join("node_modules/dshmarket/version")).unwrap(),
+            "1.0.0"
+        );
+        assert!(!profile.join("node_modules/dshmarket/half").exists());
+        assert_eq!(
+            std::fs::read_to_string(profile.join("data/usage.json")).unwrap(),
+            "after",
+            "restoring the plugin tree must not roll back live session state"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A confirmed boot drops the record, and the rollback generation is what the next update
+    /// would have to undo.
+    #[test]
+    fn a_confirmed_boot_keeps_the_new_tree_and_clears_the_record() {
+        let root = std::env::temp_dir().join("dsh-desktop-core-confirm-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = UpdatePaths::new(&root.join("runtime"));
+        std::fs::create_dir_all(&paths.rollback).unwrap();
+        transaction::write_swap(
+            &paths.swap,
+            &transaction::SwapRecord {
+                target: "/tmp/target".to_string(),
+                backup: "/tmp/backup".to_string(),
+                version: "0.1.6".to_string(),
+                at: 0,
+            },
+        )
+        .unwrap();
+
+        confirm_core_update(&paths);
+        assert!(transaction::read_swap(&paths.swap).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2629,15 +3260,15 @@ mod tests {
     }
 
     /// Taking the port from another Harness kills a session someone may be watching, so the
-    /// decision needs both an identity and explicit permission.
+    /// decision needs both an identity and the user asking for it.
     #[test]
-    fn a_foreign_instance_is_only_taken_over_when_it_is_identified() {
+    fn a_foreign_instance_is_only_asked_about_when_it_is_identified() {
         const CMD: &str = "/opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --port 3080";
 
-        // Identified and allowed: the only path that signals anything.
+        // Identified and allowed: the question is put, and only the answer may signal anything.
         assert_eq!(
             foreign_instance_action(true, Some(4242), Some(CMD)),
-            ForeignAction::TakeOver { pid: 4242 }
+            ForeignAction::Ask { pid: 4242 }
         );
         // Identified, not allowed: the default. The instance keeps running.
         assert_eq!(
@@ -2659,6 +3290,58 @@ mod tests {
             foreign_instance_action(true, None, Some(CMD)),
             ForeignAction::Refuse { .. }
         ));
+    }
+
+    /// The question has to name what the user is about to end: a pid alone does not tell them
+    /// which terminal session or workspace they are looking at.
+    #[test]
+    fn the_takeover_question_names_the_process_and_this_shells_workspace() {
+        const CMD: &str = "/usr/bin/node /srv/dsh/lib/bin.js --profile web --port 3080";
+        let (status, detail) =
+            takeover_question(3080, 4242, Some(CMD), Path::new("/Users/me/project"));
+        assert_eq!(status, "检测到其它 Harness");
+        assert!(detail.contains("127.0.0.1:3080"), "{detail}");
+        assert!(detail.contains("pid 4242"), "{detail}");
+        assert!(detail.contains(CMD), "{detail}");
+        // The workspace this shell would restart it with, which is the part that surprises
+        // people: a takeover does not continue the other instance session.
+        assert!(detail.contains("/Users/me/project"), "{detail}");
+        // A command line the platform would not report is still named as unknown rather than
+        // left out, so the user knows what the shell does not know.
+        let (_, blind) = takeover_question(3080, 7, None, Path::new("/tmp"));
+        assert!(blind.contains("读不到命令行"), "{blind}");
+    }
+
+    /// An unanswered question falls back to exactly what the config asked for, so a headless or
+    /// ignored launch behaves the way the shell did before it could ask.
+    #[test]
+    fn an_unanswered_takeover_question_follows_the_config_default() {
+        // The wait itself: a value that never arrives is a timeout, not a panic or a hang.
+        assert_eq!(
+            window::wait_for_choice(1, Duration::from_millis(30), || None),
+            None
+        );
+        // An answer to a different question (a click that crossed a retry) is not this answer.
+        let stale = || {
+            Some(window::Choice {
+                question: 1,
+                id: CHOICE_TAKE_OVER.to_string(),
+            })
+        };
+        assert_eq!(
+            window::wait_for_choice(2, Duration::from_millis(30), stale),
+            None
+        );
+        let fresh = || {
+            Some(window::Choice {
+                question: 2,
+                id: CHOICE_BROWSER.to_string(),
+            })
+        };
+        assert_eq!(
+            window::wait_for_choice(2, Duration::from_secs(5), fresh).map(|choice| choice.id),
+            Some(CHOICE_BROWSER.to_string())
+        );
     }
 
     #[test]

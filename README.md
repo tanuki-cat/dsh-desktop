@@ -268,7 +268,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 | `workspace` | `$HOME` | 传给 dsh 的工作目录 = agent 的 workspace root。不是已存在的绝对目录时本次回落到默认值并记日志（**不改写你的文件**） |
 | `dsh_path` | `null` | 记住的 `dsh` 启动器绝对路径：自动搜索顺序为 `DSH_DESKTOP_DSH` → 本字段 → PATH → 常见目录 → login shell。相对路径或不存在的文件本次忽略并记日志 |
 | `dsh_home` | `null` | `null` 表示共用 `~/.dsh`（插件/设置/会话全保留）；指向别的目录则隔离 |
-| `take_over_existing` | `false` | 端口被**外部** Harness（不是本应用启动的）占用时是否停掉它并接管。默认不接管：改用系统浏览器打开那个实例。设为 `true` 才会接管，且**只在该进程的命令行确实像 `dsh web` 时**才发信号 |
+| `take_over_existing` | `false` | 端口被**外部** Harness（不是本应用启动的）占用时，是否**允许**停掉它并接管。设为 `true` 时不会静默接管：先弹面板让你当场选（接管 / 保留并用浏览器打开 / 什么都不做），面板写明对方 pid、完整命令行与本应用将要使用的 workspace；**120 秒没有选择才按本项决定**。默认 `false` 即「没选择就不接管」。任何情况下都**只在该进程的命令行确实像 `dsh web` 时**才会问这个问题 |
 | `auto_update` | `true` | 启动时检查并安装 dsh 新版本（自带/影子运行时总是更新自己的树） |
 | `auto_update_plugins` | `false` | 是否把 profile 里的插件市场（`dshmarket`）也更新到 registry 上的最新版。默认关：它会改写你 profile 的 `package.json`/锁文件，而 profile 是用户数据 |
 | `update_tags` | `["latest"]` | 取其中最高版本。默认只跟正式版；想跟预发布再加 `"next"` |
@@ -324,13 +324,13 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 |---|---|
 | 端口无监听 | 定位 dsh/node（**逐个候选校验身份**，见配置表末行）→ 启动 → 等 URL → 打开窗口。状态页写明用的是哪棵树：`dsh 0.1.5-rc.2 · system /opt/homebrew/lib/node_modules/… · 端口 3080` |
 | 端口上是本应用上次启动的实例（state.json 对得上且存活） | 直接复用（cookie 对同一 authority 仍有效，实测跨重启有效） |
-| 端口上是**别人**启动的 Harness（CLI / Automator） | 默认**不接管**：用系统浏览器打开那个实例并说明原因。`take_over_existing: true` 时才接管，且需两道身份同时成立 —— 401 特征 + 该 PID 命令行像 `dsh web`（`plugin` 子命令不算）→ 对该 PID 发 SIGTERM（只发单进程，不碰它的进程组）→ 等端口释放 → 自启拿新 token |
+| 端口上是**别人**启动的 Harness（CLI / Automator） | 先做两道身份校验（401 特征 + 该 PID 命令行像 `dsh web`，`plugin` 子命令不算）；都通过才**弹面板询问**：接管 / 保留并用浏览器打开 / 什么都不做。选接管 → 对该 PID 发 SIGTERM（只发单进程，不碰它的进程组）→ 等端口释放 → 自启拿新 token。面板写明对方的 pid、完整命令行、端口，以及**接管后会改用本应用配置的 workspace**（不会继续对方的工作目录）。`take_over_existing: false`（默认）时不问，直接用系统浏览器打开；`true` 时询问，**120 秒无选择才按 `true` 处理** |
 | 启动前发现新版 dsh | 先升级 CLI（splash 显示进度），随后重启实例跑新版本。用户自己装的那棵树默认**只提示不升级**（`system_updates: notify`）；新版本若超出已测试区间，在 `require_tested_dsh` 默认开启时**不安装**（装了也会被拒绝启动） |
 | 启动前发现新版插件市场 | 先停实例 → `dsh plugin --profile web add dshmarket@<版本>` → 重启实例。默认**不做**（`auto_update_plugins: false`），设为 `true` 才开启 |
 | WebView 缺可补的 API（如 `Iterator`） | 向 harness 窗口注入兼容层（ES5、逐块自守卫、只装缺的那些）后照常开原生窗口，日志记 `WebView 缺少 …：已注入兼容层`；`webkit_compat: false` 时改成"未注入"并走浏览器 |
 | WebView 缺补不了的能力（目前只有 `class static block` 语法） | 不打开 harness 窗口：改用默认浏览器 + 状态窗口写明缺什么、界面需要 Safari 16.4 及以上 |
 | 端口被别的程序占用（不是 Harness 协议） | 错误页，提示改 `config.json` 的端口。**普通 HTTP 服务（含返回 200 的 Vite/Node/Java）走这一条**：401 认证栅栏是唯一的 Harness 判据 |
-| `take_over_existing: false`（默认）且是外部 Harness | 不接管：用系统浏览器打开并给出说明 |
+| `take_over_existing: false`（默认）且是外部 Harness | 不询问也不接管：用系统浏览器打开并给出说明 |
 | 端口按 Harness 协议应答，但读不到 / 不像 `dsh web` 的命令行 | 不接管也不报"被别的程序占用"：拒绝接管并说明无法确认身份（避免误杀），提示手动停止或换端口 |
 | 关闭窗口（红点 / ⌘W） | `AppHandle::exit(0)` → `RunEvent::ExitRequested` → SIGTERM 进程组 → 删状态文件 |
 | ⌘Q / Dock 退出 / `quit app` | tao `application_will_terminate` → `RunEvent::Exit` → 同样的清理（幂等） |
@@ -343,7 +343,7 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | 页面停止刷新（能点击能输入、模型输出不更新） | 页面里的动画帧计数连续 2 次没变化 → 重新加载当前 URL（最多 3 次），标题显示"页面已停止刷新，正在重新加载…"（日志记 `Harness 页面停止绘制（输入仍有响应）`）。窗口不在前台时 WebKit 本就可以停画，这种探测不计数、不消耗重载预算。**重载前会先问页面是否正在被输入**：焦点在输入框、或最近 15 s 内有按键/粘贴 → 推迟一轮（标题显示"等待输入结束…"），避免丢掉未提交的提示词；输入停下后照常重载，重载预算不受影响 |
 | 页面完全无响应（渲染进程被杀 / 主线程卡死） | 15s 一次的探测连续 2 次收不到应答 → 同样重新加载（最多 3 次）。**无应答不算"正在输入"**：能回答"我在输入"的代码正是已经停掉的那部分，所以静默一律按需要恢复处理；macOS 上渲染进程被系统结束时会立刻重载（日志记 `WebView 渲染进程被系统结束（多为内存压力）`）。加载完成后标题自动恢复；3 次仍不回来 → 标题停在"页面已停止刷新，请重启应用"并记日志 |
 | 页面里的非 http/https 链接（`file:`、自定义 scheme…） | 不交给系统：日志记 `external scheme blocked: <scheme> (...)` 后丢弃 |
-| 有新版 dsh 但端口上是外部实例且不允许接管 | 跳过本次更新（不重写别人正在用的树），实例继续服务，日志记 `update deferred` |
+| 有新版 dsh 但端口上是外部实例且不允许接管 | 跳过本次更新（不重写别人正在用的树），实例继续服务，日志记 `update deferred`。允许接管时同样**先弹面板**：拒绝接管即跳过本次更新，而不是先停掉对方再失败 |
 | 下载同名文件 | 自动改名 `name-1.ext`，不覆盖已有文件 |
 | 关闭状态页（启动失败时） | 直接退出应用（此时没有 Harness 窗口，不会留下无窗口进程）；应用自己移除该窗口走 `destroy`，不触发这条 |
 | 终态状态页上点「重新启动 Harness」 | 同一进程内复位失败标志并重跑启动流程：占端口的外部 Harness 会被接管，成功即销毁状态页、开新窗口；再失败则原地更新报错页 |
@@ -373,19 +373,34 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
    树被换走后运行中的 harness 下一次 `require()` 会直接 `MODULE_NOT_FOUND`（实测）。所以先 SIGTERM 停实例、
    等端口释放，再安装；不能停时（外部实例且 `take_over_existing=false`、或拿不到 PID）**跳过本次更新**并记日志，
    实例不受任何影响；
-4. 有新版则 `npm install -g --no-fund --no-audit --cache <app-data>/runtime/npm-cache @deepseek-ai/dsh@<解析出的具体版本>`；
-   npm 取自 node 同目录，且 npm 全局前缀 ≠ CLI 实际位置时自动带 `--prefix`；`runtime/{prefix,tools,npm-cache}` 在启动时
-   幂等创建；
+4. **装进暂存目录，不碰正在用的那棵树**：有新版则
+   `npm install -g --no-fund --no-audit --cache <app-data>/runtime/npm-cache --prefix <app-data>/runtime/staging/staging-<版本>/prefix @deepseek-ai/dsh@<解析出的具体版本>`；
+   npm 取自 node 同目录；`runtime/{prefix,tools,npm-cache,staging,rollback,profile-backup}` 在启动时幂等创建。
+   暂存目录每次尝试前清空 —— 上一次留下的半棵树绝不能被当成这一次的成果；
 5. 所有 npm 子进程都在 PATH 最前面插入 npm 所在目录：npm 是 `#!/usr/bin/env node` 脚本，
    而 GUI 启动的壳只有 launchd 的 PATH（不含 node），不这样处理会直接 `exit 127`（详见设计文档 §13.8）；
-6. 安装后**从安装前缀回读** CLI 路径与版本：自带运行时的更新落在影子前缀，回读 seed 会让版本看起来没变，
-   于是本轮继续跑旧核心、日志还指向 npm 前缀；版本变了就把受管 CLI 切到新树并在本轮重启实例；
-   只有**确实没变**（npm 装到了别处）才记那条日志，并把这次尝试写进缓存（`attempted`），
-   **同一缓存窗口内不再重复安装**（否则每次启动都会先停掉 Harness 再重建一棵约 289 MB 的依赖树）；
-7. 刚更新过 → 强制重启实例（否则复用旧进程仍跑旧二进制）。
+6. **校验暂存树**：包名必须是 `@deepseek-ai/dsh`、版本必须是请求的那个、入口脚本 `lib/bin.js` 必须存在。
+   任一条不满足就放弃本次更新并记日志 —— registry 给了别的版本、下载被截断、npm 忽略了 `--prefix`，
+   都在这里变成一条日志，而不是一棵坏掉的树；
+7. **原子切换**：把活动树 `rename` 到 `runtime/rollback/<版本>`（last-known-good，保留 2 代），
+   再把暂存树 `rename` 到活动位置。切换**之前**先写 `runtime/update-swap.json` 记录这次切换，
+   它要等新版本真的打印出启动 URL 才被删掉；
+8. 切换推迟到**确定要启动**的那一刻：这中间还可能因为端口被占、外部实例不接管、版本超出测试区间而
+   根本不启动 Harness，为一次不会发生的启动做切换只会给下次启动留一条要回滚的记录；
+9. 新版本起不来（等启动 URL 超时）→ **立即回滚**并把原因写进错误页；进程在切换与确认之间被强杀 →
+   下次启动读到 `update-swap.json` 就先把旧树放回，再去解析运行时（否则会挑中同一棵起不来的树、
+   以同样的方式再失败一次）。失败的那棵树改名为 `<name>.failed` 留在旁边，作为排查证据；
+10. 只有**确实没变**（npm 装到了别处）才记那条日志，并把这次尝试写进缓存（`attempted`），
+    **同一缓存窗口内不再重复安装**（否则每次启动都会先停掉 Harness 再重建一棵约 289 MB 的依赖树）；
+11. 刚更新过 → 强制重启实例（否则复用旧进程仍跑旧二进制）。
 
-结果写入日志：`dsh is up to date` / `update available: A -> B` / `dsh updated: A -> B` / `update failed, keeping vA` /
-`update A was already attempted and changed nothing; not installing again`。
+结果写入日志：`dsh is up to date` / `update available: A -> B` / `update staged: A -> B（校验通过，待切换）` /
+`dsh updated: A -> B` / `update staged but not committed, keeping vA` / `update failed, keeping vA` /
+`vB 未能启动，已回滚到上一棵树` / `update A was already attempted and changed nothing; not installing again`。
+
+**回滚点与磁盘占用**：`runtime/rollback/` 最多保留 2 代 CLI 树，`runtime/profile-backup/` 最多保留 2 份
+profile 快照（都是**上限**：一次更新只产生一份，两次指向同一版本时会覆盖）。常见情况是活动树 + 1 份回滚树
++ 1 份快照；最坏情况约 3 × 290 MB + 2 × profile。旧代在每次成功确认后自动裁剪，被强杀留下的暂存树在下次启动时清理。
 
 ### 插件市场（`dshmarket`）的自动更新
 
@@ -395,9 +410,14 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
   `<app-data>/plugin-check.json`，与核心的 `update-check.json` 互不干扰；
 - 只在该 profile 的 `package.json` **声明了** `dshmarket` 时才动手（你自己删掉的插件不会被装回来），
   比较的是 `node_modules/dshmarket/package.json` 里的**实际安装版本**，不是范围；
-- 有新版时走与核心相同的顺序：**先停实例**（pnpm 原地重写 profile 的 `node_modules`，运行中的
-  harness 下次 lazy require 会崩）→ `dsh plugin --profile web add dshmarket@<版本>`（CLI 自己转发 pnpm，
-  属于你的 profile 文件会被改写）→ 回读版本 → 本轮重启实例让新插件生效；
+- 有新版时：**先停实例**（pnpm 原地重写 profile 的 `node_modules`，运行中的 harness 下次 lazy require 会崩）
+  → **先把 profile 快照到 `<app-data>/runtime/profile-backup/<版本>/`**（跳过 `data/`、`.dsh-market/`：
+  凭据、会话状态与市场日志在 Harness 运行期间一直在写，恢复旧值回去是第二个、更糟的故障）
+  → `dsh plugin --profile web add dshmarket@<版本>`（CLI 自己转发 pnpm，属于你的 profile 文件会被改写）
+  → 回读版本 → 本轮重启实例让新插件生效；
+- **安装失败就把快照放回**：pnpm 可能在失败前已经改写了 `node_modules`，而半棵插件树不是下次启动能自愈的。
+  恢复只动快照里有的条目，因此安装期间 Harness 写下的实时状态不受影响。拿不到快照时**不做本次安装** ——
+  插件市场不值得一次不可逆的 profile 改写；
 - 子进程用的是壳**组装好的那份 PATH**（node 目录 → 可写的 `<app-data>/runtime/tools/bin` →
   随包的 `<seed>/tools/bin` → 登录 shell 的 PATH），pnpm 就装在随包的 `tools` 前缀里 ——
   Finder 启动的应用继承的是 launchd 的 PATH，本来找不到它；
