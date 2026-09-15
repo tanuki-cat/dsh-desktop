@@ -271,14 +271,35 @@ jobs:
 
           ### 本版修复
 
-          - **页面停止刷新**：模型跑着跑着界面不再更新（能点击、能输入、能发送，只有输出不动），
-            重启后发现任务其实已经完成。原因是 WebKit 会暂停它认为不活跃的窗口的动画帧，而 Harness
-            界面把流式输出合并到动画帧上（输入框走同步刷新，所以只有输出受影响）。现在窗口显式关闭
-            背景节流，并新增绘制看护：连续两次探测到"帧没动"就自动重新加载页面（最多 3 次）。
-          - **认错 dsh**：PATH 上同名的其他程序（Homebrew 的 Dancer's shell 等）不再被当作 dsh 监管，
-            界面显示的版本号也不会再来自别人的包；状态页现在同时写明用的是哪棵树。
-          - **界面没有插件市场**：profile 已存在、或没声明 dshmarket 时不再静默跳过，日志会说明原因
-            与修复命令。
+          > ⚠️ **本版收紧了若干默认行为**，升级后可能与你习惯的不同，逐条列在最前面。
+
+          - **不再误杀占用端口的其他程序**（重要）：此前只要某服务在配置端口上返回 `HTTP 200`，
+            就会被当成"外部 Harness"并被终止 —— 普通 Vite / Node / Java 服务都可能中招。原因是
+            探测把 `200` 也当作 Harness 的证据，而 Harness 的认证栅栏对所有不带 cookie 的请求
+            一律回 `401`，所以 `200` 只可能来自非 Harness。判据已收敛为唯一的 401 栅栏，并新增
+            第二道校验：只有监听进程的命令行确实是 `dsh web` 时才允许发信号。
+          - **默认不再接管外部实例**：`take_over_existing` 默认由 `true` 改为 `false`。端口上已有
+            别人启动的 Harness 时，本应用改用系统浏览器打开它，而不是终止它（那可能中断你的终端
+            会话或正在跑的 agent 任务）。要恢复旧行为就在 `config.json` 里显式写 `true`。
+          - **默认不自动改写你的全局 dsh**：`system_updates` 默认由 `install` 改为 `notify` ——
+            自己装的 CLI 只提示新版本，不再被 `npm install -g` 就地替换。自带运行时版不受影响，
+            它更新的是包内自己的树。想恢复就地升级就写 `install`。
+          - **默认不自动改写 profile**：`auto_update_plugins` 默认由 `true` 改为 `false`，插件市场
+            不再自动更新（它会改写 profile 的 `package.json` 与锁文件）。想保持自动更新就写 `true`。
+          - **只跟正式版**：`update_tags` 默认由 `["latest","next"]` 改为 `["latest"]`，不再默认
+            跟进预发布渠道。
+          - **区间外版本默认拒绝启动**：`require_tested_dsh` 默认由 `false` 改为 `true`。同时新增
+            约束：会被拒绝启动的版本也不会被自动装上（否则会把你能用的版本换成壳自己又拒绝运行的
+            那一个）。想继续用未测试版本就写 `false`。
+          - **npm 不再可能永久挂起**：`npm view` / `npm install` / `dsh plugin add` 现在有进程级
+            超时，超时后连同子进程树一起清理。此前 `--fetch-timeout` 只管单次请求，代理挂起、锁等待、
+            生命周期脚本都可能让它们永不返回 —— 而那时 Harness 已经被停掉了。
+          - **日志脱敏范围扩大**：除 launch token 外，`Authorization`/`Bearer`、API Key、
+            `Cookie`/`Set-Cookie`、`password`、`secret` 等字段的值也会被替换为 `***`。
+          - **Windows 敏感文件权限收紧**：`config.json` 与 `state.json` 现在用 `icacls` 去掉继承并
+            只授权当前用户（此前 Windows 上是空实现，只依赖用户目录原有 ACL）。
+          - **本地状态页启用严格 CSP**：splash 页面不再允许内联脚本与 `eval`。
+          - **页面重载不再无条件丢输入**：绘制看护重载前会先问页面是否正在被输入，是则推迟一轮。
 
           ### 产物
 
@@ -297,7 +318,8 @@ jobs:
           | Windows x64 | dsh-desktop___VERSION___windows-x64-portable.zip（免安装，自带运行时） | —— |
 
           自带运行时版首次启动会用包内的 Node + dsh 拉起 Web GUI，不需要联网下载；dsh 核心与插件市场
-          dshmarket 之后跟随 npm registry 自动更新（默认开启，可用 config.json 的 auto_update 关闭）。
+          dshmarket 之后跟随 npm registry 自动更新（**本版起默认关闭**，用 config.json 的
+          `auto_update_plugins` 开启；核心的 `auto_update` 不受影响）。
 
           > 🖥 **macOS 的界面需要 Safari 16.4（macOS 13.3）或更新的 WebKit**：随包的 document-preview
           > 插件在更旧的引擎上会在加载期抛 `Can't find variable: Iterator` 一类错误。壳会先探测缺什么，
