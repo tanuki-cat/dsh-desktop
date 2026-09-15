@@ -37,6 +37,11 @@ impl Origin {
             Origin::System => "system",
         }
     }
+
+    /// The same label for a caller that has the value in hand.
+    pub fn label_of(origin: Origin) -> &'static str {
+        origin.label()
+    }
 }
 
 /// `runtime` in config.json.

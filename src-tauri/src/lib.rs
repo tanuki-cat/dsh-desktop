@@ -533,6 +533,10 @@ struct ResolvedRuntime {
     node: PathBuf,
     dsh_js: PathBuf,
     version: String,
+    /// Where the supervised dsh came from: the seed, the shadow prefix, the environment, or the
+    /// user's own installation. Shown on the status page, because "which tree is this" is the
+    /// difference between a working setup and a machine running an unrelated `dsh`.
+    origin: runtime::Origin,
     updates: runtime::Updates,
     /// Where the bundled runtime lives, when this build ships one.
     seed: Option<PathBuf>,
@@ -774,11 +778,14 @@ fn resolve_runtime(
         config.system_updates.label()
     );
     harness::app_log(&describe);
-    let version = locator::version_of(&decision.dsh.path).unwrap_or_else(|| "未知".into());
+    // Reported with the reason when it cannot be read: the status page and the log used to show a
+    // bare "未知", which hid *why* the tree could not be identified (2026-09-15).
+    let version = locator::describe_version(&decision.dsh.path);
     Ok(ResolvedRuntime {
         node: absolute(&decision.node.path),
         dsh_js: absolute(&decision.dsh.path),
         version,
+        origin: decision.dsh.origin,
         updates: decision.updates,
         seed,
         bundled: matches!(
@@ -802,28 +809,100 @@ struct SeedOutcome {
     note: Option<String>,
 }
 
+/// Why a bundled build did not put its profile template in place.
+///
+/// Every branch reports: a user whose UI has no plugin market needs the log to say which of
+/// these happened, and the template is the only thing that installs one without a download.
+#[derive(Debug, PartialEq, Eq)]
+enum SeedSkip {
+    /// This build has no bundled runtime: a machine that installed its own dsh gets no template
+    /// (the template pins a market version, and this tree is not ours — review P1-7).
+    NotBundled,
+    /// The bundle has no template to copy.
+    NoTemplate,
+    /// Neither `dsh_home` nor a home directory could be resolved.
+    NoHome,
+    /// A profile is already there: seeding never overwrites one (plan §2.5).
+    ProfileExists,
+}
+
+impl SeedSkip {
+    fn reason(&self) -> String {
+        match self {
+            SeedSkip::NotBundled => {
+                "本构建没有自带运行时：不播种 profile 模板（插件市场由用户的安装自行决定）"
+                    .to_string()
+            }
+            SeedSkip::NoTemplate => "随包资源里没有 profile-template，跳过播种".to_string(),
+            SeedSkip::NoHome => "无法确定 DSH_HOME，跳过 profile 模板播种".to_string(),
+            SeedSkip::ProfileExists => {
+                "profile 已存在，跳过模板播种：插件市场不会因此被安装（缺失就自己 add 一次）"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// Which half of the seeding decision this run lands on, without touching the filesystem.
+///
+/// Pure, so the matrix is testable: `bundled` is whether this build's own tree is being
+/// supervised, `template` whether the bundle carries one, and `profile_exists` whether the user
+/// already has a web profile.
+fn seed_decision(
+    bundled: bool,
+    template: bool,
+    home: bool,
+    profile_exists: bool,
+) -> Result<(), SeedSkip> {
+    if !bundled {
+        return Err(SeedSkip::NotBundled);
+    }
+    if !template {
+        return Err(SeedSkip::NoTemplate);
+    }
+    if !home {
+        return Err(SeedSkip::NoHome);
+    }
+    if profile_exists {
+        return Err(SeedSkip::ProfileExists);
+    }
+    Ok(())
+}
+
 /// First launch of a bundled build: install the profile template (which carries the plugin
 /// market) into the user's DSH_HOME, unless a profile is already there (plan §2.5).
-fn seed_profile_template(config: &Config, seed: Option<&Path>) -> SeedOutcome {
+///
+/// Every skip is reported through `note`: the template is how a bundled build gets its plugin
+/// market, so a silent skip is exactly the state a user cannot diagnose from the UI.
+fn seed_profile_template(config: &Config, bundled: bool, seed: Option<&Path>) -> SeedOutcome {
     let mut outcome = SeedOutcome::default();
-    let Some(seed) = seed else {
-        return outcome;
-    };
-    let template = seed.join("profile-template");
-    if !template.join("package.json").is_file() {
-        return outcome;
-    }
-    let Some(home) = config
+    let template = seed.map(|seed| seed.join("profile-template"));
+    let home = config
         .dsh_home
         .clone()
-        .or_else(|| home_dir().map(|home| home.join(".dsh")))
-    else {
-        return outcome;
+        .or_else(|| home_dir().map(|home| home.join(".dsh")));
+    let profile = home.as_ref().map(|home| home.join("profiles").join("web"));
+    let decision = seed_decision(
+        bundled,
+        template
+            .as_ref()
+            .is_some_and(|template| template.join("package.json").is_file()),
+        profile.is_some(),
+        profile.as_ref().is_some_and(|profile| profile.exists()),
+    );
+    let (template, profile) = match (decision, template, profile) {
+        (Ok(()), Some(template), Some(profile)) => (template, profile),
+        // `seed_decision` already rejected every state that cannot reach the copy, so this arm is
+        // unreachable; it reports instead of panicking, because a later edit to either side must
+        // not be able to crash startup.
+        (decision, _, _) => {
+            outcome.note = Some(match decision {
+                Err(skip) => skip.reason(),
+                Ok(()) => "无法确定 profile 模板或 DSH_HOME，跳过播种".to_string(),
+            });
+            return outcome;
+        }
     };
-    let profile = home.join("profiles").join("web");
-    if profile.exists() {
-        return outcome;
-    }
     match copy_tree(&template, &profile) {
         Ok(()) => {
             outcome.seeded = true;
@@ -1270,6 +1349,19 @@ fn looks_like_our_harness(output: &str, parent: Parent) -> bool {
     command.contains("--profile web") && command.contains("dsh") && parent != Parent::Live
 }
 
+/// The npm package this shell supervises, for the messages that have to name it.
+const DSH_PACKAGE_NAME: &str = "@deepseek-ai/dsh";
+
+/// May the core update path touch the supervised tree?
+///
+/// Two facts have to hold. The tree must be one this shell owns (`Shadow`, the writable prefix
+/// updates install into) or a version that `@deepseek-ai/dsh` really publishes: handing a foreign
+/// `dsh` (or an unreadable version) to `npm install -g @deepseek-ai/dsh@latest` would install a
+/// second CLI beside it and restart the shell onto a tree the user never chose (2026-09-15).
+fn may_update_core(updates: runtime::Updates, version: &str) -> bool {
+    matches!(updates, runtime::Updates::Shadow) || crate::update::Version::parse(version).is_some()
+}
+
 /// Why the plugin market cannot be updated this launch, when it cannot.
 ///
 /// The decision is taken *before* the running Harness is stopped: `dsh plugin add` is a thin
@@ -1284,6 +1376,10 @@ enum PluginSkip {
     /// No `pnpm` on the PATH the CLI will run with (the bundled tools prefix is missing, or the
     /// build has no bundled runtime and the machine has no system pnpm).
     NoPnpm,
+    /// The profile does not mention the market at all, so there is nothing to keep current.
+    /// Reported rather than silently skipped: "the UI has no plugin market" is otherwise a fact
+    /// the user has to work out from the absence of a menu.
+    NotDeclared,
 }
 
 impl PluginSkip {
@@ -1295,11 +1391,29 @@ impl PluginSkip {
             PluginSkip::NoPnpm => {
                 "PATH 上没有 pnpm，跳过插件市场更新（不停止正在运行的 Harness）".to_string()
             }
+            PluginSkip::NotDeclared => format!(
+                "profile {} 里没有声明 {}：界面不会出现插件市场，也不会自动安装（                 用 `dsh plugin --profile web add {}` 装上，或改用自带运行时版让首启播种模板）",
+                update::MARKET_PLUGIN,
+                update::MARKET_PLUGIN,
+                update::MARKET_PLUGIN
+            ),
         }
     }
 }
 
-fn plugin_skip_reason(installed: Option<&str>, pnpm: Option<&Path>) -> Option<PluginSkip> {
+/// Why the plugin market step cannot run this launch.
+///
+/// `declared` is the profile's own `package.json`: a market the user removed must not come back
+/// (design §2.5), but that decision is worth a log line — the shell used to skip the whole step
+/// without a word, which is how "the plugin shop is gone" became unexplainable from the log.
+fn plugin_skip_reason(
+    declared: bool,
+    installed: Option<&str>,
+    pnpm: Option<&Path>,
+) -> Option<PluginSkip> {
+    if !declared {
+        return Some(PluginSkip::NotDeclared);
+    }
     if installed.is_none() {
         return Some(PluginSkip::NotInstalled);
     }
@@ -1522,13 +1636,12 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     // place before the CLI starts, so the marketplace exists without any download (§2.5).
     // Only for the shell's own runtime: the template pins a dshmarket version, and a user who
     // installed or pointed at their own tree should not be given one (review P1-7).
-    let mut seeded_this_run = false;
-    if resolved.bundled() {
-        let outcome = seed_profile_template(&config, resolved.seed.as_deref());
-        seeded_this_run = outcome.seeded;
-        if let Some(note) = outcome.note {
-            harness::app_log(&note);
-        }
+    // Reported either way: a bundled build that skipped the template has no plugin market, and
+    // that is the one fact a user cannot see from the UI.
+    let seed_outcome = seed_profile_template(&config, resolved.bundled(), resolved.seed.as_deref());
+    let seeded_this_run = seed_outcome.seeded;
+    if let Some(note) = seed_outcome.note {
+        harness::app_log(&note);
     }
 
     // The update path installs into `runtime/prefix` and keeps npm's cache there: create both
@@ -1545,8 +1658,14 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     }
 
     // 3b) Update the supervised CLI before booting it, so "core upgrade" needs no terminal.
+    let may_update = may_update_core(resolved.updates, &version);
+    if !may_update {
+        harness::app_log(&format!(
+            "跳过核心更新检查：监督的 dsh {version} 不是 {DSH_PACKAGE_NAME} 的已发布版本之一"
+        ));
+    }
     let mut just_updated = false;
-    if config.auto_update && !version.is_empty() {
+    if config.auto_update && may_update {
         match update::npm_for(&resolved.node) {
             None => harness::app_log("找不到 npm，跳过更新检查"),
             Some(npm) => {
@@ -1723,12 +1842,14 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     }
     if check_market && !seeded_this_run {
         let profile_dir = home.join("profiles").join("web");
-        if update::declares_plugin(&profile_dir, update::MARKET_PLUGIN) {
+        let declared = update::declares_plugin(&profile_dir, update::MARKET_PLUGIN);
+        if declared {
             let installed = update::installed_plugin(&profile_dir, update::MARKET_PLUGIN);
             // Resolve pnpm before anything is stopped: it is what actually installs a plugin,
             // and without it the CLI exits 127 after the instance is already gone (review A1).
             let pnpm = update::find_pnpm(Some(OsStr::new(&child.path)));
-            if let Some(skip) = plugin_skip_reason(installed.as_deref(), pnpm.as_deref()) {
+            if let Some(skip) = plugin_skip_reason(declared, installed.as_deref(), pnpm.as_deref())
+            {
                 harness::app_log(&skip.reason());
             } else if let Some(current) = installed {
                 match update::npm_for(&resolved.node) {
@@ -1969,16 +2090,20 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     // before the spawn so the status line says it, and logged before the window opens: a feature
     // that misbehaves under a shim should be traceable to it.
     let compat = harness_compat(&config);
+    // The source is named on the status page, not just in the log: "which dsh is this" is the
+    // first question when the UI behaves like a different installation (2026-09-15).
     window::set_status(
         app,
         "正在启动 Harness…",
         &format!(
-            "dsh {version}{} · 端口 {port}{}",
+            "dsh {version}{} · {}{} · 端口 {port}{}",
             if untested {
                 "（未测试版本）"
             } else {
                 ""
             },
+            runtime::Origin::label_of(resolved.origin),
+            resolved.dsh_js.display(),
             if compat.is_some() {
                 " · 兼容层"
             } else {
@@ -2414,7 +2539,13 @@ mod tests {
         std::fs::create_dir_all(seed.join("node/bin")).unwrap();
         std::fs::write(seed.join("node/bin/node"), "").unwrap();
         std::fs::write(dsh_dir.join("lib/bin.js"), "").unwrap();
-        std::fs::write(dsh_dir.join("package.json"), "{\"version\": \"9.9.9\"}").unwrap();
+        // The manifest has to name the package: a version is only read from a tree that
+        // identifies itself as this CLI.
+        std::fs::write(
+            dsh_dir.join("package.json"),
+            "{\"name\": \"@deepseek-ai/dsh\", \"version\": \"9.9.9\"}",
+        )
+        .unwrap();
 
         let data_dir = root.join("app-data");
         let config = Config {
@@ -2613,22 +2744,59 @@ mod tests {
         let pnpm = Path::new("/opt/runtime/tools/bin/pnpm");
         // Declared but not installed: installing it is a repair the user may be mid-way through.
         assert_eq!(
-            plugin_skip_reason(None, Some(pnpm)),
+            plugin_skip_reason(true, None, Some(pnpm)),
             Some(PluginSkip::NotInstalled)
         );
         // No pnpm: `dsh plugin add` forwards to pnpm and exits 127 — after the shell already
         // stopped the Harness, so the decision has to be made here (review A1).
         assert_eq!(
-            plugin_skip_reason(Some("1.0.0"), None),
+            plugin_skip_reason(true, Some("1.0.0"), None),
             Some(PluginSkip::NoPnpm)
         );
         // Both halves present: the update may proceed.
-        assert_eq!(plugin_skip_reason(Some("1.0.0"), Some(pnpm)), None);
+        assert_eq!(plugin_skip_reason(true, Some("1.0.0"), Some(pnpm)), None);
         // The skip has to explain itself; this is the log line the user sees.
         assert!(PluginSkip::NoPnpm.reason().contains("pnpm"));
         assert!(PluginSkip::NotInstalled
             .reason()
             .contains(update::MARKET_PLUGIN));
+    }
+
+    /// Core updates are the same hazard as the identity check: `npm i -g @deepseek-ai/dsh`
+    /// against a foreign or unreadable tree installs a second CLI and restarts onto it.
+    #[test]
+    fn the_core_update_only_touches_a_tree_it_can_identify() {
+        // The shell's own writable prefix: always its business.
+        assert!(may_update_core(runtime::Updates::Shadow, "0.1.5-rc.2"));
+        assert!(may_update_core(runtime::Updates::Shadow, "未知"));
+        // A user's install whose version this package really publishes: updatable in place.
+        assert!(may_update_core(runtime::Updates::Notify, "0.1.5-rc.2"));
+        assert!(may_update_core(runtime::Updates::Notify, "0.1.6-alpha.1"));
+        // A user's install with no version to compare against: leave it alone.
+        assert!(!may_update_core(runtime::Updates::Notify, "未知"));
+        assert!(!may_update_core(runtime::Updates::Notify, ""));
+        assert!(!may_update_core(runtime::Updates::Notify, "Dancer's shell"));
+    }
+
+    /// A profile without the market used to be skipped in silence, which is how "the UI has no
+    /// plugin market" became impossible to explain from the log.
+    #[test]
+    fn a_profile_without_the_market_says_so_instead_of_going_quiet() {
+        let pnpm = Path::new("/opt/runtime/tools/bin/pnpm");
+        assert_eq!(
+            plugin_skip_reason(false, None, Some(pnpm)),
+            Some(PluginSkip::NotDeclared)
+        );
+        // Not declared wins over the other reasons: there is nothing to install or update.
+        assert_eq!(
+            plugin_skip_reason(false, Some("1.0.0"), None),
+            Some(PluginSkip::NotDeclared)
+        );
+        let reason = PluginSkip::NotDeclared.reason();
+        assert!(reason.contains(update::MARKET_PLUGIN), "{reason}");
+        assert!(reason.contains("profile"), "{reason}");
+        // The repair path is named, because the missing menu is not something a user can guess.
+        assert!(reason.contains("dsh plugin"), "{reason}");
     }
 
     #[test]
@@ -2706,16 +2874,63 @@ mod tests {
 
         // First launch: the template is copied and the caller is told, so the plugin check can
         // stay offline this once (review A2).
-        let outcome = seed_profile_template(&config, Some(&seed));
+        let outcome = seed_profile_template(&config, true, Some(&seed));
         assert!(outcome.seeded);
         assert!(outcome.note.is_some());
         assert!(home.join("profiles/web/package.json").is_file());
 
-        // Second launch: the profile exists, so this is not a first start any more.
-        let again = seed_profile_template(&config, Some(&seed));
+        // Second launch: the profile exists, so this is not a first start any more — and saying
+        // so is what makes "my UI has no plugin market" answerable from the log.
+        let again = seed_profile_template(&config, true, Some(&seed));
         assert!(!again.seeded);
-        assert!(again.note.is_none());
+        assert_eq!(
+            again
+                .note
+                .as_deref()
+                .map(|note| note.contains("profile 已存在")),
+            Some(true),
+            "{:?}",
+            again.note
+        );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The decision matrix, without a filesystem: every skip has to be sayable.
+    #[test]
+    fn seeding_decides_on_four_plain_facts() {
+        assert_eq!(seed_decision(true, true, true, false), Ok(()));
+        assert_eq!(
+            seed_decision(false, true, true, false),
+            Err(SeedSkip::NotBundled)
+        );
+        assert_eq!(
+            seed_decision(true, false, true, false),
+            Err(SeedSkip::NoTemplate)
+        );
+        assert_eq!(
+            seed_decision(true, true, false, false),
+            Err(SeedSkip::NoHome)
+        );
+        assert_eq!(
+            seed_decision(true, true, true, true),
+            Err(SeedSkip::ProfileExists)
+        );
+        // A non-bundled build names itself, not whatever else is missing.
+        assert_eq!(
+            seed_decision(false, false, false, true),
+            Err(SeedSkip::NotBundled)
+        );
+        // Each reason has to name the consequence, because the missing menu cannot be guessed.
+        for skip in [
+            SeedSkip::NotBundled,
+            SeedSkip::NoTemplate,
+            SeedSkip::NoHome,
+            SeedSkip::ProfileExists,
+        ] {
+            let reason = skip.reason();
+            assert!(!reason.is_empty(), "{skip:?} must explain itself");
+        }
+        assert!(SeedSkip::ProfileExists.reason().contains("插件市场"));
     }
 
     #[test]

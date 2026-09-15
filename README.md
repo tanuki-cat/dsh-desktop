@@ -161,6 +161,13 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   完整证据与设计（含为什么推翻 2026-09-14"不在 WebView 里打补丁"的结论）见
   [`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs/design-task-feat-legacy-webkit-compat-layer.md)。
   Intel 机器更容易停在旧系统，所以这个现象看着像「macos-x64 专属」。
+- **界面没有插件市场**：市场来自 profile（`~/.dsh/profiles/web`），只有三条来源 —— ① **自带运行时版**首启
+  播种的 profile 模板（**精简版永远不播种**）；② 你自己 `dsh plugin --profile web add dshmarket`；
+  ③ 市场装好后自我更新。profile 已经存在时模板不会覆盖（跳过会记日志），profile 里没声明 dshmarket 时
+  也会记一条说明 —— 这两种情况以前是完全静默的。
+- **显示的 dsh 版本不像 dsh**：状态页现在同时写**版本与来源**（`system` / `bundled` / `env` + 树路径）。
+  若版本号可疑、或部署里存在同名 `dsh`，先看日志的 `runtime:` 与 `spawn:` 两行：`spawn:` 里的路径
+  就是壳真正监管的那棵树。
 
 ### 自带运行时（已并入 main）
 
@@ -248,6 +255,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 | `require_tested_dsh` | `false` | CLI 版本落在已测试区间外时是否拒绝启动。默认只告警并继续（状态页标注「未测试版本」） |
 | `webkit_compat` | `true` | 旧 WebView 上注入兼容层（`Iterator` 等，见[已知坑](#已知坑)），让 macOS 13.3+ 用原生窗口。`false` 恢复旧行为：缺任何能力都改用默认浏览器 |
 | `runtime` | `"auto"` | 运行时来源：`auto` 用系统已装的（通过门槛时），否则用自带；`bundled` 强制自带；`system` 保持旧行为（开发用） |
+| —— | —— | **候选必须真的是 `@deepseek-ai/dsh`**：PATH 上同名但不是这个 npm 包的 `dsh`（Homebrew 的 Dancer's shell、自定义 shim…）会被跳过并记日志；全部候选都不合格时报错页，而不是随便监管一个同名程序。识别不出来的 node 启动脚本只有在 `--version` 真的打印出版本号时才被采用（旧布局的兜底） |
 | `env` | `{}` | 显式追加/覆盖传给 harness 的环境变量，优先级最高，如 `{"DEEPSEEK_API_KEY": "sk-…"}` |
 
 只要写你想改的字段即可：`port` / `workspace` 缺失会取默认值，其余字段本就有默认值。
@@ -279,7 +287,7 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 
 | 场景 | 行为 |
 |---|---|
-| 端口无监听 | 定位 dsh/node → 启动 → 等 URL → 打开窗口 |
+| 端口无监听 | 定位 dsh/node（**逐个候选校验身份**，见配置表末行）→ 启动 → 等 URL → 打开窗口。状态页写明用的是哪棵树：`dsh 0.1.5-rc.2 · system /opt/homebrew/lib/node_modules/… · 端口 3080` |
 | 端口上是本应用上次启动的实例（state.json 对得上且存活） | 直接复用（cookie 对同一 authority 仍有效，实测跨重启有效） |
 | 端口上是**别人**启动的 Harness（CLI / Automator） | **接管**：401 特征确认身份 → 对该 PID 发 SIGTERM → 等端口释放 → 自启拿新 token |
 | 启动前发现新版 dsh | 先升级 CLI（splash 显示进度），随后重启实例跑新版本 |

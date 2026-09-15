@@ -104,15 +104,104 @@ fn probe_node_within(node: &Path, timeout: Duration) -> Option<NodeFacts> {
     }
 }
 
-/// Version of a CLI tree, from the package.json that owns the entry script.
+/// The npm package every candidate has to be: a `dsh` that is something else is not this CLI.
+///
+/// `dsh` is a crowded name — Homebrew ships a distributed shell under it, PyPI a Python tool,
+/// and a hand-written shim or a stale dependency can put one anywhere on PATH. The shell used to
+/// take whichever file came first and read the version off the nearest `package.json` without
+/// asking whose it was, so a foreign binary could be supervised *and* have its version shown as
+/// "the dsh version" (field report 2026-09-15: a startup page naming a dsh version that does not
+/// exist on npm).
+const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
+
+/// The nearest package manifest above an entry script: where it is, what it is called, its version.
+///
+/// Reading the *nearest* manifest — rather than "the first one on the way up that names dsh" — is
+/// the point: a foreign `dsh` living inside some other npm package must be recognised as that
+/// package, not adopted merely because no dsh manifest turned up.
+struct PackageManifest {
+    name: String,
+    version: String,
+}
+
+/// Read the manifest owning `dsh_js`, up to five levels above it.
+///
+/// `Ok(None)` means there is no manifest to judge (a shim outside any package, which is how the
+/// shell's own launcher can look); `Err` carries one that exists but cannot be read or parsed,
+/// which is worth logging instead of pretending either answer.
+fn owning_manifest(dsh_js: &Path) -> Result<Option<PackageManifest>, String> {
+    let mut dir = match dsh_js.parent() {
+        Some(dir) => dir.to_path_buf(),
+        None => return Ok(None),
+    };
+    for _ in 0..5 {
+        let manifest = dir.join("package.json");
+        if manifest.is_file() {
+            let raw = std::fs::read_to_string(&manifest)
+                .map_err(|error| format!("{} 无法读取: {error}", manifest.display()))?;
+            let parsed: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|error| format!("{} 不是合法 JSON: {error}", manifest.display()))?;
+            return Ok(Some(PackageManifest {
+                name: parsed
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                version: parsed
+                    .get("version")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            }));
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// The owning manifest when it really is this CLI.
+fn dsh_package(dsh_js: &Path) -> Result<Option<PackageManifest>, String> {
+    Ok(owning_manifest(dsh_js)?.filter(|manifest| manifest.name == DSH_PACKAGE))
+}
+
+/// The version of a CLI tree, when its owning package really is this CLI.
 pub fn version_of(dsh_js: &Path) -> Option<String> {
-    version_from_package(dsh_js)
+    match dsh_package(dsh_js) {
+        Ok(Some(manifest)) if !manifest.version.is_empty() => Some(manifest.version),
+        _ => None,
+    }
+}
+
+/// Version of a CLI tree as a person should read it, with the reason when it cannot be read.
+pub fn describe_version(dsh_js: &Path) -> String {
+    match dsh_package(dsh_js) {
+        Ok(Some(manifest)) if !manifest.version.is_empty() => manifest.version,
+        Ok(Some(_)) => "未知（清单没有 version）".to_string(),
+        Ok(None) => match owning_manifest(dsh_js) {
+            Ok(Some(other)) => format!(
+                "未知（{} 属于 {}，不是 {DSH_PACKAGE}）",
+                dsh_js.display(),
+                other.name.as_str()
+            ),
+            Ok(None) => "未知（找不到所属 package.json）".to_string(),
+            Err(error) => format!("未知（{error}）"),
+        },
+        Err(error) => format!("未知（{error}）"),
+    }
 }
 
 /// Version of the installed CLI. Reading the owning package.json costs ~1 ms, while booting
 /// node for `--version` costs ~80 ms, so the file wins and the CLI is the fallback.
+///
+/// The fallback asks the binary itself, which is what names the version on a layout this walk
+/// cannot read — and the answer is still parsed as a version, so a foreign `dsh` printing
+/// something unrelated cannot put that text on the status page either.
 pub fn version(loc: &DshLocation) -> Option<String> {
-    if let Some(version) = version_from_package(&loc.dsh_js) {
+    if let Some(version) = version_of(&loc.dsh_js) {
         return Some(version);
     }
     let out = Command::new(&loc.node)
@@ -120,64 +209,203 @@ pub fn version(loc: &DshLocation) -> Option<String> {
         .arg("--version")
         .output()
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
+    parse_version_line(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The version a `dsh --version` line carries, or `None` when it is not one.
+fn parse_version_line(raw: &str) -> Option<String> {
+    let line = raw.trim().lines().next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let parsed = crate::update::Version::parse(line)?;
+    Some(parsed.to_string())
+}
+
+/// True when the file looks like a node launcher (`lib/bin.js`, or a `#!…node` shim).
+///
+/// A launcher on PATH is normally a symlink or a two-line shim, so the identity check needs the
+/// file it points at — and a compiled `dsh` from another project is neither.
+fn is_js_launcher(path: &Path) -> bool {
+    use std::io::Read;
+    if path.extension().is_some_and(|extension| extension == "js") {
+        return true;
+    }
+    let mut head = [0u8; 64];
+    match std::fs::File::open(path).and_then(|mut file| file.read(&mut head)) {
+        Ok(0) | Err(_) => false,
+        Ok(read) => {
+            let text = String::from_utf8_lossy(&head[..read]);
+            text.starts_with("#!") && text.contains("node")
+        }
     }
 }
 
-/// Walk up from the entry script to the package that owns it and read its version.
-fn version_from_package(dsh_js: &Path) -> Option<String> {
-    let mut dir = dsh_js.parent()?;
-    for _ in 0..5 {
-        if let Ok(raw) = std::fs::read_to_string(dir.join("package.json")) {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(version) = parsed.get("version").and_then(|value| value.as_str()) {
-                    let version = version.trim();
-                    if !version.is_empty() {
-                        return Some(version.to_string());
-                    }
-                }
+/// How a candidate launcher was judged.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Candidate {
+    /// The owning package is [DSH_PACKAGE]: this is the CLI.
+    Ours,
+    /// A node launcher that answers `--version` with a version but cannot be identified from its
+    /// manifest (a shim outside its package, a layout this walk does not know).
+    Unidentified(String),
+    /// Not a dsh: skipped, with the reason for the log.
+    Foreign(String),
+}
+
+/// Judge one candidate launcher.
+///
+/// `probe` runs `--version` and returns its first line, so the pure part stays testable without a
+/// node binary.
+pub fn judge(launcher: &Path, probe: impl FnOnce(&Path) -> Option<String>) -> Candidate {
+    let real = real_path(launcher);
+    let manifest = match owning_manifest(&real) {
+        Ok(manifest) => manifest,
+        Err(error) => return Candidate::Foreign(error),
+    };
+    if let Some(manifest) = &manifest {
+        if manifest.name == DSH_PACKAGE {
+            return Candidate::Ours;
+        }
+        // The nearest manifest names something else. That is an answer, not a reason to keep
+        // walking: a \`dsh\` shipped inside another npm package is that package's binary.
+        return Candidate::Foreign(format!(
+            "{} 属于 {}，不是 {DSH_PACKAGE}",
+            real.display(),
+            manifest.name.as_str()
+        ));
+    }
+    if !is_js_launcher(&real) {
+        return Candidate::Foreign(format!("{} 不是 node 启动脚本", real.display()));
+    }
+    match probe(&real).and_then(|line| parse_version_line(&line)) {
+        Some(version) => Candidate::Unidentified(version),
+        None => Candidate::Foreign(format!("{} 不响应 --version", real.display())),
+    }
+}
+
+/// Every place a `dsh` launcher may live, in the documented order (design §4 step 3).
+///
+/// Duplicates are dropped after resolving symlinks: the login shell usually prints the same file
+/// PATH already offered, and probing one candidate twice costs a node start each time.
+fn launcher_candidates(remembered: Option<PathBuf>, override_env: Option<String>) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut push = |path: PathBuf| {
+        if path.is_file() {
+            candidates.push(path);
+        }
+    };
+    if let Some(raw) = override_env {
+        push(PathBuf::from(raw));
+    }
+    if let Some(path) = remembered {
+        push(path);
+    }
+    if let Some(path) = path_lookup("dsh") {
+        push(path);
+    }
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        push(Path::new(dir).join("dsh"));
+    }
+    if let Some(path) = login_shell_lookup("dsh") {
+        push(path);
+    }
+    let mut seen: Vec<PathBuf> = Vec::new();
+    candidates.retain(|candidate| {
+        let real = real_path(candidate);
+        if seen.contains(&real) {
+            return false;
+        }
+        seen.push(real);
+        true
+    });
+    candidates
+}
+
+/// Run the candidate with its own node and return the first line it prints.
+///
+/// Bounded by the same budget as the node probe: a launcher that hangs must not park startup.
+fn probe_version_line(node: Option<&Path>, entry: &Path) -> Option<String> {
+    let node = node?;
+    let mut child = Command::new(node)
+        .arg(entry)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let text = reader.join().unwrap_or_default();
+                return status.success().then_some(text);
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(reader);
+                return None;
             }
         }
-        dir = dir.parent()?;
     }
-    None
 }
 
+/// The first candidate that really is this CLI, or an error naming what was rejected.
 fn find_launcher(
     remembered: Option<PathBuf>,
     override_env: Option<String>,
 ) -> Result<PathBuf, String> {
-    if let Some(raw) = override_env {
-        let p = PathBuf::from(raw);
-        if p.is_file() {
-            return Ok(p);
+    let candidates = launcher_candidates(remembered, override_env);
+    if candidates.is_empty() {
+        return Err(
+            "找不到 dsh。可在 config.json 里设置 dsh_path，或用环境变量 DSH_DESKTOP_DSH 指定绝对路径。"
+                .into(),
+        );
+    }
+    let mut rejected: Vec<String> = Vec::new();
+    let mut unidentified: Option<(PathBuf, String)> = None;
+    for candidate in &candidates {
+        let node = find_node_without_env(candidate);
+        match judge(candidate, |entry| {
+            probe_version_line(node.as_deref(), entry)
+        }) {
+            Candidate::Ours => return Ok(candidate.clone()),
+            Candidate::Unidentified(version) => {
+                if unidentified.is_none() {
+                    unidentified = Some((candidate.clone(), version));
+                }
+            }
+            Candidate::Foreign(reason) => {
+                crate::harness::app_log(&format!("跳过候选 dsh：{reason}"));
+                rejected.push(reason);
+            }
         }
     }
-    if let Some(p) = remembered {
-        if p.is_file() {
-            return Ok(p);
-        }
+    // Nothing identified itself. A launcher that at least answers `--version` with a version is
+    // still the user's installation on a layout this walk cannot read — refusing it would be
+    // worse than the bug the identity check fixes — so it is used, loudly.
+    if let Some((launcher, version)) = unidentified {
+        crate::harness::app_log(&format!(
+            "无法从清单确认 {} 属于 {DSH_PACKAGE}，但它报告版本 {version}，按用户的安装处理",
+            launcher.display()
+        ));
+        return Ok(launcher);
     }
-    if let Some(p) = path_lookup("dsh") {
-        return Ok(p);
-    }
-    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
-        let c = Path::new(dir).join("dsh");
-        if c.is_file() {
-            return Ok(c);
-        }
-    }
-    if let Some(p) = login_shell_lookup("dsh") {
-        return Ok(p);
-    }
-    Err(
-        "找不到 dsh。可在 config.json 里设置 dsh_path，或用环境变量 DSH_DESKTOP_DSH 指定绝对路径。"
-            .into(),
-    )
+    Err(format!(
+        "PATH 上的 dsh 都不是 {DSH_PACKAGE}：{}。请安装 npm i -g {DSH_PACKAGE}，或用 DSH_DESKTOP_DSH / config.json 的 dsh_path 指定。",
+        rejected.join("；")
+    ))
 }
 
 /// The system `dsh` launcher, resolved without requiring node to exist (review P1-4).
@@ -322,23 +550,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn reads_version_from_the_owning_package() {
-        let dir = std::env::temp_dir().join("dsh-desktop-version-test");
+    /// A tree with the given manifest content and an entry script inside it.
+    fn tree(name: &str, manifest: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("lib/bin")).unwrap();
-        std::fs::write(
-            dir.join("package.json"),
-            r#"{"name":"@deepseek-ai/dsh","version":"1.2.3"}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join("package.json"), manifest).unwrap();
         let entry = dir.join("lib/bin/bin.js");
         std::fs::write(&entry, "#!/usr/bin/env node\n").unwrap();
-        assert_eq!(version_from_package(&entry).as_deref(), Some("1.2.3"));
+        (dir, entry)
+    }
+
+    #[test]
+    fn reads_version_from_the_owning_package() {
+        let (dir, entry) = tree(
+            "dsh-desktop-version-test",
+            r#"{"name":"@deepseek-ai/dsh","version":"1.2.3"}"#,
+        );
+        assert_eq!(version_of(&entry).as_deref(), Some("1.2.3"));
+        assert_eq!(describe_version(&entry), "1.2.3");
         // Nothing to read above the script: the caller must fall back to running the CLI.
         let orphan = std::env::temp_dir().join("dsh-desktop-no-package/bin.js");
-        assert_eq!(version_from_package(&orphan), None);
+        assert_eq!(version_of(&orphan), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The field report that started this: something called `dsh` on PATH that is not this CLI
+    /// must not have its version printed as the dsh version, and must not be supervised either.
+    #[test]
+    fn a_foreign_dsh_is_never_mistaken_for_this_cli() {
+        // Homebrew ships a distributed shell under this very name.
+        let (dir, launcher) = tree(
+            "dsh-desktop-foreign-dsh-test",
+            r#"{"name":"dsh","version":"0.25.10"}"#,
+        );
+        assert_eq!(version_of(&launcher), None);
+        let described = describe_version(&launcher);
+        assert!(described.contains("未知"), "{described}");
+        assert!(
+            !described.contains("0.25.10"),
+            "别人的版本号不能出现在这里：{described}"
+        );
+
+        // Even when it answers `--version`, the manifest named a different package: a foreign
+        // binary that prints a version is not evidence that it owns this shell's CLI.
+        match judge(&launcher, |_| Some("0.25.10".to_string())) {
+            Candidate::Foreign(reason) => {
+                assert!(
+                    reason.contains("属于 dsh，不是 @deepseek-ai/dsh"),
+                    "{reason}"
+                )
+            }
+            other => panic!("a foreign dsh must not be adopted: {other:?}"),
+        }
+
+        // A compiled launcher from another project, sitting in a tree with no manifest at all:
+        // it cannot be identified, and it is not a node script that could answer `--version`.
+        let bare = std::env::temp_dir().join("dsh-desktop-foreign-binary-test");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        let binary = bare.join("dsh");
+        std::fs::write(&binary, [0x7fu8, b'E', b'L', b'F', 2, 1, 1, 0]).unwrap();
+        match judge(&binary, |_| None) {
+            Candidate::Foreign(reason) => {
+                assert!(reason.contains("不是 node 启动脚本"), "{reason}")
+            }
+            other => panic!("a native binary must not be adopted: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A layout this walk cannot read (a shim outside its package) is still the user's install:
+    /// it is used, but only because it answered `--version` with a version.
+    #[test]
+    fn an_unidentified_launcher_is_used_only_when_it_answers_with_a_version() {
+        let dir = std::env::temp_dir().join("dsh-desktop-unidentified-dsh-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("dsh");
+        std::fs::write(&shim, "#!/usr/bin/env node\n").unwrap();
+
+        assert_eq!(
+            judge(&shim, |_| Some("0.1.5-rc.2".to_string())),
+            Candidate::Unidentified("0.1.5-rc.2".to_string())
+        );
+        // Anything that is not a version is not an answer.
+        assert!(matches!(
+            judge(&shim, |_| Some("Dancer shell, version 0.25.10".to_string())),
+            Candidate::Foreign(_)
+        ));
+        assert!(matches!(judge(&shim, |_| None), Candidate::Foreign(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End to end on this machine, when it has a CLI at all: whatever the search returns must be
+    /// a tree that names this package — that is the invariant the field report broke.
+    #[test]
+    fn whatever_the_search_returns_is_really_this_cli() {
+        let Some(entry) = system_dsh(None) else {
+            eprintln!("skipped: no dsh resolvable on this machine");
+            return;
+        };
+        match dsh_package(&entry) {
+            Ok(Some(manifest)) => {
+                assert_eq!(manifest.name, DSH_PACKAGE);
+                assert!(
+                    version_of(&entry).is_some(),
+                    "{} 有清单却没有版本",
+                    entry.display()
+                );
+                println!(
+                    "resolved {} -> {}",
+                    entry.display(),
+                    describe_version(&entry)
+                );
+            }
+            // Nothing identified: the search only returns such a candidate after `--version`
+            // answered with a version, so re-judging it now has to land in the same category.
+            Ok(None) => {
+                let node = find_node_without_env(&entry);
+                let probed = probe_version_line(node.as_deref(), &entry);
+                match judge(&entry, |_| probed.clone()) {
+                    Candidate::Unidentified(version) => {
+                        println!("resolved {} (unidentified, {version})", entry.display())
+                    }
+                    other => panic!("返回了无法识别的候选 {other:?}: {}", entry.display()),
+                }
+            }
+            Err(error) => panic!("清单读取失败: {error}"),
+        }
+    }
+
+    #[test]
+    fn only_a_version_line_counts_as_an_answer() {
+        assert_eq!(
+            parse_version_line("0.1.5-rc.2\n"),
+            Some("0.1.5-rc.2".to_string())
+        );
+        assert_eq!(parse_version_line("  1.2.3  \n"), Some("1.2.3".to_string()));
+        // Chatter, a usage line, or another tool's banner must not become "the version".
+        assert_eq!(parse_version_line("Dancer shell, version 0.25.10"), None);
+        assert_eq!(parse_version_line("Usage: dsh [options]"), None);
+        assert_eq!(parse_version_line(""), None);
+        assert_eq!(parse_version_line("   \n"), None);
     }
 
     #[cfg(unix)]
@@ -347,6 +702,14 @@ mod tests {
         let dir = std::env::temp_dir().join("dsh-desktop-locator-order-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
+        // Both launchers live inside a package that really is this CLI: the search now refuses a
+        // candidate whose owning manifest names something else, so an anonymous script would be
+        // rejected before the order under test could matter.
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"@deepseek-ai/dsh","version":"0.1.5-rc.2"}"#,
+        )
+        .unwrap();
         let remembered = dir.join("bin/dsh");
         let from_env = dir.join("bin/dsh-env");
         for file in [&remembered, &from_env] {
@@ -375,6 +738,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("lib/bin")).unwrap();
         std::fs::create_dir_all(dir.join("bin")).unwrap();
+        // The launcher has to belong to a package that really is this CLI: the search now
+        // rejects a candidate whose owning manifest names something else.
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"@deepseek-ai/dsh","version":"0.1.5-rc.2"}"#,
+        )
+        .unwrap();
         let js = dir.join("lib/bin/bin.js");
         std::fs::write(&js, "#!/usr/bin/env node\n").unwrap();
         let link = dir.join("bin/dsh");
