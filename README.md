@@ -25,7 +25,7 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 > 后续开发直接在 `main` 上进行；该分支只作历史快照保留。
 
 设计依据：[`docs/design-task-feat-dsh-tauri-desktop-shell.md`](docs/design-task-feat-dsh-tauri-desktop-shell.md)
-（正文为设计，实施偏差与验证证据见其 §13.1–13.4，Harness 退出后的自动恢复见 §13.14、页面存活看护见 §13.15）。
+（正文为设计，实施偏差与验证证据见其 §13.1–13.4，Harness 退出后的自动恢复见 §13.14、绘制看护见 §13.15）。
 WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs/design-task-feat-legacy-webkit-compat-layer.md)
 （取代 [`docs/design-task-fix-webview-compat-audit.md`](docs/design-task-fix-webview-compat-audit.md) 中"缺能力即改用浏览器"的结论）。
 
@@ -41,7 +41,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 - 生命周期：退出即 SIGTERM 进程组（5s 后 SIGKILL）并删除 state.json —— 关闭窗口（`RunEvent::ExitRequested`）
   与 ⌘Q / Dock 退出（`RunEvent::Exit`）两条事件链都处理；复用的上次实例也登记，退出时一并停掉
 - 启动失败即收尾：等待 URL 超时或窗口创建失败时，先停掉刚起的进程再报错，不留"假失败 + 端口被占"
-- **页面存活看护**：Harness 窗口每 15s 被问一次"你还在吗"（`eval_with_callback`，5s 超时）。WebKit 的 WebContent 进程被系统回收（内存压力）或主线程被插件卡死时，页面自己的重连逻辑也在那个进程里、一起停摆 —— 只有壳还能发现。连续 2 次没应答就重新加载当前 URL（最多 3 次），窗口标题写明状态；macOS 上另有 `on_web_content_process_terminate` 回调，渲染进程一结束就立刻重载。页面加载完成会把标题恢复原样；3 次仍不回来则停在"页面无响应，请重启应用"并记日志
+- **绘制看护**：Harness 窗口每 15s 被问一次"你还在画吗"（`eval_with_callback`，5s 超时）。页面里的探测脚本维护一个动画帧计数器并把它报回来：**同一个数字连续两次 = JavaScript 在跑但一帧都没画**，这正是"能点击、能输入、模型输出不刷新"的形态；**完全没应答 = 渲染进程没了或主线程卡死**。两种都连续 2 次才重载当前 URL（最多 3 次），标题写明状态；窗口不在前台时 WebKit 本就可以停画，那种探测**不计数**。macOS 上另有 `on_web_content_process_terminate` 回调，渲染进程一结束就立刻重载。加载完成标题自动恢复；3 次仍不回来则停在"页面已停止刷新，请重启应用"并记日志
 - 看护线程：启动成功后继续 `wait` 子进程，Harness 意外退出会清掉 state.json 并**自动把它拉起来**：先给 8s（崩溃/被杀只给 2s）等一次"交接"——插件市场的「立即重启」就是宿主干净退出、由 detached helper 在同一端口拉起替代进程；端口重新服务时先停掉那个替代进程（它的 cwd 是 CLI 目录、不是本壳配置的 workspace），再按本壳的 runtime/workspace/凭据启动自己的实例，成功后直接把窗口切到新的 token URL。连续 3 次短命重启都没稳定下来才弹终态状态页；运行满 60s 记一次健康、计数归零。状态页带「重新启动 Harness」按钮（同一进程内重跑启动流程），此时另起一个实例（single-instance 回调）或点 Dock 图标（macOS 的 `RunEvent::Reopen`）也等价于按这个按钮；浏览器回退页没有按钮、也不响应这两个入口
 - 残留自愈：只有强杀/崩溃这类拿不到回调的场景才靠下次启动清理；state.json 0600。记录的 pid 仍监听记录的端口时才发信号；仍服务**本次端口**的记录会保留，让启动流程直接复用而不是重启；pid 已不拥有该端口时，只有"命令行含 `--profile web`/`dsh`，且父进程已消失或由 launchd / `systemd --user` 接管"的残留才会被清理（pid 复用、以及别人正在跑的会话都不动）
 - 安全：Harness 窗口零 capability、导航限定当次 authority、外链与 `window.open` 只把 `http`/`https` 交系统浏览器（`file:`、自定义 scheme 记 `external scheme blocked` 后丢弃）
@@ -72,7 +72,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   `plugin update available: dshmarket 1.45.1 -> 1.46.1, installing`、`plugin updated: dshmarket 1.45.1 -> 1.46.1`，
   随后 harness 重启并正常服务；profile 的依赖范围被改写为 `^1.46.1`、`node_modules` 内实装 1.46.1，
   且 `plugin-check.json` 与核心的 `update-check.json` 各自独立（时间戳与内容互不影响）。
-- 离线测试：`cargo test` **100 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
+- 离线测试：`cargo test` **102 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
   缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口与跨窗口都不重复安装"、npm PATH 前缀、沉默对端探针超时、
   package.json 版本解析、部分/损坏 config.json 处理、workspace / dsh_path 回退不改文件、HOME 缺失不回落 `/`、
@@ -84,7 +84,8 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   （干净退出给长交接等待 / 崩溃给短等待、连续自动重启预算与"健康运行后计数归零"、退出码与信号的人话文案、
   状态页按钮与壳监听的事件名一致、兼容层的判定矩阵与逐块选择 / 探针的语法探测 / 兼容层 ES5 纪律、
   候选 dsh 的身份判定与"无法识别只在答出版本时采用"、核心更新闸门、播种四态与插件跳过文案、
-  页面存活策略矩阵（一次抖动只观察 / 连续两次才重载 / 重载预算用尽即报告 / 应答即清零））；
+  绘制看护策略矩阵（帧计数代数：同值=停帧、变化=在画、变小=新文档、无应答=渲染进程没了；
+  一次坏探测只观察、连续两次才重载、重载预算用尽即报告、后台窗口不算故障、探测脚本保持 ES5 且一次只排一帧））；
 - 兼容层在真实 JS 引擎里跑通（2026-09-15）：`webkit_compat_shim` 集成测试把清单里的 8 个 API 先删掉
   （`Symbol.dispose` 在 node 里不可删、已在测试里注明），注入后用断言跑行为 —— pdf.js 那条
   `Iterator.prototype.join` guard 不再抛、`Iterator.from(...).map(...).filter(...).toArray()` 链式可用、
@@ -103,8 +104,8 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   另有一条专门复现 GUI 失败场景的回归测试（把进程 PATH 换成不含 node 的值、npm cache 指向临时目录）：
   先断言裸调 `npm` 会 exit 127，再断言走修复后的路径能正常查到 registry。
 
-**待实机点击确认**：附件上传、下载、`window.open` 实际效果、macOS TCC 授权归因、以及页面存活看护的
-真实触发（需要一次 WebContent 被杀或主线程卡死；日志关键字见行为表）。
+**待实机点击确认**：附件上传、下载、`window.open` 实际效果、macOS TCC 授权归因、以及绘制看护的真实
+触发（需要一次页面停画或渲染进程被杀；日志关键字见行为表）。
 
 **平台**：`make` 的构建入口只覆盖 macOS 与 Linux（其他平台在解析阶段直接报错）。Windows 走
 `.github/workflows/windows-portable.yml` 的原生 staging + 免安装包（已实机验证，见下一节），
@@ -125,7 +126,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 | `make doctor` | 检查工具链与平台依赖 | Linux 用 `pkg-config` 查 `webkit2gtk-4.1` / `gtk+-3.0` / `libsoup-3.0` 并给出 Debian/Fedora/Arch 安装命令；macOS 提示装 Xcode CLT |
 | `make check` | `cargo check --all-targets` | 与 CI 口径一致 |
 | `make fmt` / `make fmt-check` / `make clippy` | 格式化 / 只检查格式（CI 门禁用，不改工作区）/ lint（`clippy -D warnings`） | |
-| `make test` | 离线单元测试（当前 **100** 个）＋ 在真实 JS 引擎里跑兼容层的集成测试 | 不联网；只有兼容层那个集成测试需要 PATH 上有 `node`（没有就跳过） |
+| `make test` | 离线单元测试（当前 **102** 个）＋ 在真实 JS 引擎里跑兼容层的集成测试 | 不联网；只有兼容层那个集成测试需要 PATH 上有 `node`（没有就跳过） |
 | `make test-live` | 联网集成测试（全部） | 自动设 `DSH_DESKTOP_LIVE_TESTS=1`：查真实 registry、对比冷/热缓存耗时，并在「PATH 里没有 node」的模拟 GUI 环境下验证 npm 仍可运行 |
 | `make dev` | 运行 debug 版 | 等价 `cargo run --manifest-path src-tauri/Cargo.toml` |
 | `make build` | 编译 release 可执行文件 | 产物 `src-tauri/target/release/dsh-desktop` |
@@ -165,7 +166,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   完整证据与设计（含为什么推翻 2026-09-14"不在 WebView 里打补丁"的结论）见
   [`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs/design-task-feat-legacy-webkit-compat-layer.md)。
   Intel 机器更容易停在旧系统，所以这个现象看着像「macos-x64 专属」。
-- **页面突然不动、提问也发不出去**：几乎总是 WebView 的渲染进程被系统回收（内存压力，机器上其他大程序会把 WebContent 挤掉）或主线程被第三方 client 插件卡死。壳现在会自己重载（见行为表），日志里能看到 `WebView 渲染进程被系统结束` 或 `页面连续 2 次没有响应`。若反复出现，先看当时的内存压力与其他 app，再逐个停用 profile 里的 client 插件定位（`dsh-better-sidebar`、`dsh-dream-skin`、`dsh-router-*` 都渲染进主树）
+- **页面看着没死但模型输出不刷新**：这是**绘制**停了，不是连接断了 —— Harness UI 把流式输出合并到动画帧上（`requestAnimationFrame`），而输入框走的是同步刷新，所以"能打字、能发送、输出不动"完全可能同时成立；此时模型往往已经跑完，重启后一次性看到结果。壳的绘制看护会自己重载（见行为表），日志关键字 `Harness 页面停止绘制`。触发条件通常是窗口被 WebKit 判为不活跃（`background_throttling` 默认 `suspend`，本壳已显式设为 `disabled`）或渲染进程被内存压力回收（日志 `WebView 渲染进程被系统结束`）
 - **界面没有插件市场**：市场来自 profile（`~/.dsh/profiles/web`），只有三条来源 —— ① **自带运行时版**首启
   播种的 profile 模板（**精简版永远不播种**）；② 你自己 `dsh plugin --profile web add dshmarket`；
   ③ 市场装好后自我更新。profile 已经存在时模板不会覆盖（跳过会记日志），profile 里没声明 dshmarket 时
@@ -309,7 +310,8 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | 启动等待 URL 超时 / 窗口创建失败 | 停掉刚起的子进程 → 状态页报错（不会留下占着端口的半启动实例） |
 | 启动成功后 Harness 意外退出 | 看护线程发现退出 → 清 state.json → 销毁 Harness 窗口、状态页显示"正在重新启动…" → **自动重启**：干净退出（退出码 0，插件市场「立即重启」就是这一种）先等 8s，端口被替代实例接管时先停掉它再按本壳的 workspace 启自己的；崩溃/被杀 2s 后直接自启。成功后切到新的 token URL；连续 3 次短命重启未稳定才停在终态报错页（带「重新启动 Harness」按钮） |
 | 窗口首次加载失败 | 20 s 内没有收到"加载开始"事件（导航根本没起来，无论端口是否健康）→ 退避重试同一 token URL，最多 3 次；已经开始加载则一律不打扰。次数用尽且端口也不再服务才弹状态页；端口仍健康时只记日志，不在事件不投递的环境里给正常应用弹错误页 |
-| 页面中途无响应（渲染进程被杀 / 主线程卡死） | 15s 一次的存活探测连续 2 次无应答 → 重新加载当前 URL（最多 3 次），标题显示"页面无响应，正在重新加载…"；macOS 上渲染进程被系统结束时会立刻重载（日志记 `WebView 渲染进程被系统结束（多为内存压力）`）。加载完成后标题自动恢复；3 次仍无应答 → 标题停在"页面无响应，请重启应用"并记日志 |
+| 页面停止刷新（能点击能输入、模型输出不更新） | 页面里的动画帧计数连续 2 次没变化 → 重新加载当前 URL（最多 3 次），标题显示"页面已停止刷新，正在重新加载…"（日志记 `Harness 页面停止绘制（输入仍有响应）`）。窗口不在前台时 WebKit 本就可以停画，这种探测不计数、不消耗重载预算 |
+| 页面完全无响应（渲染进程被杀 / 主线程卡死） | 15s 一次的探测连续 2 次收不到应答 → 同样重新加载（最多 3 次）；macOS 上渲染进程被系统结束时会立刻重载（日志记 `WebView 渲染进程被系统结束（多为内存压力）`）。加载完成后标题自动恢复；3 次仍不回来 → 标题停在"页面已停止刷新，请重启应用"并记日志 |
 | 页面里的非 http/https 链接（`file:`、自定义 scheme…） | 不交给系统：日志记 `external scheme blocked: <scheme> (...)` 后丢弃 |
 | 有新版 dsh 但端口上是外部实例且不允许接管 | 跳过本次更新（不重写别人正在用的树），实例继续服务，日志记 `update deferred` |
 | 下载同名文件 | 自动改名 `name-1.ext`，不覆盖已有文件 |

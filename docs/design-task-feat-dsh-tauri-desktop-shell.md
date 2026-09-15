@@ -762,43 +762,62 @@ harness 的代码路径（`FAILURE_SHOWN` 是一次性闩锁，也没有线程�
 **同轮后续**：紧接着落地的旧 WebView 兼容层复用了这套状态页拆分，见
 [`design-task-feat-legacy-webkit-compat-layer.md`](./design-task-feat-legacy-webkit-compat-layer.md)。
 
-### 13.15 页面存活看护：渲染进程被杀与主线程卡死（2026-09-15）
+### 13.15 绘制看护：页面没死但不再刷新（2026-09-15）
 
 **触发**：用户反馈"模型工作时偶尔页面无法继续渲染，提问也发不出去，只能重启应用"。
 
-**排查（本机证据）**：
+**用户补充的关键事实（推翻第一版判断）**：页面**有响应** —— 可以点击、可以输入、可以发送；
+只有**运行中的模型输出渲染**卡住。重启后模型其实已经跑完，输出一次性正常显示。
+所以这不是"渲染进程死了"，第一版按"进程被杀/主线程卡死"做的看护**判据是错的**：
+那种页面根本不会响应输入。
 
-- 壳日志只有 harness 子进程的记录：整份 323 行里 `panic|crash|unresponsive|timeout` **0 命中** ——
-  页面挂掉时日志完全静默，事后无从判断；
-- `/Library/Logs/DiagnosticReports/JetsamEvent-2026-09-15-115235.ips`：11:52 有过一次内存压力事件
-  （`idea` 11.4 GB、`com.apple.WebKit.WebContent` 627 MB、free 约 97 MB），说明这台机器上
-  WebContent 被系统回收是现实风险（该次被杀的是 `milod`，不是我们的进程）；
-- wry 0.55 在 macOS 上**本来就提供** `web_content_process_did_terminate`
-  （`wkwebview/navigation.rs:109`），Tauri 2.11 把它暴露成 `Builder::on_web_content_process_terminate`
-  （仅 macOS/iOS）—— 我们一处都没用（`grep on_web_content_process_terminate src-tauri/src` 为空）。
+**真实机制（代码证据）**：
 
-**为什么页面自己回不来**：UI 的实时通道是 WebSocket（`dsh-api-gateway`），宿主侧是"两个心跳没回
-就 `terminate()`"（`MAX_MISSED_HEARTBEATS = 2`），客户端也有指数退避重连（`dsh-client-connection`）。
-但这些重连代码**跑在同一个渲染进程里**：进程被杀、或主线程被插件卡死时，它们与页面一起停摆 ——
-只有壳还活着，能发现问题。
+- Harness UI 把**流式输出**合并到动画帧上：`dsh-api-session-controller/lib/client.js` 的 `Notifier`
+  文档原文 —— "Batches structural updates in microtasks and **stream updates by animation frame**"，
+  实现即 `markFrameDirty()` → `schedule("frame")` → `requestAnimationFrame(publish)`；
+  前端 `dsh-web-frontend` 里同一套合并（`flush:"raf"` 的 store 工厂 + 一次性闩锁）。
+- 输入框**不走这条路径**：`notifyNow()` 是同步 flush，注释写明理由 —— 受控输入必须同 tick 通知，
+  否则 React 会把 DOM 回滚到旧值、光标跳到末尾。**这就是"能打字、输出不动"能同时成立的原因。**
+- 帧一停，`requestAnimationFrame` 的回调就永远排在队里，流式增量全部积压在快照里不发布；
+  而模型在宿主进程里继续跑完 —— 与用户观察到的"重启后已跑完"完全一致。
+- 谁会让帧停下：WebKit 对**判为不活跃**的窗口停止调度（`WKPreferences.inactiveSchedulingPolicy`，
+  wry 暴露为 `BackgroundThrottlingPolicy`，**默认 `Suspend`**，而本壳此前从未设置过）；
+  渲染进程被内存压力回收也会如此（本机确有 Jetsam 记录：
+  `/Library/Logs/DiagnosticReports/JetsamEvent-2026-09-15-115235.ips`，`idea` 11.4 GB、
+  `WebContent` 627 MB、free 约 97 MB）。无论哪一种，结果都是"页面活着但不画"。
 
 **修复**：
 
-- `lib.rs::run` 接上 `on_web_content_process_terminate`（`#[cfg(macos|ios)]`）：渲染进程一结束就记
-  日志（`WebView 渲染进程被系统结束（多为内存压力）`）并重新导航到窗口当前 URL；
-- `window.rs::watch_page_liveness`：每 15s 用 `eval_with_callback` 求值一次 `"dsh-desktop-alive"`，
-  5s 内没有回调即记一次 miss。WebKit 的回调走 UI 进程，所以"能答"同时证明两侧都在工作；
-- 纯策略 `liveness_action(answer, misses, reloads)`：连续 **2** 次 miss 才重载（一次抖动不丢页面状态），
-  重载最多 **3** 次，用尽后停在"页面无响应，请重启应用"并记日志 —— 不刷屏、不无限重载；
-- 标题承载状态：崩溃/无响应时写 `（页面已崩溃，正在重新加载…）`/`（页面无响应，正在重新加载…）`，
-  `PageLoadEvent::Finished` 到达即恢复默认标题，窗口不会一直挂着过期提示；
-- `GENERATION` 计数：窗口重建（插件更新后重启、Harness 退出恢复）时旧看护线程立即退出，
-  不与新线程抢同一个窗口。
+- **关掉节流**（根因侧）：Harness 窗口显式 `.background_throttling(BackgroundThrottlingPolicy::Disabled)`
+  （macOS 14+ 生效；更早系统该键不存在，wry 会跳过）。
+- **改判据**（探测侧）：`FRAME_PROBE` 在页面里维护 `__dshFrames` 计数器，并**最多只排一个**
+  待处理帧；每 15s 求值一次并把计数报回来（5s 超时）。`judge_frames(answer, previous)` 的代数：
+  **数字没变 = `Frozen`**（JS 在跑、一帧没画）、**变了 = `Drawing`**、**变小 = 新文档**（重载后计数归零，
+  不是故障）、**没应答 = `Silent`**（进程没了或主线程卡死）。待处理的那个回调本身就是证据：
+  帧一恢复它立刻触发。
+- **后台窗口不冤枉**：`attended()`（可见 + 未最小化 + 有焦点）只对 `Frozen` 生效 —— 用户切走时
+  WebKit 本就可以停画，判它会把"切了个窗口"变成重载循环；`Silent` 在任何状态都算故障。
+- **动作策略** `liveness_action(state, attended, misses, reloads)`：连续 **2** 次才重载（一次抖动不丢
+  页面状态），最多 **3** 次，用尽后停在"页面已停止刷新，请重启应用"；重载时清掉帧基线，避免拿新文档
+  的计数跟旧文档比。
+- 仍保留 `on_web_content_process_terminate`（macOS/iOS）：渲染进程真被系统结束的那一刻立即重载，
+  这条与绘制看护互补，不重复。
+- 标题承载状态（`页面已停止刷新，正在重新加载…`），`PageLoadEvent::Finished` 到达即恢复默认标题；
+  `GENERATION` 计数让窗口重建后的旧看护线程立即退出。
 
-**验证**：单测 98 → 100（策略矩阵：一次 miss 只观察、连续两次才重载、重载预算用尽即报告、
-任何应答清零；探针是无副作用的单表达式；超时 < 间隔）。**真机触发待做**：需要一次真实的
-WebContent 被杀或主线程卡死，观察日志与自动重载。
+**验证**：单测 100 → **102**（帧计数代数四条分支、停画/静默/后台三种动作矩阵、重载预算与
+"坏探测不重置预算"、探测脚本 ES5 且一次只排一帧、`LIVENESS_TIMEOUT < LIVENESS_INTERVAL`）。
+**真机触发待做**：复现一次"输出不刷新"，确认日志出现 `Harness 页面停止绘制（输入仍有响应）`
+并自动重载；关掉节流后应不再复发。
 
-**仍在上游/插件侧的部分**：主线程被第三方 client 插件卡死（`dsh-better-sidebar`、
-`dsh-dream-skin`、`dsh-router-*` 都渲染进主 React 树）时，重载只是恢复手段；要根治得靠插件自身的
-性能问题，或把重负载面板移出主线程。
+**边界（如实说明）**：
+
+- `background_throttling` 只在 macOS 14+/iOS 17+ 生效，更早系统上该键无效（wry 会跳过），
+  那里只剩探测与重载这条兜底路径。
+- **"窗口被判为不活跃"是解释得通的一种触发，不是已证实的唯一一种**：用户报告的现象与代码路径
+  完全吻合，本机也有内存压力前科，但没有抓到停画当刻的现场（帧计数、WebKit 日志、Jetsam 记录
+  三者缺一）。探测与重载对**所有**导致停画的原因都有效，因为判据是"帧有没有动"而不是"为什么没动"；
+  关掉节流则针对其中最可预防的一种。
+- 若停画来自第三方 client 插件把主线程占满（`dsh-better-sidebar`、`dsh-dream-skin`、
+  `dsh-router-*` 都渲染进主 React 树），重载是恢复手段而非根治，需要插件侧优化。

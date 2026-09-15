@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tauri::utils::config::BackgroundThrottlingPolicy;
 use tauri::webview::{DownloadEvent, NewWindowResponse, PageLoadEvent};
 use tauri::{AppHandle, Manager, Webview, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use url::Url;
@@ -740,58 +741,115 @@ fn status_script(function: &str, status: &str, detail: &str) -> String {
 /// before the window was built, so a healthy load completes well inside it.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How often the shell asks the Harness page whether it is still there.
+/// How often the shell checks that the Harness page is still *drawing*.
 ///
-/// The page's own WebSocket is the thing the user notices dying, but the page cannot report a
-/// dead *renderer*: when WebKit's WebContent process is killed (memory pressure) or its main
-/// thread is wedged by a plugin, nothing inside that process runs — including every reconnection
-/// path the UI has. The shell is the only party still alive to notice.
+/// The page's own WebSocket is the connection the user notices dying, but the page cannot report
+/// the failure that matters here: the Harness UI coalesces every streamed update onto an animation
+/// frame, so a page whose frames stop still takes clicks and keystrokes — controlled input is
+/// flushed synchronously — while the model's output never appears. Nothing inside that page can
+/// notice, because the code that would notice is the code that stopped running.
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(15);
 
-/// How long one liveness answer may take before it counts as a miss.
+/// How long one probe's answer may take before the page counts as silent.
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Consecutive misses that mean "this page is gone", not "this machine hiccuped".
+/// Consecutive bad probes that mean "this page is not coming back on its own".
 const LIVENESS_MISSES: u32 = 2;
 
 /// Reloads allowed before the shell stops trying and says so.
 const LIVENESS_RELOADS: u32 = 3;
 
-/// What the shell does about one liveness probe result.
+/// What one probe learned about the page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageState {
+    /// JavaScript ran and the frame counter moved: the page is drawing.
+    Drawing,
+    /// JavaScript ran, but not one frame was produced since the previous probe.
+    Frozen,
+    /// Nothing answered at all: the renderer is gone, or its main thread is wedged.
+    Silent,
+}
+
+/// What the shell does about one probe result.
 #[derive(Debug, PartialEq, Eq)]
 enum LivenessAction {
-    /// The page answered: it is alive, whatever its connection state.
+    /// The page is drawing: nothing to do.
     Alive,
-    /// Nothing answered yet: wait for the next probe.
+    /// The window is not one the user can be looking at, and WebKit is allowed to stop drawing
+    /// there — so this probe is no evidence either way.
+    Unattended,
+    /// Nothing conclusive yet: wait for the next probe.
     Wait { misses: u32 },
-    /// The page is gone or wedged: load the URL again.
+    /// The page stopped drawing, or stopped answering: load the URL again.
     Reload { attempt: u32 },
     /// Reloads did not bring it back: stop, and tell the user.
     Report { attempts: u32 },
 }
 
-/// Pure liveness policy: a miss count and the reloads already spent decide what happens next.
+/// Pure liveness policy: what one probe means, given the streaks so far.
 ///
 /// Reloading is not free — it throws away whatever the page had in memory — so it is reserved for
-/// a page that has missed [`LIVENESS_MISSES`] probes in a row, and it gives up after
+/// a page that has failed [`LIVENESS_MISSES`] probes in a row, and it gives up after
 /// [`LIVENESS_RELOADS`] of them instead of looping for ever.
-fn liveness_action(answer: bool, misses: u32, reloads: u32) -> LivenessAction {
-    if answer {
-        return LivenessAction::Alive;
+///
+/// `attended` is whether the user can be looking at the window. It gates *frozen* only: a window
+/// behind another app is allowed to stop drawing, and judging it would turn "the user switched
+/// away" into a reload loop. A page that answers nothing is broken wherever it is.
+fn liveness_action(state: PageState, attended: bool, misses: u32, reloads: u32) -> LivenessAction {
+    match state {
+        PageState::Drawing => LivenessAction::Alive,
+        PageState::Frozen if !attended => LivenessAction::Unattended,
+        PageState::Frozen | PageState::Silent => {
+            let misses = misses.saturating_add(1);
+            if misses < LIVENESS_MISSES {
+                return LivenessAction::Wait { misses };
+            }
+            let attempt = reloads.saturating_add(1);
+            if attempt > LIVENESS_RELOADS {
+                return LivenessAction::Report { attempts: reloads };
+            }
+            LivenessAction::Reload { attempt }
+        }
     }
-    let misses = misses.saturating_add(1);
-    if misses < LIVENESS_MISSES {
-        return LivenessAction::Wait { misses };
-    }
-    let attempt = reloads.saturating_add(1);
-    if attempt > LIVENESS_RELOADS {
-        return LivenessAction::Report { attempts: reloads };
-    }
-    LivenessAction::Reload { attempt }
 }
 
-/// The answer a live page sends back: the shell only needs "something ran".
-const LIVENESS_PROBE: &str = "\"dsh-desktop-alive\"";
+/// What the page's answer says, given the previous answer.
+///
+/// The probe returns the page's own frame counter. That counter cannot move while frames are
+/// stopped, so any change is proof the page is drawing — including a drop to a smaller number,
+/// which is a freshly loaded document rather than a fault.
+fn judge_frames(answer: Option<u64>, previous: Option<u64>) -> PageState {
+    match answer {
+        None => PageState::Silent,
+        Some(count) => match previous {
+            Some(previous) if previous == count => PageState::Frozen,
+            _ => PageState::Drawing,
+        },
+    }
+}
+
+/// The probe: count animation frames in the page, and report the running total.
+///
+/// ES5 on purpose, and it schedules at most one frame at a time: a pending callback is itself the
+/// proof that frames are stopped, and it fires the moment they resume.
+const FRAME_PROBE: &str = r#"
+(function () {
+  var w = window;
+  if (typeof w.__dshFrames !== "number") {
+    w.__dshFrames = 0;
+    w.__dshFramePending = false;
+  }
+  if (!w.__dshFramePending && typeof w.requestAnimationFrame === "function") {
+    w.__dshFramePending = true;
+    w.requestAnimationFrame(function () {
+      w.__dshFrames += 1;
+      w.__dshFramePending = false;
+    });
+  }
+  return w.__dshFrames;
+})()
+"#;
+
 /// Navigations of the same startup URL, including the first one.
 const LOAD_ATTEMPTS: u32 = 3;
 
@@ -831,6 +889,11 @@ pub fn create_harness(
         .title(DEFAULT_TITLE)
         .inner_size(1440.0, 960.0)
         .min_inner_size(900.0, 600.0)
+        // WebKit stops animation frames and timers for a window it decides is inactive, and the
+        // Harness page coalesces every streamed update onto an animation frame — so a throttled
+        // page keeps taking input while its model output stops drawing (field report 2026-09-15).
+        // The default is "suspend"; this asks for no throttling at all.
+        .background_throttling(BackgroundThrottlingPolicy::Disabled)
         .on_navigation(move |target| {
             let same_origin = target.scheme() == "http"
                 && target.host_str() == Some("127.0.0.1")
@@ -975,6 +1038,7 @@ fn current_url(window: &WebviewWindow) -> Url {
 fn watch_page_liveness(app: AppHandle, url: Url, generation: u64) {
     let mut misses = 0;
     let mut reloads = 0;
+    let mut frames = None;
     loop {
         std::thread::sleep(LIVENESS_INTERVAL);
         if crate::EXITING.load(Ordering::SeqCst) {
@@ -985,39 +1049,61 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64) {
             harness::app_log("页面存活检查结束：harness 窗口已不在");
             return;
         };
-        let answered = probe_page(&window);
-        match liveness_action(answered, misses, reloads) {
+        let answer = probe_frames(&window);
+        let state = judge_frames(answer, frames);
+        if let Some(count) = answer {
+            frames = Some(count);
+        }
+        match liveness_action(state, attended(&window), misses, reloads) {
             LivenessAction::Alive => {
                 if misses > 0 || reloads > 0 {
                     harness::app_log(&format!(
-                        "WebView 页面恢复响应（此前 {misses} 次未响应、{reloads} 次重载）"
+                        "WebView 页面恢复绘制（此前 {misses} 次未通过检查、{reloads} 次重载）"
                     ));
                 }
                 misses = 0;
                 reloads = 0;
             }
+            LivenessAction::Unattended => {
+                // The user is elsewhere and WebKit may legitimately stop drawing here. Say so
+                // once, then keep the streak as it was: this is not a fault to accumulate.
+                if misses == 0 && reloads == 0 && state == PageState::Frozen {
+                    harness::app_log("窗口不在前台，WebKit 可能已停止绘制，本轮不判定");
+                }
+            }
             LivenessAction::Wait { misses: now } => {
                 misses = now;
                 if misses == 1 {
-                    harness::app_log("WebView 页面没有响应存活检查，继续观察");
+                    harness::app_log(match state {
+                        PageState::Frozen => "Harness 页面停止绘制（输入仍有响应），继续观察",
+                        _ => "Harness 页面没有响应存活检查，继续观察",
+                    });
                 }
             }
             LivenessAction::Reload { attempt } => {
                 misses = 0;
                 reloads = attempt;
+                // The reload starts a fresh document with a fresh counter, so the old reading
+                // must not be compared against it: that would spend a second probe on a page
+                // that has just been rebuilt.
+                frames = None;
                 harness::app_log(&format!(
-                    "WebView 页面连续 {LIVENESS_MISSES} 次没有响应，第 {attempt}/{LIVENESS_RELOADS} 次重新加载 {url}"
+                    "Harness 页面连续 {LIVENESS_MISSES} 次未通过存活检查（{}），第 {attempt}/{LIVENESS_RELOADS} 次重新加载 {url}",
+                    match state {
+                        PageState::Frozen => "停止绘制",
+                        _ => "无响应",
+                    }
                 ));
-                set_title(&window, "DeepSeek Harness（页面无响应，正在重新加载…）");
+                set_title(&window, "DeepSeek Harness（页面已停止刷新，正在重新加载…）");
                 if let Err(error) = window.navigate(url.clone()) {
                     harness::app_log(&format!("重新加载页面失败: {error}"));
                 }
             }
             LivenessAction::Report { attempts } => {
                 harness::app_log(&format!(
-                    "WebView 页面在 {attempts} 次重新加载后仍无响应，交给用户处理"
+                    "Harness 页面在 {attempts} 次重新加载后仍未恢复，交给用户处理"
                 ));
-                set_title(&window, "DeepSeek Harness（页面无响应，请重启应用）");
+                set_title(&window, "DeepSeek Harness（页面已停止刷新，请重启应用）");
                 return;
             }
         }
@@ -1049,21 +1135,29 @@ fn title_is_default(window: &WebviewWindow) -> bool {
         .unwrap_or(true)
 }
 
-/// Ask the page to evaluate something trivial, and wait a bounded time for the answer.
+/// Whether the user can be looking at the window: visible, not minimised, and focused.
+///
+/// A window that is none of those is one WebKit is allowed to stop drawing, which is why the
+/// answer gates the *frozen* verdict and not the silent one.
+fn attended(window: &WebviewWindow) -> bool {
+    window.is_visible().unwrap_or(true)
+        && !window.is_minimized().unwrap_or(false)
+        && window.is_focused().unwrap_or(true)
+}
+
+/// Ask the page how many frames it has drawn, and wait a bounded time for the answer.
 ///
 /// `eval_with_callback` answers from WebKit's completion handler, so a wedged or dead renderer
-/// never calls it — that silence is the signal this whole path exists for.
-fn probe_page(window: &WebviewWindow) -> bool {
+/// never calls it: `None` is that silence. A number that has not moved is the other failure —
+/// the page runs, takes input, and draws nothing.
+fn probe_frames(window: &WebviewWindow) -> Option<u64> {
     let (tx, rx) = mpsc::channel();
-    if window
-        .eval_with_callback(LIVENESS_PROBE, move |_answer| {
-            let _ = tx.send(());
+    window
+        .eval_with_callback(FRAME_PROBE, move |answer| {
+            let _ = tx.send(answer.trim().parse::<u64>().ok());
         })
-        .is_err()
-    {
-        return false;
-    }
-    rx.recv_timeout(LIVENESS_TIMEOUT).is_ok()
+        .ok()?;
+    rx.recv_timeout(LIVENESS_TIMEOUT).ok().flatten()
 }
 
 /// Bumped every time the window is rebuilt, so an old watchdog can tell it lost its subject.
@@ -1490,55 +1584,107 @@ mod tests {
         }
     }
 
-    /// The page cannot report its own death: a killed renderer, or a main thread wedged by a
-    /// plugin, stops the UI's own reconnection logic too. This is the shell-side policy.
+    /// A page that takes input but draws nothing is the reported failure, and it cannot report
+    /// itself: the UI coalesces streamed output onto animation frames, and the code that would
+    /// notice is the code that stopped running.
     #[test]
-    fn a_page_that_stops_answering_is_reloaded_and_then_reported() {
-        // One miss is a hiccup: the shell waits for the next probe instead of throwing away the
-        // page's state.
+    fn a_page_that_stops_drawing_is_reloaded_and_then_reported() {
+        let drawing = PageState::Drawing;
+        let frozen = PageState::Frozen;
+        // One bad probe is a hiccup: the shell waits instead of throwing away the page state.
         assert_eq!(
-            liveness_action(false, 0, 0),
+            liveness_action(frozen, true, 0, 0),
             LivenessAction::Wait { misses: 1 }
         );
-        // The second miss in a row is a page that is gone.
+        // The second one in a row is a page that has stopped drawing.
         assert_eq!(
-            liveness_action(false, 1, 0),
+            liveness_action(frozen, true, 1, 0),
             LivenessAction::Reload { attempt: 1 }
         );
-        // Anything that answers clears the streak, whatever the reload count was.
-        assert_eq!(liveness_action(true, 5, 2), LivenessAction::Alive);
+        // Anything that draws clears the streak, whatever the reload count was.
+        assert_eq!(liveness_action(drawing, true, 5, 2), LivenessAction::Alive);
         // Reloads are budgeted: the shell stops instead of looping over a page that never returns.
         assert_eq!(
-            liveness_action(false, 1, 1),
+            liveness_action(frozen, true, 1, 1),
             LivenessAction::Reload { attempt: 2 }
         );
         assert_eq!(
-            liveness_action(false, 1, 2),
-            LivenessAction::Reload { attempt: 3 }
-        );
-        assert_eq!(
-            liveness_action(false, 1, 3),
+            liveness_action(frozen, true, 1, 3),
             LivenessAction::Report { attempts: 3 }
         );
-        // A missed probe mid-recovery does not reset the reload budget.
+        // A bad probe mid-recovery does not reset the reload budget.
         assert_eq!(
-            liveness_action(false, 0, 3),
+            liveness_action(frozen, true, 0, 3),
             LivenessAction::Wait { misses: 1 }
         );
         assert_eq!(
-            liveness_action(false, 1, u32::MAX),
+            liveness_action(frozen, true, 1, u32::MAX),
             LivenessAction::Report { attempts: u32::MAX }
+        );
+        // A silent page is broken wherever it is: focus is no excuse for answering nothing.
+        assert_eq!(
+            liveness_action(PageState::Silent, false, 1, 0),
+            LivenessAction::Reload { attempt: 1 }
         );
     }
 
+    /// A window the user is not looking at is one WebKit may legitimately stop drawing, and
+    /// reloading it would turn "the user switched away" into a reload loop.
     #[test]
-    fn the_liveness_probe_is_a_single_expression() {
-        // The answer is only "something ran in the page": the callback is what the shell waits
-        // for, so the expression must not depend on anything the page has to provide.
-        assert_eq!(LIVENESS_PROBE, "\"dsh-desktop-alive\"");
+    fn a_background_window_is_not_accused_of_being_frozen() {
+        assert_eq!(
+            liveness_action(PageState::Frozen, false, 0, 0),
+            LivenessAction::Unattended
+        );
+        // Even a long streak of unattended probes stays unattended: no reloads are spent.
+        assert_eq!(
+            liveness_action(PageState::Frozen, false, 4, 2),
+            LivenessAction::Unattended
+        );
+        // Drawing is drawing, attended or not.
+        assert_eq!(
+            liveness_action(PageState::Drawing, false, 0, 0),
+            LivenessAction::Alive
+        );
+    }
+
+    /// The frame counter is the whole signal, so its algebra has to be exact.
+    #[test]
+    fn only_a_moving_frame_counter_proves_the_page_is_drawing() {
+        // First answer: nothing to compare against, so a number that arrived is progress.
+        assert_eq!(judge_frames(Some(1), None), PageState::Drawing);
+        assert_eq!(judge_frames(Some(0), None), PageState::Drawing);
+        // Same number twice: JavaScript runs and no frame was produced in between.
+        assert_eq!(judge_frames(Some(7), Some(7)), PageState::Frozen);
+        // A larger number is frames being drawn.
+        assert_eq!(judge_frames(Some(8), Some(7)), PageState::Drawing);
+        // A smaller number is a fresh document, not a fault: a reload starts the count over.
+        assert_eq!(judge_frames(Some(1), Some(40)), PageState::Drawing);
+        // No answer at all is the renderer being gone or wedged.
+        assert_eq!(judge_frames(None, Some(40)), PageState::Silent);
+        assert_eq!(judge_frames(None, None), PageState::Silent);
+    }
+
+    #[test]
+    fn the_frame_probe_is_es5_and_schedules_at_most_one_frame() {
+        // The probe runs on every engine this shell supports, including the old WebKits the
+        // compat layer exists for.
+        for syntax in ["=>", "```", "??", "const ", "let ", "class "] {
+            assert!(
+                !FRAME_PROBE.contains(syntax),
+                "存活探测必须保持 ES5，发现 {syntax:?}"
+            );
+        }
+        // The pending callback is itself the evidence: one at a time, never a queue.
+        assert!(FRAME_PROBE.contains("__dshFramePending"), "{FRAME_PROBE}");
         assert!(
-            !LIVENESS_PROBE.contains(';'),
-            "一次求值，不要有副作用: {LIVENESS_PROBE}"
+            FRAME_PROBE.contains("requestAnimationFrame"),
+            "{FRAME_PROBE}"
+        );
+        // It has to answer with the count, so the shell can compare two probes.
+        assert!(
+            FRAME_PROBE.contains("return w.__dshFrames"),
+            "{FRAME_PROBE}"
         );
         // The watchdog has to outlast a slow but healthy page, and give up before a user would.
         assert!(LIVENESS_TIMEOUT < LIVENESS_INTERVAL);
