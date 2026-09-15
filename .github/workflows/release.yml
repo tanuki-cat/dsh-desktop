@@ -269,6 +269,19 @@ jobs:
           cat > notes.md <<'MD'
           ## DSH Desktop v__VERSION__
 
+          ### 本版修复
+
+          - **页面停止刷新**：模型跑着跑着界面不再更新（能点击、能输入、能发送，只有输出不动），
+            重启后发现任务其实已经完成。原因是 WebKit 会暂停它认为不活跃的窗口的动画帧，而 Harness
+            界面把流式输出合并到动画帧上（输入框走同步刷新，所以只有输出受影响）。现在窗口显式关闭
+            背景节流，并新增绘制看护：连续两次探测到"帧没动"就自动重新加载页面（最多 3 次）。
+          - **认错 dsh**：PATH 上同名的其他程序（Homebrew 的 Dancer's shell 等）不再被当作 dsh 监管，
+            界面显示的版本号也不会再来自别人的包；状态页现在同时写明用的是哪棵树。
+          - **界面没有插件市场**：profile 已存在、或没声明 dshmarket 时不再静默跳过，日志会说明原因
+            与修复命令。
+
+          ### 产物
+
           macOS / Linux 每个平台都有两种产物，Windows 只有一种（它本身就是免安装的）：
 
           - **自带运行时版**（文件名带 `-bundled`）：随包附带 Node 22 与 dsh 核心，**目标机器无需
@@ -286,9 +299,10 @@ jobs:
           自带运行时版首次启动会用包内的 Node + dsh 拉起 Web GUI，不需要联网下载；dsh 核心与插件市场
           dshmarket 之后跟随 npm registry 自动更新（默认开启，可用 config.json 的 auto_update 关闭）。
 
-          > 🖥 **macOS 的界面需要 Safari 18.4（macOS 15.4）或更新的 WebKit**：随包的 document-preview 插件
-          > 在更旧的引擎上会在加载期抛 `Can't find variable: Iterator`。壳会先探测再决定是否打开界面，
-          > 不满足时给出写明原因的提示（不会再看到 `Failed to load plugins`）。
+          > 🖥 **macOS 的界面需要 Safari 16.4（macOS 13.3）或更新的 WebKit**：随包的 document-preview
+          > 插件在更旧的引擎上会在加载期抛 `Can't find variable: Iterator` 一类错误。壳会先探测缺什么，
+          > **能补的（Iterator、Promise.try、Math.sumPrecise 等）自己注入兼容层**，补不了的语法
+          > （macOS ≤ 12 缺 `class static block`）才改用系统浏览器并写明原因。
 
           > ⚠️ 这些构建**未签名也未公证**：macOS 首次打开请右键 →「打开」，或执行
           > xattr -dr com.apple.quarantine "/Applications/DSH Desktop.app"。Linux 上 WebKitGTK 仍来自系统。
