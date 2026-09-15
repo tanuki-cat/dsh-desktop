@@ -1609,11 +1609,39 @@ fn terminal_page(action: &ForeignAction) -> TerminalPage {
     }
 }
 
+/// How much of a command line the question shows.
+///
+/// These lines carry two deep absolute paths (the node that runs the CLI and the CLI itself), so
+/// they run to several hundred characters on any real installation. The box they go in scrolls,
+/// and a scroll box hides its own content: what the user reads has to be the part that identifies
+/// the process.
+const COMMAND_DISPLAY_LIMIT: usize = 160;
+
+/// Shorten a command line for display, keeping both ends recognisable.
+///
+/// The middle is what goes. The start names the interpreter and the tree the CLI was installed
+/// into; the end carries the flags (`--profile web`, `--port`) that say what it is doing. Those
+/// are the two things a person checks to answer "is this mine?", and the path depth in between is
+/// exactly what makes the line too long to show.
+fn elide_command(command: &str) -> String {
+    let chars: Vec<char> = command.chars().collect();
+    if chars.len() <= COMMAND_DISPLAY_LIMIT {
+        return command.to_string();
+    }
+    let head = COMMAND_DISPLAY_LIMIT / 2;
+    let tail = COMMAND_DISPLAY_LIMIT - head;
+    let start: String = chars[..head].iter().collect();
+    let end: String = chars[chars.len() - tail..].iter().collect();
+    format!("{start}…{end}")
+}
+
 /// The question put to the user when a Harness this shell did not start is in the way.
 ///
 /// The detail is the whole point of asking: a pid alone does not tell the user which terminal
-/// session, agent run or workspace they are about to end, so the command line and this shell's
-/// own workspace are both spelled out.
+/// session, agent run or workspace they are about to end. So it leads with what answering yes
+/// would *do* — end that session and restart under this shell's workspace — and only then shows
+/// the process as evidence. The order matters on a small window, where the bottom of this text is
+/// the part that scrolls out of sight.
 fn takeover_question(
     port: u16,
     pid: u32,
@@ -1622,13 +1650,16 @@ fn takeover_question(
 ) -> (String, String) {
     let detail = format!(
         "端口 127.0.0.1:{port} 上已有一个不是本应用启动的 Harness。\n\n\
-         进程: pid {pid}\n\
-         命令行: {}\n\n\
-         接管会先终止该进程（它当前的会话、正在执行的 agent 任务与浏览器里已打开的页面都会断开），\
+         接管会先终止该进程 —— 它当前的会话、正在执行的 agent 任务、浏览器里已打开的页面都会断开 ——\
          然后用本应用的 workspace 重新启动：\n{}\n\n\
+         要接管的进程: pid {pid}\n\
+         命令行: {}\n\n\
          不接管则用系统浏览器打开那个实例，本应用退出。",
-        command.unwrap_or("<读不到命令行>"),
-        workspace.display()
+        workspace.display(),
+        command
+            .map(elide_command)
+            .as_deref()
+            .unwrap_or("<读不到命令行>")
     );
     ("检测到其它 Harness".to_string(), detail)
 }
@@ -3401,6 +3432,55 @@ mod tests {
             terminal_page(&ForeignAction::TakeOver { pid: 1 }),
             TerminalPage::Failure
         );
+    }
+
+    /// A real command line is mostly path, and the box it goes in scrolls — so it is shortened
+    /// around a middle the user does not need, keeping the interpreter and the flags.
+    #[test]
+    fn a_long_command_line_is_elided_around_its_middle() {
+        // Short enough to show as-is: no ellipsis, no truncation.
+        let short = "/usr/bin/node /srv/dsh/lib/bin.js --profile web";
+        assert_eq!(elide_command(short), short);
+
+        let long = format!(
+            "/Users/me/Library/Application Support/JetBrains/Toolbox/apps/node/versions/22/bin/node {}/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --no-open --port 3080",
+            "/Users/me/WorkSpace/RustRoverProjects/a-deeply-nested-directory".repeat(3)
+        );
+        let shown = elide_command(&long);
+        assert!(
+            shown.chars().count() <= COMMAND_DISPLAY_LIMIT + 1,
+            "{shown}"
+        );
+        // Both ends survive: the interpreter that was used, and the flags that say what it does.
+        assert!(
+            shown.starts_with("/Users/me/Library/Application Support"),
+            "{shown}"
+        );
+        assert!(
+            shown.ends_with("--profile web --no-open --port 3080"),
+            "{shown}"
+        );
+        assert!(shown.contains('…'), "{shown}");
+        // The line still identifies the CLI, which is the whole reason it is shown.
+        assert!(harness::looks_like_dsh_web(&long));
+    }
+
+    /// What answering yes would do comes before the evidence for it: the bottom of the box is the
+    /// part a small window scrolls out of sight.
+    #[test]
+    fn the_question_leads_with_what_takeover_would_do() {
+        let (_, detail) = takeover_question(3080, 7, None, Path::new("/Users/me/project"));
+        let effect = detail
+            .find("接管会先终止该进程")
+            .expect("the effect is stated");
+        let evidence = detail.find("要接管的进程").expect("the process is named");
+        assert!(effect < evidence, "{detail}");
+        // The workspace is part of the effect — a takeover does not continue the other session —
+        // so it has to be above the command line rather than after it.
+        let workspace = detail
+            .find("/Users/me/project")
+            .expect("the workspace is named");
+        assert!(workspace < evidence, "{detail}");
     }
 
     /// An unanswered question runs the config, and a question that could not be put at all has to

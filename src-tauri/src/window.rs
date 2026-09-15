@@ -346,6 +346,9 @@ pub fn ask_choice(
         *ASKED.lock().unwrap() = None;
         return None;
     }
+    // Before the page draws the buttons, not after: a resize the user can watch happening
+    // under a question they are already reading is worse than one that lands first.
+    size_for_question(app);
     let options = options.to_vec();
     let script = choice_script(question, status, detail, &options, hint);
     if let Some(window) = app.get_webview_window(SPLASH) {
@@ -800,10 +803,34 @@ const FIND_LAST_SHIM: &str = r#"
 })();
 "#;
 
+/// The splash window for ordinary progress: a spinner, a status line and a short detail.
+const SPLASH_SIZE: (f64, f64) = (460.0, 300.0);
+
+/// The same window while the takeover question is up.
+///
+/// That question is the one thing here the user has to read before acting: a heading, an
+/// explanation naming the pid, the command line and the workspace, four buttons and the timeout
+/// hint. At [`SPLASH_SIZE`] the content overflowed and the flex centring clipped it at both ends
+/// — spinner and title off the top, explanation cut mid-line (seen on a real launch, 2026-09-16).
+const QUESTION_SIZE: (f64, f64) = (520.0, 560.0);
+
+/// Grow the status window to fit the question, and keep it on screen while doing so.
+///
+/// The window is not user-resizable, so its size has to come from here. Re-centring matters: a
+/// window that grows from its top-left corner can run off the bottom of the display, which would
+/// hide the buttons the user is being asked to press.
+fn size_for_question(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(SPLASH) else {
+        return;
+    };
+    let _ = window.set_size(tauri::LogicalSize::new(QUESTION_SIZE.0, QUESTION_SIZE.1));
+    let _ = window.center();
+}
+
 pub fn create_splash(app: &AppHandle) -> tauri::Result<()> {
     let window = WebviewWindowBuilder::new(app, SPLASH, WebviewUrl::App("index.html".into()))
         .title("DeepSeek Harness")
-        .inner_size(460.0, 300.0)
+        .inner_size(SPLASH_SIZE.0, SPLASH_SIZE.1)
         .resizable(false)
         // Ask this WebView what it can run before anything is spawned: an engine older than
         // Safari 18.4 cannot load the current dsh front end at all (see `WebviewReport`).
@@ -2200,6 +2227,37 @@ mod tests {
         // never be able to become markup on this page.
         assert!(page.contains("textContent = option.label"), "{page}");
         assert!(!page.contains("innerHTML"), "提问面板不能用 innerHTML 渲染");
+    }
+
+    /// The question is the one page here the user must read before acting, and it is taller than
+    /// the splash. Two layout rules decide whether it is readable at all, and both were wrong on a
+    /// real launch (2026-09-16): the window was too short for the content, and the page centred it
+    /// with a flex rule that clips overflow at *both* ends — the spinner and title went off the
+    /// top while the explanation was cut mid-line at the bottom.
+    #[test]
+    fn the_question_gets_a_window_and_a_layout_that_fit_it() {
+        // The window grows for the question, and the two sizes must stay in that order: a
+        // question window no taller than the splash would put the buttons back below the fold.
+        assert!(
+            QUESTION_SIZE.1 > SPLASH_SIZE.1,
+            "the question needs more height than the splash: {QUESTION_SIZE:?} vs {SPLASH_SIZE:?}"
+        );
+        assert!(QUESTION_SIZE.0 >= SPLASH_SIZE.0, "{QUESTION_SIZE:?}");
+
+        let page = include_str!("../../src/index.html");
+        // `margin: auto` on the content, not `justify-content: center` on the body: the latter
+        // clips the overflow instead of scrolling it.
+        assert!(page.contains("margin: auto"), "内容靠 margin:auto 居中");
+        // The comment above explains why, so match the declaration and not the word: a bare
+        // `contains` would also flag the note that says not to do this.
+        assert!(
+            !page.contains("justify-content: center;"),
+            "flex 居中会裁掉溢出内容，改用 margin:auto"
+        );
+        // The explanation is capped so four buttons and the hint stay on screen; the box scrolls
+        // rather than pushing the answer off the bottom.
+        assert!(page.contains("body.asking #detail"), "{page}");
+        assert!(page.contains("#detail:empty"), "空的详情框不该显示成灰条");
     }
 
     /// The question script escapes what it carries: a command line can hold quotes, and a

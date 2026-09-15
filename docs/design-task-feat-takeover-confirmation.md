@@ -108,13 +108,40 @@ the status page`）。判断抽成 `terminal_page(&ForeignAction)` 以便单测�
 用户最难预料的一点，因此写在详情里而不是日志里。读不到命令行时写 `<读不到命令行>`，让用户知道
 壳不知道什么，而不是留空。
 
+**顺序也是文案的一部分**（实机截图后调整）：先写「接管会做什么」（终止会话 + 用哪个 workspace 重启），
+再写「要接管的是哪个进程」。小窗口里文本底部会滚出视野，而被滚掉的必须是证据，不是用户真正要判断的后果。
+
+命令行按 `COMMAND_DISPLAY_LIMIT = 160` **掐头去尾**（`elide_command()`）：真实命令行里有两段深路径，
+动辄几百字符，而盒子会滚动 —— 滚动就等于藏内容。保留首尾是因为开头说明用的是哪个解释器与安装树、
+结尾带着 `--profile web` / `--port` 这些说明它在干什么的 flag，中间那截路径深度正是让它过长的原因。
+
 浏览器回退页额外写明两条用户下一句一定会问的：**没有可重启的 Harness**（所以也没有重启按钮），
 以及浏览器需要已有该 authority 的登录 cookie —— 否则会看到 `authentication required`（实测无 cookie
 访问根路径就是 401 栅栏）。
 
+### 3.4 布局：小窗口里的取舍
+
+实机截图暴露两处渲染缺陷，都不是逻辑问题，而是「内容比窗口高」时 CSS 的行为：
+
+1. **flex 居中会裁掉溢出**：`body { justify-content: center }` 在内容高于容器时两端一起被裁 ——
+   转圈与标题被顶出可视区、说明文字从中间断掉。改成内容自身 `margin: auto`（有空间时居中、没空间时
+   塌成 0），页面改为可滚动，于是最坏情况是「需要滚一下」而不是「看不见」；
+2. **上边被顶掉**：同一处裁切的后果，随第 1 条一并修掉。
+
+配套的尺寸决策：
+
+- 窗口平时 `SPLASH_SIZE = 460×300`（转圈 + 状态行）；
+- 提问时由 `size_for_question()` 长到 `QUESTION_SIZE = 520×560` 并重新 `center()` —— 提问是这个窗口
+  承载过的最大内容（标题 + 多行说明 + 四个按钮 + 超时提示），而它不可缩放，尺寸只能从这里来；
+  重新居中是因为从左上角长大会顶出屏幕底部，正好藏起用户要按的按钮；
+- 详情框在提问态放宽到 `max-height: 240px` 并提高对比度，但**仍然有上限**：命令行可以任意长，
+  让它撑开就会把最后一个按钮挤到折叠线以下 —— 那是这个页面上唯一绝不能发生的事；超过上限就内部滚动；
+- `#choice` / `#retry` 设 `flex: 0 0 auto`，按钮不为文本让位；
+- 空的详情框 `#detail:empty` 隐藏：启动过程中它就是空的，一块灰条看起来像渲染故障。
+
 ## 4. 验证
 
-新增单测 8 项（`lib.rs` 6 项 + `window.rs` 2 项），集成测试 5 → 6 项。库内单测合计 116 → 138，
+新增单测 11 项（`lib.rs` 8 项 + `window.rs` 3 项），集成测试 5 → 6 项。库内单测合计 116 → 141，
 其中 14 项属于更新事务（见另一文档）：
 
 - `an_identified_foreign_instance_is_always_asked_about`：身份矩阵，识别出来就问、**与配置项无关**；
@@ -126,6 +153,11 @@ the status page`）。判断抽成 `terminal_page(&ForeignAction)` 以便单测�
 - `a_port_override_lasts_for_one_launch_only`：`PORT_OVERRIDE` 置位生效、清零后回到配置端口；
 - `leaving_the_instance_alone_does_not_offer_a_restart`：`UseBrowser` → `Notice`（无按钮），
   `Refuse` / `TakeOver` → `Failure`（有按钮）；
+- `a_long_command_line_is_elided_around_its_middle`：短命令行原样、长命令行首尾保留且长度受限；
+- `the_question_leads_with_what_takeover_would_do`：后果段落在证据段落之前，workspace 也在其之前；
+- `the_question_gets_a_window_and_a_layout_that_fit_it`：提问窗口高于普通窗口、页面用 `margin: auto`
+  而非 flex 居中、提问态详情框有上限、空详情框隐藏。**负向验证**：把 flex 居中改回去，测试立刻以
+  「flex 居中会裁掉溢出内容」失败 —— 正是实机截图里的现象；
 - `the_takeover_question_names_the_process_and_this_shells_workspace`：文案含端口、pid、命令行、
   workspace；命令行缺失时有明确占位；
 - `an_unanswered_takeover_question_follows_the_config_default`：超时返回 `None`；问题号不匹配的
@@ -143,12 +175,20 @@ the status page`）。判断抽成 `terminal_page(&ForeignAction)` 以便单测�
   改回去，新测试立刻以「the question must show the panel」失败；改回来即绿。这印证了「断言字符串出现在文件里」
   与「页面真的这么工作」是两回事。
 
-门禁：`cargo test` **138 passed / 0 failed**、`cargo fmt --check` 通过、`cargo clippy --all-targets`
+**渲染验证（2026-09-16）**：用无头 Edge 按窗口尺寸实拍 `src/index.html`，覆盖四种状态 —— 启动中
+（460×300）、失败页（460×300）、提问（520×560，正常命令行）、提问（520×560，Toolbox 深路径的超长
+命令行）。前三张正常，第四张暴露出「最后一个按钮被挤出可视区」，于是有了详情框上限与文案重排。
+截图也确认了修复前那种「转圈与标题被顶出可视区、说明从中间断掉」的现象不再出现。
+
+门禁：`cargo test` **141 passed / 0 failed**、`cargo fmt --check` 通过、`cargo clippy --all-targets`
 0 warning。产物冒烟：`make bundle` 后确认 `.app` 里含换端口选项与新的浏览器回退文案。
 
 **实机复现（2026-09-16，用户报告 → 已确认）**：默认配置下，端口上有别人启动的 `dsh web` 时启动桌面端，
 会直接以浏览器形式打开并停在错误页。根因是 3.2 修正的那处配置闸门，日志里的 6 次
 `restart requested from the status page` 则对应 3.2.2 的重试循环。
+
+**实机确认功能可用（同日，用户截图）**：面板弹出、四个选项齐全、点击生效。同一次截图暴露了 3.4 的
+两处渲染问题（转圈与标题被裁掉、说明文字从中间断掉），本轮的布局改动即针对它。
 
 **未做完整实机验证**：面板本身需要真实的外部 Harness 占住端口才能弹出，而当前沙箱不允许 `ps` /
 `lsof`（身份校验的第二道信号读不到），因此无法在这里跑 GUI 冒烟。已能验证的部分：

@@ -95,7 +95,7 @@
 
 ## 3. 验证
 
-### 3.1 单测（库内 116 → 138，本项占 14 项）
+### 3.1 单测（库内 116 → 141，本项占 14 项）
 
 `transaction.rs` 11 项：暂存目录的清理与自删、按**名字与版本**双重校验（含"暂存的是别的包"、
 缺入口脚本、版本不符）、切换保留旧树、切换失败放回旧树、回滚保留失败树、代际裁剪（含 `0.10.0 > 0.9.0` 的版本序与非法名优先级）、
@@ -120,7 +120,7 @@
 
 ### 3.3 门禁
 
-`cargo test` **138 passed / 0 failed**（另有 6 项集成用例）、`cargo fmt --check` 通过、`cargo clippy --all-targets`
+`cargo test` **141 passed / 0 failed**（另有 6 项集成用例）、`cargo fmt --check` 通过、`cargo clippy --all-targets`
 0 warning。
 
 ### 3.4 未验证

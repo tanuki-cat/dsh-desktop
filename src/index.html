@@ -6,19 +6,45 @@
     <style>
       :root { color-scheme: light dark; }
       body {
-        margin: 0; height: 100vh; display: flex; flex-direction: column;
-        align-items: center; justify-content: center; gap: 12px;
+        margin: 0; min-height: 100vh; display: flex; overflow: auto;
         font: 13px/1.6 -apple-system, "Helvetica Neue", sans-serif;
         background: Canvas; color: CanvasText; padding: 24px; box-sizing: border-box;
+      }
+      /*
+        Centred by `margin: auto` on the content, NOT by `justify-content: center` on the body.
+        A flex container that centres its items clips the overflow at both ends when they are
+        taller than it is: the takeover question pushed the spinner and title off the top and
+        cut the explanation mid-line at the bottom (seen on a real launch, 2026-09-16).
+        `margin: auto` centres while there is room and collapses to zero when there is not, so
+        the page scrolls instead of losing the text the user is being asked to read.
+      */
+      #page {
+        margin: auto; display: flex; flex-direction: column; align-items: center; gap: 12px;
+        width: 100%; max-width: 420px;
       }
       h1 { font-size: 15px; margin: 0; letter-spacing: .02em; }
       #status { opacity: .9; }
       #detail {
         width: 100%; max-height: 110px; overflow: auto; white-space: pre-wrap;
         opacity: .7; font-size: 12px; text-align: left;
-        background: color-mix(in srgb, CanvasText 6%, transparent);
+        background: color-mix(in srgb, CanvasText 8%, transparent);
         border-radius: 6px; padding: 8px; box-sizing: border-box;
       }
+      /*
+        The question puts the whole explanation in here, and it is what the choice is about, so
+        the box gets more room and a higher contrast. The cap matters as much as the room: the
+        command line can be arbitrarily long, and letting the box grow with it pushed the last
+        button below the fold — the one thing on this page that must not happen (seen with a
+        Toolbox-length node path, 2026-09-16). Past the cap the box scrolls instead.
+      */
+      body.asking #detail { max-height: 240px; opacity: .85; }
+      body.asking .spinner { display: none; }
+      /* An empty detail is the normal state while starting: an empty grey bar reads as a
+         rendering glitch. `:empty` matches only truly empty, so a detail of "" from Rust is
+         hidden too, which is what a caller passing no detail means. */
+      #detail:empty { display: none; }
+      /* The buttons and the hint are the answer; they never shrink to make room for text. */
+      #choice, #retry { flex: 0 0 auto; }
       .spinner {
         width: 18px; height: 18px; border-radius: 50%;
         border: 2px solid color-mix(in srgb, CanvasText 25%, transparent);
@@ -33,7 +59,7 @@
       }
       #retry:disabled { opacity: .6; cursor: default; }
       #retry[hidden] { display: none; }
-      #choice { display: flex; flex-direction: column; gap: 8px; width: 100%; max-width: 420px; }
+      #choice { display: flex; flex-direction: column; gap: 8px; width: 100%; }
       #choice[hidden] { display: none; }
       #choice button {
         font: inherit; padding: 7px 12px; border-radius: 6px; cursor: pointer; text-align: left;
@@ -88,17 +114,21 @@
     </script>
   </head>
   <body>
-    <div class="spinner" id="spinner"></div>
-    <h1>DeepSeek Harness</h1>
-    <div id="status">正在启动…</div>
-    <div id="detail"></div>
-    <button id="retry" hidden>重新启动 Harness</button>
-    <!--
-      The takeover question. Rust writes the labels (they carry the pid, the command line and the
-      port), the page only draws them and reports which one was clicked: the buttons are created
-      here rather than injected as HTML so nothing from a process command line can become markup.
-    -->
-    <div id="choice" hidden></div>
+    <!-- One column, centred by `margin: auto`; see the layout note in the stylesheet. -->
+    <div id="page">
+      <div class="spinner" id="spinner"></div>
+      <h1>DeepSeek Harness</h1>
+      <div id="status">正在启动…</div>
+      <div id="detail"></div>
+      <button id="retry" hidden>重新启动 Harness</button>
+      <!--
+        The takeover question. Rust writes the labels (they carry the pid, the command line and
+        the port), the page only draws them and reports which one was clicked: the buttons are
+        created here rather than injected as HTML, so nothing from a process command line can
+        become markup.
+      -->
+      <div id="choice" hidden></div>
+    </div>
     <script>
       // Render whatever Rust has already sent (and every later update).
       window.__applyStatus = function () {
@@ -127,6 +157,10 @@
         document.getElementById("status").textContent = pending[1];
         document.getElementById("detail").textContent = pending[2] || "";
         document.body.classList.toggle("error", false);
+        // While the question is up the detail box is the question, not a log tail: give it the
+        // room to be read in full and drop the spinner, which says "working" while the shell is
+        // in fact waiting for a person.
+        document.body.classList.toggle("asking", options.length > 0);
         // The question replaces the restart button: two live buttons on one page would let a
         // click race the answer the shell is already waiting for.
         document.getElementById("retry").hidden = true;
