@@ -457,10 +457,22 @@ README 顶部新增一张表，把三个下限分开说明，并标注各自由�
 **本轮补充（2026-09-15）**
 
 审查环境已具备 Cargo 1.97.0，测试已复跑：`cargo test` **116 passed / 0 failed**
-（审查时的基线为 102 passed）。新增 14 项单测覆盖本轮修复，其中三项在编写或冒烟时**抓出了真实缺陷**：
+（审查时的基线为 102 passed）。新增 14 项单测覆盖本轮修复，其中四项在编写、冒烟或 CI 中**抓出了真实缺陷**：
 脱敏对 `api_key: value` 这类「分隔符后带空格」的写法会漏掉值；`looks_like_dsh_web` 会把
-`dsh plugin --profile web add …` 误判为服务进程；以及 P2-5 记的兼容层竞态（`needed_compat_script`
-不等待上报，导致需要兼容层的机器静默不打补丁）。
+`dsh plugin --profile web add …` 误判为服务进程；P2-5 记的兼容层竞态（`needed_compat_script`
+不等待上报，导致需要兼容层的机器静默不打补丁）；以及下面这条只在 Windows 暴露的测试缺陷。
+
+**v0.4.2 首次发布在 Windows 上失败（2026-09-15，已修）**：`build windows-x64` 的离线测试门禁挂在
+`the_auth_fence_identifies_a_harness`（`left: Other, right: Harness`），macOS 与 Linux 全绿。
+根因是**测试辅助函数**而非被测代码：`serve_once()` 写入响应后直接关闭 socket，但从不读取请求。
+接收缓冲区仍有未读数据时关闭会发 RST 而不是 FIN，**Windows 见到 RST 会丢弃对端已收到的数据**，
+于是探测读到空 body 判为 `Other`；macOS/Linux 会先交付已收到的字节，所以本地永远绿。
+实测确认：旧写法 30 次里 29 次触发 `ECONNRESET`，新写法 0 次。
+
+更值得记的是**同一缺陷让另一个测试假通过**：`an_unrelated_http_server_is_not_a_harness` 期望 `Other`，
+而空 body 恰好也是 `Other` —— 它在 Windows 上通过，理由却是错的。修法：`serve_once()` 读完请求再
+优雅关闭，并返回一个「已排空」标志供断言。该断言**故意不依赖探测结果**，因为 macOS 上 RST 仍会交付
+body、平台相关的现象抓不住回归；标志在任何平台都会失败（已用负向验证确认：移除排空逻辑后本地即挂）。
 
 逐条状态（本轮）：
 

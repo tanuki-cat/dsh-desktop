@@ -660,6 +660,7 @@ fn backup_path(path: &Path, index: usize) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn spawn_paths_are_named_in_the_error() {
@@ -914,8 +915,9 @@ mod tests {
             "HTTP/1.1 403 Forbidden\r\n\r\n",
             "HTTP/1.1 404 Not Found\r\n\r\n",
         ] {
-            let port = serve_once(response);
+            let (port, drained) = serve_once(response);
             assert_eq!(probe(port), Probe::Other, "misread: {response:?}");
+            assert_drained(&drained);
         }
     }
 
@@ -925,7 +927,9 @@ mod tests {
     fn the_auth_fence_identifies_a_harness() {
         let response = "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\n\r\n\
                         dsh web authentication required; reopen the URL printed by dsh web.\n";
-        assert_eq!(probe(serve_once(response)), Probe::Harness);
+        let (port, drained) = serve_once(response);
+        assert_eq!(probe(port), Probe::Harness);
+        assert_drained(&drained);
     }
 
     /// A command line has to name the `dsh web` server before anything is signalled. Both the
@@ -949,16 +953,59 @@ mod tests {
     }
 
     /// Serve one canned HTTP response on a loopback port for a single probe.
-    fn serve_once(response: &str) -> u16 {
-        use std::io::Write;
+    ///
+    /// Returns the port and a flag the serving thread sets once it has drained the whole request.
+    ///
+    /// The drain is what the flag exists to prove. Closing a socket that still has unread bytes in
+    /// its receive buffer sends an RST instead of a FIN, and Windows discards what the peer already
+    /// received when it sees one. A write-only server therefore answered with an empty body *there*
+    /// while behaving on macOS — so the bug reached CI as a Windows-only failure, and the 200 test
+    /// passed for the wrong reason, since an empty body is `Other` too.
+    ///
+    /// Asserting the flag rather than the probe result is deliberate: on macOS the RST still
+    /// delivers the body, so a platform-dependent outcome cannot catch a regression here. The flag
+    /// fails wherever it runs.
+    fn serve_once(response: &str) -> (u16, Arc<AtomicBool>) {
+        use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let response = response.to_string();
+        let drained = Arc::new(AtomicBool::new(false));
+        let served = drained.clone();
         std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let _ = stream.write_all(response.as_bytes());
+            let (stream, _) = listener.accept().expect("the probe must connect");
+            // Read the request to its end first: leaving it unread is what turns the close into
+            // an RST, and an RST is what loses the response on Windows.
+            let mut reader = BufReader::new(stream.try_clone().expect("clone for reading"));
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        // The blank line ends the request headers; the probe sends no body.
+                        if line == "\r\n" || line == "\n" {
+                            served.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
+            let mut stream = stream;
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            // A plain close now that nothing is unread: FIN, not RST.
+            let _ = stream.shutdown(std::net::Shutdown::Write);
         });
-        port
+        (port, drained)
+    }
+
+    /// The request must reach the test server whole, on every platform.
+    fn assert_drained(drained: &AtomicBool) {
+        assert!(
+            drained.load(std::sync::atomic::Ordering::SeqCst),
+            "the probe request must be drained before the socket closes, or the peer sees an RST\n\
+             and Windows then discards the response"
+        );
     }
 }
