@@ -1,6 +1,10 @@
 # 代码审查结论：macOS WebView 下限（界面加载失败）
 
 > 审查日期：2026-09-14 ｜ 分支 `main` ｜ 触发版本 v0.2.0（随包 dsh `0.1.5-rc.2`）
+> **已被取代**：§3.2「为什么是浏览器而不是自己打补丁」与 §5 中"WebView 内的兼容补丁"的结论，已由
+> [`design-task-feat-legacy-webkit-compat-layer.md`](./design-task-feat-legacy-webkit-compat-layer.md)（2026-09-15）取代；
+> 本文其余诊断（证据链、影响面、判定通道）仍然有效，保留原决策与被取代的原因。
+>
 > 触发现象：Intel Mac 上用 macos-x64 产物启动后，界面停在
 > `HARNESS / Failed to load plugins / failed to import loader entry … (@deepseek-ai/dsh-client-ui-sidebar-documentpreview): Can't find variable: Iterator`
 > 姊妹文档：[`design-task-fix-v0-2-0-post-merge-audit.md`](./design-task-fix-v0-2-0-post-merge-audit.md)（A1–A6）、

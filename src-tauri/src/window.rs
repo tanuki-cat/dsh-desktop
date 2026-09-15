@@ -20,7 +20,7 @@ pub const PROBE_EVENT: &str = "dsh-desktop:webview-probe";
 /// The event the status page uses to ask for another attempt at starting the Harness.
 pub const RESTART_EVENT: &str = "dsh-desktop:restart-harness";
 
-/// APIs whose absence kills the dsh front end while it loads.
+/// APIs the compat layer can install when this WebView lacks them (see [`compat_script`]).
 ///
 /// `Iterator` is the one that actually happened (2026-09-14, an Intel Mac): the bundled
 /// document-preview plugin evaluates `Iterator.prototype.join` without checking that the global
@@ -28,25 +28,45 @@ pub const RESTART_EVENT: &str = "dsh-desktop:restart-harness";
 /// window ends up showing the harness's opaque "Failed to load plugins" page. The `Iterator`
 /// global arrived in Safari 18.4 — macOS 15.4, or the Safari 18.4 update for macOS 13/14 — which
 /// is far newer than the macOS versions this bundle still allows (11.0).
-const REQUIRED_APIS: &[&str] = &["Iterator"];
-
-/// APIs whose absence only costs a feature. Reported, never fatal: the bundled PDF writer uses
-/// `Math.sumPrecise`, which no Safari release ships yet.
-const OPTIONAL_APIS: &[&str] = &[
-    "Promise.withResolvers",
-    "Math.sumPrecise",
-    "structuredClone",
+///
+/// The rest are the same class of gap, found by grepping every shipped client bundle for the
+/// APIs its build targets. Each entry is the label the probe reports and the expression whose
+/// absence it tests: prototype methods are not globals, so that check is `[].findLast`.
+pub const SHIMMED_APIS: &[(&str, &str)] = &[
+    ("Iterator", "Iterator"),
+    ("Promise.try", "Promise.try"),
+    ("Promise.withResolvers", "Promise.withResolvers"),
+    ("Symbol.dispose", "Symbol.dispose"),
+    ("Math.sumPrecise", "Math.sumPrecise"),
+    ("Uint8Array.fromBase64", "Uint8Array.fromBase64"),
+    ("Object.hasOwn", "Object.hasOwn"),
+    ("findLast", "[].findLast"),
 ];
+
+/// APIs reported for diagnostics only: absent costs a feature, and neither the shim nor anything
+/// else here can implement them faithfully.
+const WATCHED_APIS: &[(&str, &str)] = &[("structuredClone", "structuredClone")];
+
+/// Syntax the client bundles use that no polyfill can add: the module has to parse.
+///
+/// `new Function` is the only way to ask an engine whether it can parse something, and the splash
+/// page has no CSP (`csp: null` in `tauri.conf.json`), so it works. `class static block` (Safari
+/// 16.4, macOS 13.3) is the newest syntax the bundles use, which is what makes the compat layer's
+/// floor 13.3 rather than the 10.15 the bundle declares; newer syntax goes in this list.
+const REQUIRED_SYNTAX: &[(&str, &str)] = &[("class static block", "class Probe { static { 1; } }")];
 
 /// What the splash page found missing in this WebView.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct WebviewReport {
-    /// Required APIs that are absent: the dsh front end cannot load.
+    /// APIs from [`SHIMMED_APIS`] this engine lacks: the compat layer installs them.
     #[serde(default)]
     pub missing: Vec<String>,
-    /// Optional APIs that are absent: some feature will misbehave.
+    /// APIs whose absence only costs a feature (see [`WATCHED_APIS`]).
     #[serde(default)]
     pub degraded: Vec<String>,
+    /// Syntax this engine cannot parse (see [`REQUIRED_SYNTAX`]).
+    #[serde(default)]
+    pub syntax: Vec<String>,
     /// `navigator.userAgent`, for the log and the failure page.
     #[serde(default)]
     pub agent: String,
@@ -59,9 +79,47 @@ impl WebviewReport {
         serde_json::from_str(payload).ok()
     }
 
-    /// False when the dsh front end cannot load in this WebView.
-    pub fn supported(&self) -> bool {
-        self.missing.is_empty()
+    /// Missing APIs no compat block covers.
+    ///
+    /// Empty by construction — the probe reports exactly [`SHIMMED_APIS`] as `missing` — so this
+    /// only matters the day someone watches an API here without writing a shim: the shell then
+    /// sends the user to the browser instead of into a page that breaks later.
+    pub fn uncovered(&self) -> Vec<String> {
+        self.missing
+            .iter()
+            .filter(|api| !SHIMMED_APIS.iter().any(|(name, _)| name == api))
+            .cloned()
+            .collect()
+    }
+
+    /// Everything this engine lacks, as the list the user sees.
+    ///
+    /// `compat` is false when the shell was told not to install the compat layer
+    /// (`webkit_compat: false`), which turns the shimmable gaps into real ones.
+    pub fn gaps(&self, compat: bool) -> Vec<String> {
+        let mut gaps = self.syntax.clone();
+        gaps.extend(self.uncovered());
+        if !compat {
+            let uncovered: Vec<String> = self
+                .missing
+                .iter()
+                .filter(|api| !gaps.contains(api))
+                .cloned()
+                .collect();
+            gaps.extend(uncovered);
+        }
+        gaps
+    }
+
+    /// False when the dsh front end cannot load in this WebView, with or without the compat
+    /// layer: syntax no shim can add, an API no block covers, or the layer switched off.
+    pub fn supported(&self, compat: bool) -> bool {
+        self.gaps(compat).is_empty()
+    }
+
+    /// True when the compat layer has something to install here.
+    pub fn needs_compat(&self) -> bool {
+        !self.missing.is_empty()
     }
 
     /// The text shown when the UI has to move to the system browser: this WebView cannot run
@@ -70,27 +128,35 @@ impl WebviewReport {
     /// That is the `dsh web` path these machines have always used: the shell still supervises
     /// the Harness (updates, stopping it on exit), the browser only renders the UI — with an
     /// engine that does keep getting updates.
-    pub fn browser_fallback_detail(&self, dsh_version: &str, url: &str) -> String {
+    pub fn browser_fallback_detail(&self, dsh_version: &str, url: &str, compat: bool) -> String {
         format!(
             "{}\n\n界面已在默认浏览器中打开：\n{url}\n\n\
              这个窗口是 harness 的管理窗口（更新与退出清理都在这里）：在浏览器里操作时请不要关闭它，\
              关闭它会停止 harness。",
-            self.describe(dsh_version)
+            self.describe(dsh_version, compat)
         )
     }
 
     /// The text of the failure page: what is missing, what this dsh version needs, what to do.
-    pub fn describe(&self, dsh_version: &str) -> String {
+    ///
+    /// The floor named here is Safari 16.4, not the 18.4 the pre-compat shell required: the
+    /// compat layer covers everything above the one syntax item no shim can add.
+    pub fn describe(&self, dsh_version: &str, compat: bool) -> String {
         let mut text = format!(
-            "系统 WebView 缺少 dsh {dsh_version} 前端必需的 JavaScript 能力：{}。\n\
-             这个版本的界面需要 Safari 18.4（macOS 15.4）或更新的 WebKit，升级系统或安装 Safari 更新后重试。",
-            self.missing.join("、")
+            "系统 WebView 缺少 dsh {dsh_version} 前端必需的能力：{}。\n\
+             这个版本的界面需要 Safari 16.4（macOS 13.3）或更新的 WebKit，升级系统或安装 Safari 更新后重试。",
+            self.gaps(compat).join("、")
         );
         if !self.degraded.is_empty() {
             text.push_str(&format!(
                 "\n另外缺少（只影响部分功能）：{}。",
                 self.degraded.join("、")
             ));
+        }
+        if !compat && self.needs_compat() {
+            text.push_str(
+                "\nconfig.json 里关闭了 webkit_compat，上面这些能力本可以由兼容层补上；需要原生窗口就打开它。",
+            );
         }
         if !self.agent.is_empty() {
             text.push_str(&format!("\n当前 WebView：{}", self.agent));
@@ -121,13 +187,16 @@ pub fn record_report(payload: &str) {
 
 /// The reason this WebView cannot host the dsh front end, when the page reported one.
 ///
+/// `compat` is what `config.json` allows: with it off, an engine this shell could patch counts as
+/// unsupported, so the UI moves to the browser instead of loading without its shim.
+///
 /// `None` means "no reason known" — either the report says the WebView is fine or the probe
 /// never arrived (see [`REPORT`]).
-pub fn unsupported_webview() -> Option<WebviewReport> {
+pub fn unsupported_webview(compat: bool) -> Option<WebviewReport> {
     let deadline = Instant::now() + PROBE_WAIT;
     loop {
         if let Some(report) = REPORT.lock().unwrap().as_ref() {
-            return (!report.supported()).then(|| report.clone());
+            return (!report.supported(compat)).then(|| report.clone());
         }
         if Instant::now() >= deadline {
             harness::app_log("WebView 能力探测没有上报，按支持处理");
@@ -137,18 +206,42 @@ pub fn unsupported_webview() -> Option<WebviewReport> {
     }
 }
 
+/// The compat script the Harness window should carry, when the probe found something to install.
+///
+/// `None` on an engine that has everything, and on one whose probe never reported: a diagnostic
+/// that failed must not put a patch into a window.
+pub fn needed_compat_script() -> Option<String> {
+    let report = REPORT.lock().unwrap().clone()?;
+    report
+        .needs_compat()
+        .then(|| compat_script(&report.missing))
+}
+
+/// The last report the splash page sent, for the startup log and the status page.
+pub fn report() -> Option<WebviewReport> {
+    REPORT.lock().unwrap().clone()
+}
+
 /// The script that asks the page what this WebView can run.
 ///
 /// It is injected into the splash window, which is our own page and the only one holding core
 /// capabilities (`capabilities/splash.json`); the Harness window deliberately gets none.
-fn probe_script() -> String {
+pub fn probe_script() -> String {
     let mut checks = String::new();
-    for (list, names) in [("missing", REQUIRED_APIS), ("degraded", OPTIONAL_APIS)] {
-        for name in names {
+    for (list, apis) in [("missing", SHIMMED_APIS), ("degraded", WATCHED_APIS)] {
+        for (name, expression) in apis {
             checks.push_str(&format!(
-                "  try {{ if (typeof {name} === \"undefined\") {list}.push(\"{name}\"); }} catch (error) {{ {list}.push(\"{name}\"); }}\n"
+                "  try {{ if (typeof {expression} === \"undefined\") {list}.push(\"{name}\"); }} catch (error) {{ {list}.push(\"{name}\"); }}\n"
             ));
         }
+    }
+    // Syntax cannot be feature-detected with `typeof`: compiling it is the only question an
+    // engine answers truthfully, and a failed compile is exactly what a client bundle would hit.
+    for (name, source) in REQUIRED_SYNTAX {
+        let source = json!(source);
+        checks.push_str(&format!(
+            "  try {{ new Function({source}); }} catch (error) {{ syntax.push(\"{name}\"); }}\n"
+        ));
     }
     PROBE_TEMPLATE
         .replace("%CHECKS%", &checks)
@@ -162,8 +255,9 @@ const PROBE_TEMPLATE: &str = r#"
 (function () {
   var missing = [];
   var degraded = [];
+  var syntax = [];
 %CHECKS%
-  var payload = { missing: missing, degraded: degraded, agent: navigator.userAgent };
+  var payload = { missing: missing, degraded: degraded, syntax: syntax, agent: navigator.userAgent };
   function report(attempt) {
     try {
       if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) {
@@ -176,6 +270,316 @@ const PROBE_TEMPLATE: &str = r#"
     if (attempt < 40) setTimeout(function () { report(attempt + 1); }, 25);
   }
   report(0);
+})();
+"#;
+
+/// One polyfill per [`SHIMMED_APIS`] entry, selected by what the probe found missing.
+///
+/// Each block is its own IIFE with its own guard, so a block is complete on its own and cannot
+/// collide with another; an engine that gained the API between the probe and the page load is
+/// left untouched.
+const COMPAT_BLOCKS: &[(&str, &str)] = &[
+    ("Iterator", ITERATOR_SHIM),
+    ("Promise.try", PROMISE_TRY_SHIM),
+    ("Promise.withResolvers", PROMISE_WITH_RESOLVERS_SHIM),
+    ("Symbol.dispose", SYMBOL_DISPOSE_SHIM),
+    ("Math.sumPrecise", MATH_SUM_PRECISE_SHIM),
+    ("Uint8Array.fromBase64", UINT8_FROM_BASE64_SHIM),
+    ("Object.hasOwn", OBJECT_HAS_OWN_SHIM),
+    ("findLast", FIND_LAST_SHIM),
+];
+
+/// The compat layer for one report: only the blocks whose API the probe found missing.
+///
+/// ES5 on purpose, like the probe: this is the layer that has to work on the very engines the
+/// probe refused.
+pub fn compat_script(missing: &[String]) -> String {
+    let mut script = String::new();
+    for (name, block) in COMPAT_BLOCKS {
+        if missing.iter().any(|api| api == name) {
+            script.push_str(block);
+            script.push('\n');
+        }
+    }
+    script
+}
+
+/// A module-level pdf.js guard reads `Iterator.prototype.join` while the document-preview bundle
+/// is imported, so the global has to exist before that module is evaluated. `%IteratorPrototype%`
+/// is this engine's own iterator prototype — the object every array, string and map iterator
+/// inherits from — so installing the helpers there makes them work on iterators the page already
+/// creates, which is where the spec puts them anyway.
+const ITERATOR_SHIM: &str = r#"
+(function () {
+  // globalThis is named explicitly: a "var Iterator" in this scope would shadow the global, and
+  // the guard would then answer about the local binding instead of the engine.
+  if (typeof globalThis.Iterator !== "undefined") return;
+  var iteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
+  if (typeof iteratorPrototype[Symbol.iterator] !== "function") {
+    Object.defineProperty(iteratorPrototype, Symbol.iterator, {
+      value: function () { return this; },
+      configurable: true
+    });
+  }
+  var IteratorShim = function () {
+    throw new TypeError("Iterator is abstract: use Iterator.from");
+  };
+  IteratorShim.prototype = iteratorPrototype;
+  try {
+    Object.defineProperty(iteratorPrototype, "constructor", { value: IteratorShim, writable: true, configurable: true });
+  } catch (error) {}
+  IteratorShim.from = function (value) {
+    if (value === null || value === undefined) throw new TypeError("Iterator.from requires an object");
+    if (typeof value.next === "function") return value;
+    var method = value[Symbol.iterator];
+    if (typeof method !== "function") throw new TypeError("value is not iterable");
+    return method.call(value);
+  };
+  globalThis.Iterator = IteratorShim;
+  var defineHelper = function (name, helper) {
+    if (typeof iteratorPrototype[name] === "function") return;
+    Object.defineProperty(iteratorPrototype, name, { value: helper, writable: true, configurable: true });
+  };
+  // A helper result is an iterator like any other: it inherits from %IteratorPrototype%, which is
+  // what makes chaining (and "instanceof Iterator") work, and that prototype is iterable.
+  var wrap = function (next) {
+    var result = Object.create(iteratorPrototype);
+    result.next = next;
+    return result;
+  };
+  defineHelper("map", function (mapper, thisArg) {
+    var source = this, index = 0;
+    return wrap(function () {
+      var step = source.next();
+      if (step.done) return step;
+      return { value: mapper.call(thisArg, step.value, index++), done: false };
+    });
+  });
+  defineHelper("filter", function (predicate, thisArg) {
+    var source = this, index = 0;
+    return wrap(function () {
+      for (;;) {
+        var step = source.next();
+        if (step.done) return step;
+        if (predicate.call(thisArg, step.value, index++)) return { value: step.value, done: false };
+      }
+    });
+  });
+  defineHelper("take", function (limit) {
+    var source = this, left = Number(limit);
+    return wrap(function () {
+      if (!(left > 0)) return { value: undefined, done: true };
+      left -= 1;
+      var step = source.next();
+      if (step.done) left = 0;
+      return step;
+    });
+  });
+  defineHelper("drop", function (limit) {
+    var source = this, left = Number(limit), started = false;
+    return wrap(function () {
+      if (!started) {
+        started = true;
+        while (left > 0) {
+          left -= 1;
+          if (source.next().done) return { value: undefined, done: true };
+        }
+      }
+      return source.next();
+    });
+  });
+  defineHelper("flatMap", function (mapper, thisArg) {
+    var source = this, inner = null, index = 0;
+    return wrap(function () {
+      for (;;) {
+        if (inner !== null) {
+          var innerStep = inner.next();
+          if (!innerStep.done) return { value: innerStep.value, done: false };
+          inner = null;
+        }
+        var step = source.next();
+        if (step.done) return step;
+        inner = mapper.call(thisArg, step.value, index++)[Symbol.iterator]();
+      }
+    });
+  });
+  defineHelper("reduce", function (reducer) {
+    var source = this, index = 0, accumulator, started = arguments.length > 1;
+    if (started) accumulator = arguments[1];
+    for (;;) {
+      var step = source.next();
+      if (step.done) break;
+      if (!started) {
+        accumulator = step.value;
+        started = true;
+        continue;
+      }
+      accumulator = reducer(accumulator, step.value, index);
+      index += 1;
+    }
+    if (!started) throw new TypeError("reduce of an empty iterator with no initial value");
+    return accumulator;
+  });
+  defineHelper("toArray", function () {
+    var source = this, values = [];
+    for (;;) {
+      var step = source.next();
+      if (step.done) return values;
+      values.push(step.value);
+    }
+  });
+  defineHelper("forEach", function (callback, thisArg) {
+    var source = this, index = 0;
+    for (;;) {
+      var step = source.next();
+      if (step.done) return undefined;
+      callback.call(thisArg, step.value, index++);
+    }
+  });
+  defineHelper("some", function (predicate, thisArg) {
+    var source = this, index = 0;
+    for (;;) {
+      var step = source.next();
+      if (step.done) return false;
+      if (predicate.call(thisArg, step.value, index++)) return true;
+    }
+  });
+  defineHelper("every", function (predicate, thisArg) {
+    var source = this, index = 0;
+    for (;;) {
+      var step = source.next();
+      if (step.done) return true;
+      if (!predicate.call(thisArg, step.value, index++)) return false;
+    }
+  });
+  defineHelper("find", function (predicate, thisArg) {
+    var source = this, index = 0;
+    for (;;) {
+      var step = source.next();
+      if (step.done) return undefined;
+      if (predicate.call(thisArg, step.value, index++)) return step.value;
+    }
+  });
+  // Not a standard helper, but the document-preview bundle installs exactly this one, so a shim
+  // that got there first must behave the same: spread the iterator, join the array.
+  defineHelper("join", function (separator) {
+    return this.toArray().join(separator);
+  });
+})();
+"#;
+
+/// `Promise.try` (Safari 18.2): call the function now, settle the promise with what it returned
+/// or threw — the synchronous-throw half is what the PDF stream paths rely on.
+const PROMISE_TRY_SHIM: &str = r#"
+(function () {
+  if (typeof Promise.try === "function") return;
+  Promise.try = function (callback) {
+    var args = Array.prototype.slice.call(arguments, 1);
+    return new Promise(function (resolve) { resolve(callback.apply(undefined, args)); });
+  };
+})();
+"#;
+
+/// `Promise.withResolvers` (Safari 17.4): the deferred this code base builds by hand everywhere.
+const PROMISE_WITH_RESOLVERS_SHIM: &str = r#"
+(function () {
+  if (typeof Promise.withResolvers === "function") return;
+  Promise.withResolvers = function () {
+    var resolve, reject;
+    var promise = new Promise(function (res, rej) { resolve = res; reject = rej; });
+    return { promise: promise, resolve: resolve, reject: reject };
+  };
+})();
+"#;
+
+/// `Symbol.dispose` / `Symbol.asyncDispose` (Safari 18.2): the conversation UI stores these as
+/// property keys, so an absent symbol silently loses the disposal instead of throwing.
+const SYMBOL_DISPOSE_SHIM: &str = r#"
+(function () {
+  if (typeof Symbol.dispose === "undefined") Symbol.dispose = Symbol("Symbol.dispose");
+  if (typeof Symbol.asyncDispose === "undefined") Symbol.asyncDispose = Symbol("Symbol.asyncDispose");
+})();
+"#;
+
+/// `Math.sumPrecise`, which no Safari release ships: the shipped PDF writer calls it, so every
+/// engine — old or new — is missing this one. Neumaier compensated summation is not the spec's
+/// algorithm verbatim, but it is never worse than the naive sum it replaces.
+const MATH_SUM_PRECISE_SHIM: &str = r#"
+(function () {
+  if (typeof Math.sumPrecise === "function") return;
+  Math.sumPrecise = function (values) {
+    var iterator = values[Symbol.iterator](), sum = 0, correction = 0, step;
+    for (;;) {
+      step = iterator.next();
+      if (step.done) break;
+      var value = Number(step.value);
+      var next = sum + value;
+      correction += Math.abs(sum) >= Math.abs(value) ? (sum - next) + value : (value - next) + sum;
+      sum = next;
+    }
+    return sum + correction;
+  };
+})();
+"#;
+
+/// `Uint8Array.fromBase64` (Safari 18.2): `atob` plus bytes, with the url-safe alphabet accepted
+/// because the one call site in the shipped bundles decides the alphabet and does not say.
+const UINT8_FROM_BASE64_SHIM: &str = r#"
+(function () {
+  if (typeof Uint8Array.fromBase64 === "function") return;
+  Uint8Array.fromBase64 = function (value) {
+    var normalized = String(value).replace(/s/g, "").replace(/-/g, "+").replace(/_/g, "/");
+    var binary = atob(normalized);
+    var bytes = new Uint8Array(binary.length);
+    for (var index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index) & 255;
+    }
+    return bytes;
+  };
+})();
+"#;
+
+/// `Object.hasOwn` (Safari 15.4).
+const OBJECT_HAS_OWN_SHIM: &str = r#"
+(function () {
+  if (typeof Object.hasOwn === "function") return;
+  Object.hasOwn = function (object, property) {
+    if (object === null || object === undefined) throw new TypeError("Object.hasOwn requires an object");
+    return Object.prototype.hasOwnProperty.call(Object(object), property);
+  };
+})();
+"#;
+
+/// `Array.prototype.findLast` / `findLastIndex` (Safari 15.4).
+const FIND_LAST_SHIM: &str = r#"
+(function () {
+  if (typeof [].findLast !== "function") {
+    Object.defineProperty(Array.prototype, "findLast", {
+      value: function (predicate, thisArg) {
+        if (this === null || this === undefined) throw new TypeError("findLast requires an array");
+        for (var index = this.length - 1; index >= 0; index -= 1) {
+          var value = this[index];
+          if (predicate.call(thisArg, value, index, this)) return value;
+        }
+        return undefined;
+      },
+      writable: true,
+      configurable: true
+    });
+  }
+  if (typeof [].findLastIndex !== "function") {
+    Object.defineProperty(Array.prototype, "findLastIndex", {
+      value: function (predicate, thisArg) {
+        if (this === null || this === undefined) throw new TypeError("findLastIndex requires an array");
+        for (var index = this.length - 1; index >= 0; index -= 1) {
+          if (predicate.call(thisArg, this[index], index, this)) return index;
+        }
+        return -1;
+      },
+      writable: true,
+      configurable: true
+    });
+  }
 })();
 "#;
 
@@ -350,7 +754,16 @@ struct LoadSignals {
 
 /// The Harness page is remote content: it gets no capability, and navigation is fenced
 /// to the current loopback authority. Everything else opens in the system browser.
-pub fn create_harness(app: &AppHandle, url: &Url, port: u16) -> tauri::Result<()> {
+///
+/// `compat` is the legacy-WebKit shim from [`needed_compat_script`], when this engine needs it.
+/// It is injected by the shell into the webview rather than by the page, so the remote document
+/// still receives nothing it could call back with.
+pub fn create_harness(
+    app: &AppHandle,
+    url: &Url,
+    port: u16,
+    compat: Option<&str>,
+) -> tauri::Result<()> {
     // `destroy` rather than `close`: close fires the window listeners (and the Harness window
     // ends the app on a user close), which must stay a user-only signal.
     if let Some(existing) = app.get_webview_window(HARNESS) {
@@ -360,7 +773,7 @@ pub fn create_harness(app: &AppHandle, url: &Url, port: u16) -> tauri::Result<()
     // all, which is what the retry thread below watches for.
     let signals = Arc::new(LoadSignals::default());
     let load_signals = signals.clone();
-    let window = WebviewWindowBuilder::new(app, HARNESS, WebviewUrl::External(url.clone()))
+    let mut builder = WebviewWindowBuilder::new(app, HARNESS, WebviewUrl::External(url.clone()))
         .title("DeepSeek Harness")
         .inner_size(1440.0, 960.0)
         .min_inner_size(900.0, 600.0)
@@ -412,8 +825,11 @@ pub fn create_harness(app: &AppHandle, url: &Url, port: u16) -> tauri::Result<()
                 _ => {}
             }
             true
-        })
-        .build()?;
+        });
+    if let Some(script) = compat {
+        builder = builder.initialization_script(script);
+    }
+    let window = builder.build()?;
 
     // A first navigation that never renders used to leave a blank window with nothing in the
     // log. The token URL is safe to revisit (measured: it is not single-use), so retry it.
@@ -654,35 +1070,72 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_required_api_makes_the_webview_unsupported() {
+    fn a_shimmable_gap_is_covered_instead_of_forced_to_the_browser() {
         let report = WebviewReport::parse(
-            r#"{"missing":["Iterator"],"degraded":["Math.sumPrecise"],"agent":"Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15"}"#,
+            r#"{"missing":["Iterator"],"degraded":["structuredClone"],"syntax":[],"agent":"Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15"}"#,
         )
         .expect("the page's report must parse");
 
-        assert!(!report.supported());
-        let text = report.describe("0.1.5-rc.2");
+        // macOS 15.0.1 (Safari 18.0): the one API the pdf.js guard needs, nothing else.
+        assert!(
+            report.supported(true),
+            "a shimmable API must not block the native window"
+        );
+        assert!(report.needs_compat());
+        assert!(report.uncovered().is_empty());
+
+        // The same engine with the compat layer switched off is the old shell: browser fallback.
+        assert!(
+            !report.supported(false),
+            "webkit_compat=false restores the old gate"
+        );
+        assert_eq!(report.gaps(false), ["Iterator"]);
+
+        let text = report.describe("0.1.5-rc.2", false);
         assert!(text.contains("Iterator"), "缺什么要写清楚：{text}");
         assert!(text.contains("0.1.5-rc.2"), "是哪个 dsh 版本要写清楚");
-        // The user has to be told what to do about it — that is what the opaque plugin error
-        // this replaces never did.
-        assert!(text.contains("Safari 18.4"), "补救方向要写清楚：{text}");
-        assert!(text.contains("Math.sumPrecise"), "降级项也要列出来");
+        // The floor dropped from Safari 18.4 to the syntax the bundles need.
+        assert!(text.contains("Safari 16.4"), "补救方向要写清楚：{text}");
+        assert!(
+            text.contains("webkit_compat"),
+            "是开关关掉的，要说清楚：{text}"
+        );
+        assert!(text.contains("structuredClone"), "降级项也要列出来");
         assert!(text.contains("AppleWebKit"), "报上当前 WebView 便于排查");
     }
 
     #[test]
-    fn the_browser_fallback_tells_the_user_what_to_keep_open() {
-        let report =
-            WebviewReport::parse(r#"{"missing":["Iterator"],"degraded":[],"agent":"old"}"#)
-                .expect("the page's report must parse");
+    fn syntax_no_polyfill_can_add_still_sends_the_user_to_the_browser() {
+        // macOS ≤ 12: the bundles use class static blocks, and no script makes that parse.
+        let report = WebviewReport::parse(
+            r#"{"missing":["Iterator"],"syntax":["class static block"],"agent":"old"}"#,
+        )
+        .expect("the page's report must parse");
 
-        let text = report.browser_fallback_detail("0.1.5-rc.2", "http://127.0.0.1:3080/?token=t");
+        assert!(!report.supported(true), "语法缺口补不了，只能回退浏览器");
+        assert!(report.needs_compat(), "缺的 API 仍然可补");
+        assert_eq!(report.gaps(true), ["class static block"]);
+        assert!(report
+            .describe("0.1.5-rc.2", true)
+            .contains("class static block"));
+    }
+
+    #[test]
+    fn the_browser_fallback_tells_the_user_what_to_keep_open() {
+        let report = WebviewReport::parse(
+            r#"{"missing":["Iterator"],"syntax":["class static block"],"agent":"old"}"#,
+        )
+        .expect("the page's report must parse");
+
+        let text =
+            report.browser_fallback_detail("0.1.5-rc.2", "http://127.0.0.1:3080/?token=t", true);
         assert!(
             text.contains("http://127.0.0.1:3080/?token=t"),
             "给出地址：{text}"
         );
-        assert!(text.contains("Iterator"), "说明原因");
+        // The reason is the syntax gap, not Iterator: with the compat layer on, Iterator is the
+        // one thing this page did *not* fail on.
+        assert!(text.contains("class static block"), "说明原因：{text}");
         assert!(
             text.contains("不要关闭"),
             "关掉这个窗口会停 harness，必须写明：{text}"
@@ -692,11 +1145,16 @@ mod tests {
     #[test]
     fn a_degraded_but_complete_webview_still_starts() {
         let report =
-            WebviewReport::parse(r#"{"missing":[],"degraded":["Math.sumPrecise"],"agent":"x"}"#)
+            WebviewReport::parse(r#"{"missing":[],"degraded":["structuredClone"],"agent":"x"}"#)
                 .expect("the page's report must parse");
         assert!(
-            report.supported(),
+            report.supported(true),
             "a missing optional API must never block the GUI"
+        );
+        assert!(report.supported(false));
+        assert!(
+            !report.needs_compat(),
+            "nothing to install, no window script"
         );
     }
 
@@ -705,40 +1163,55 @@ mod tests {
         assert_eq!(WebviewReport::parse("not json"), None);
         // An empty report is a WebView that found nothing missing: supported.
         assert_eq!(
-            WebviewReport::parse("{}").map(|report| report.supported()),
+            WebviewReport::parse("{}").map(|report| report.supported(true)),
             Some(true)
         );
     }
 
-    /// One test owns the process-wide report slot on purpose: `record_report` overwrites it,
-    /// and every assertion here depends on what was reported last.
+    /// One test owns the process-wide report slot on purpose: `record_report` overwrites it, and
+    /// every assertion here depends on what was reported last.
     #[test]
     fn the_gate_reads_what_the_page_reported() {
-        record_report(r#"{"missing":["Iterator"],"degraded":[],"agent":"old"}"#);
-        let refused = unsupported_webview().expect("a missing Iterator must be refused");
+        record_report(r#"{"missing":["Iterator"],"degraded":[],"syntax":[],"agent":"old"}"#);
+        assert!(
+            unsupported_webview(true).is_none(),
+            "a shimmable gap keeps the native window"
+        );
+        let refused = unsupported_webview(false).expect("with compat off it must be refused");
         assert_eq!(refused.missing, ["Iterator"]);
+        let script = needed_compat_script().expect("Iterator needs a shim");
+        assert!(script.contains("globalThis.Iterator"), "{script}");
 
         // A payload this shell cannot read keeps the previous answer (logged, not fatal).
         record_report("not json");
         assert!(
-            unsupported_webview().is_some(),
+            unsupported_webview(false).is_some(),
             "a broken report must not clear a refusal"
         );
 
         // A complete WebView starts, however many optional APIs are missing.
-        record_report(r#"{"missing":[],"degraded":["Math.sumPrecise"],"agent":"new"}"#);
+        record_report(r#"{"missing":[],"degraded":["structuredClone"],"agent":"new"}"#);
         assert!(
-            unsupported_webview().is_none(),
+            unsupported_webview(false).is_none(),
             "a complete WebView must start"
+        );
+        assert!(
+            needed_compat_script().is_none(),
+            "nothing missing, nothing injected"
         );
     }
 
     #[test]
-    fn the_probe_asks_about_the_api_that_broke_the_ui() {
+    fn the_probe_asks_about_every_shimmed_api_and_the_syntax_floor() {
         let script = probe_script();
-        // The one that actually failed in the field (see REQUIRED_APIS).
+        // The one that actually failed in the field (see SHIMMED_APIS).
         assert!(script.contains("typeof Iterator === \"undefined\""));
+        // Prototype methods are not globals: the check names the expression it asks about.
+        assert!(script.contains("typeof [].findLast === \"undefined\""));
         assert!(script.contains("Math.sumPrecise"));
+        // Syntax is compiled, not probed with typeof.
+        assert!(script.contains("new Function(\"class Probe { static { 1; } }\")"));
+        assert!(script.contains("syntax.push(\"class static block\")"));
         // It reports through the splash window's core capability.
         assert!(script.contains(PROBE_EVENT));
         assert!(script.contains("plugin:event|emit"));
@@ -746,6 +1219,59 @@ mod tests {
         assert!(!script.contains("=>"), "the probe must stay ES5");
         assert!(!script.contains('`'), "the probe must stay ES5");
         assert!(!script.contains("??"), "the probe must stay ES5");
+    }
+
+    #[test]
+    fn every_shimmed_api_has_a_block_and_only_the_missing_ones_are_emitted() {
+        let names: Vec<String> = SHIMMED_APIS
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        for (name, _) in SHIMMED_APIS {
+            assert!(
+                COMPAT_BLOCKS.iter().any(|(block, _)| block == name),
+                "{name} has no compat block"
+            );
+        }
+        let all = compat_script(&names);
+        for (name, block) in COMPAT_BLOCKS {
+            assert!(
+                all.contains(block),
+                "{name} block missing from the full script"
+            );
+        }
+        // Only what the report asked for reaches the window.
+        let one = compat_script(&["Iterator".to_string()]);
+        assert!(one.contains(ITERATOR_SHIM));
+        assert!(!one.contains(PROMISE_TRY_SHIM), "{one}");
+        assert!(!one.contains(MATH_SUM_PRECISE_SHIM), "{one}");
+        assert!(
+            compat_script(&[]).is_empty(),
+            "nothing missing, nothing injected"
+        );
+    }
+
+    #[test]
+    fn the_compat_layer_stays_es5_and_guards_every_block() {
+        let names: Vec<String> = SHIMMED_APIS
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        let all = compat_script(&names);
+        for (name, block) in COMPAT_BLOCKS {
+            assert!(
+                block.contains("(function () {"),
+                "{name} is not its own scope"
+            );
+            assert!(block.contains("typeof "), "{name} installs without asking");
+        }
+        // Same discipline as the probe: the engines that need this are exactly the old ones.
+        for syntax in ["=>", "`", "??", "const ", "let ", "function*", "class "] {
+            assert!(
+                !all.contains(syntax),
+                "the compat layer must stay ES5, found {syntax:?}"
+            );
+        }
     }
 
     #[test]

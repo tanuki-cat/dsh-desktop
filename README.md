@@ -10,10 +10,15 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 > `.github/workflows/release.yml` 在打 tag 时产出，见[发布](#发布github-actions)与
 > [自带运行时](#自带运行时已并入-main)。
 >
-> **macOS 的 WebView 下限**：dsh 的前端需要 **Safari 18.4（macOS 15.4）或更新的 WebKit** —— 随包的
-> document-preview 插件在更旧的引擎上会在加载期抛 `Can't find variable: Iterator`。壳会在打开界面前
-> 探测 WebView：**不满足就改用默认浏览器打开界面**（就是 `dsh web` 一直在用的那条路，浏览器有独立的
-> JS 引擎、会持续更新），并在状态窗口里写清原因 —— 不会再把用户丢给 harness 那句 `Failed to load plugins`。
+> **macOS 的 WebView 下限**：dsh 的前端在更旧的引擎上会在加载期抛 `Can't find variable: Iterator`
+> （随包 document-preview 插件里 pdf.js 的模块级补丁先读方法、后判全局）。壳会在打开界面前探测缺失的
+> 能力，**能补的自己补上**（`Iterator`、`Promise.try`、`Promise.withResolvers`、`Symbol.dispose`、
+> `Math.sumPrecise`、`Uint8Array.fromBase64`、`Object.hasOwn`、`findLast`），于是 **Safari 16.4
+> （macOS 13.3）以上都可以用原生窗口**；只有缺 `class static block` 这类补不了的语法（macOS ≤ 12）
+> 才**改用默认浏览器打开界面**（就是 `dsh web` 一直在用的那条路，浏览器有独立的 JS 引擎、会持续更新），
+> 并在状态窗口里写清原因 —— 不会再把用户丢给 harness 那句 `Failed to load plugins`。
+> 其中 `Math.sumPrecise` 是**所有** Safari 都没有的 API（随包 PDF 写路径一直因此抛错），所以现代系统上
+> 也会注入这一小块。
 > `minimumSystemVersion` 仍是 11.0：那只约束安装与进程启动，界面另有这道运行时判定（见[已知坑](#已知坑)）。
 >
 > **分支策略**：自带运行时开发用的 `feat/bundled-runtime` 已合并回 `main`（2026-09-13），
@@ -64,7 +69,7 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
   `plugin update available: dshmarket 1.45.1 -> 1.46.1, installing`、`plugin updated: dshmarket 1.45.1 -> 1.46.1`，
   随后 harness 重启并正常服务；profile 的依赖范围被改写为 `^1.46.1`、`node_modules` 内实装 1.46.1，
   且 `plugin-check.json` 与核心的 `update-check.json` 各自独立（时间戳与内容互不影响）。
-- 离线测试：`cargo test` **88 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
+- 离线测试：`cargo test` **91 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
   缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口与跨窗口都不重复安装"、npm PATH 前缀、沉默对端探针超时、
   package.json 版本解析、部分/损坏 config.json 处理、workspace / dsh_path 回退不改文件、HOME 缺失不回落 `/`、
@@ -74,7 +79,15 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
   日志运行中轮转与备份份数、日志句柄共享、计数器不提前轮转、spawn 路径校验点名、
   下载重名避让、URL 解析兜底、CLI 版本区间判定、Harness 退出后的恢复策略矩阵
   （干净退出给长交接等待 / 崩溃给短等待、连续自动重启预算与"健康运行后计数归零"、退出码与信号的人话文案、
-  状态页按钮与壳监听的事件名一致）；
+  状态页按钮与壳监听的事件名一致、兼容层的判定矩阵与逐块选择 / 探针的语法探测 / 兼容层 ES5 纪律）；
+- 兼容层在真实 JS 引擎里跑通（2026-09-15）：`webkit_compat_shim` 集成测试把清单里的 8 个 API 先删掉
+  （`Symbol.dispose` 在 node 里不可删、已在测试里注明），注入后用断言跑行为 —— pdf.js 那条
+  `Iterator.prototype.join` guard 不再抛、`Iterator.from(...).map(...).filter(...).toArray()` 链式可用、
+  `instanceof Iterator` 不抛、`Promise.try`（含同步抛→reject）、`Promise.withResolvers`、
+  `Math.sumPrecise`、`Uint8Array.fromBase64`、`Object.hasOwn`、`findLast` 全部通过，重复注入是 no-op；
+  同一文件里还有一条在 node 里跑**探针本体**的用例（删掉 `Iterator`/`Promise.try` 后断言 `missing` 里
+  有它们、`syntax` 为空、事件名与壳的常量一致）。
+  **旧 macOS 真机（issue #1 的 15.0.1）仍待报告者验证**；
   合并自带运行时后另有：运行时决策矩阵与能力门槛、
   影子前缀与版本仲裁、`Origin::Env` 不算自带、播种与首启超时、更新后切树回读、
   插件市场 profile 判定与插件缓存隔离）。
@@ -106,7 +119,7 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 | `make doctor` | 检查工具链与平台依赖 | Linux 用 `pkg-config` 查 `webkit2gtk-4.1` / `gtk+-3.0` / `libsoup-3.0` 并给出 Debian/Fedora/Arch 安装命令；macOS 提示装 Xcode CLT |
 | `make check` | `cargo check --all-targets` | 与 CI 口径一致 |
 | `make fmt` / `make fmt-check` / `make clippy` | 格式化 / 只检查格式（CI 门禁用，不改工作区）/ lint（`clippy -D warnings`） | |
-| `make test` | 离线单元测试（当前 **77** 个） | 不联网 |
+| `make test` | 离线单元测试（当前 **91** 个）＋ 在真实 JS 引擎里跑兼容层的集成测试 | 不联网；只有兼容层那个集成测试需要 PATH 上有 `node`（没有就跳过） |
 | `make test-live` | 联网集成测试（全部） | 自动设 `DSH_DESKTOP_LIVE_TESTS=1`：查真实 registry、对比冷/热缓存耗时，并在「PATH 里没有 node」的模拟 GUI 环境下验证 npm 仍可运行 |
 | `make dev` | 运行 debug 版 | 等价 `cargo run --manifest-path src-tauri/Cargo.toml` |
 | `make build` | 编译 release 可执行文件 | 产物 `src-tauri/target/release/dsh-desktop` |
@@ -134,13 +147,16 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - Linux 首次构建前请先 `make doctor` 装齐系统依赖；即便将来采用自带 Node/dsh 的发行方式，
   **WebKitGTK 仍来自系统**（见后续实施计划）。
 - `make test-live` 与首次 `make bundle` 需要网络（查 registry / 拉 Tauri CLI）。
-- **旧 macOS 的界面会加载失败**（`Failed to load plugins` / `Can't find variable: Iterator`）：随包的
+- **旧 WebView 上的界面**（`Failed to load plugins` / `Can't find variable: Iterator`）：随包的
   `dsh-client-ui-sidebar-documentpreview` 内联 pdfjs，其中给 `Iterator.prototype.join` 打补丁的那行
-  没有先判断全局 `Iterator` 是否存在，而该全局是 **Safari 18.4** 才有的（macOS ≤ 12 拿不到，13/14 需要装
-  Safari 18.4 更新）。壳现在会在启动阶段探测：**旧系统自动改用默认浏览器打开界面**（`window.rs::WebviewReport`
-  + `lib.rs::hand_the_gui_to_the_browser`），状态窗口里保留 harness 的管理职责（更新、退出清理），
-  关掉它就停 harness。彻底修法仍在上游的插件包里。Intel 机器更容易停在旧系统，所以这个现象看着像
-  「macos-x64 专属」。
+  先读方法、后判全局，而 `Iterator` 全局是 **Safari 18.4** 才有的（macOS ≤ 12 拿不到，13/14 需要装
+  Safari 18.4 更新）。壳现在在打开界面前探测缺失的能力：**可补的在 harness 窗口里注入兼容层**
+  （ES5、逐块自守卫、只装缺的那些，见 `window.rs::compat_script`），于是 Safari 16.4（macOS 13.3）以上
+  都能用原生窗口；**补不了的**（目前只有 `class static block` 语法）才改用默认浏览器打开界面
+  （`window.rs::WebviewReport` + `lib.rs::hand_the_gui_to_the_browser`），状态窗口里保留 harness 的
+  管理职责（更新、退出清理），关掉它就停 harness。兼容层可用 `"webkit_compat": false` 关掉，关掉后
+  行为等同旧版（缺任何能力都走浏览器）。彻底修法仍在上游的插件包里（那行 guard 加个全局判断）。
+  Intel 机器更容易停在旧系统，所以这个现象看着像「macos-x64 专属」。
 
 ### 自带运行时（已并入 main）
 
@@ -178,10 +194,13 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - 探测短路：`runtime: bundled` 或两个 `DSH_DESKTOP_*` 都已指定时，跳过系统运行时探测（省掉一次登录 shell + 最长 5 秒的探测）；
 - 首启超时：判定发生在播种**之前**，所以带模板播种的首启仍然是 90 秒预算；播种失败不会留下半棵 profile（先写 `.tmp` 再改名）；
 - 想看效果：`DSH_DESKTOP_RUNTIME_PREFERENCE=bundled|system|auto` 可覆盖 `config.json` 的 `runtime`；
-- **WebView 能力探测**：splash 页面（我们自己的页面，唯一持有 core 权限的窗口）在加载时探测 `Iterator`
-  等 API 并上报，壳在打开 harness 窗口**之前**判定 —— 不满足就显示写明「缺什么 + 需要 Safari 18.4」的
-  失败页并记日志（`window.rs::WebviewReport`、`lib.rs::refuse_an_old_webview`）；探测没上报时按支持处理，
-  不会因为诊断本身出问题而把人挡在门外。
+- **WebView 能力探测与兼容层**：splash 页面（我们自己的页面，唯一持有 core 权限的窗口）在加载时探测
+  「可补的 API」清单（`Iterator`、`Promise.try`、`Promise.withResolvers`、`Symbol.dispose`、
+  `Math.sumPrecise`、`Uint8Array.fromBase64`、`Object.hasOwn`、`findLast`）、只上报不处理的降级项
+  （`structuredClone`），以及用 `new Function` 编译 `class static block` 的语法判定，然后上报；壳在打开
+  harness 窗口**之前**判定 —— 可补的注入兼容层（`initialization_script`，harness 窗口仍然零 capability），
+  补不了的显示写明「缺什么 + 需要 Safari 16.4」的失败页并改用默认浏览器（`window.rs::WebviewReport`、
+  `lib.rs::hand_the_gui_to_the_browser`）；探测没上报时按支持处理，不会因为诊断本身出问题而把人挡在门外。
 
 **Windows 免安装包已实机验证通过**（2026-09-13：解压到 `D:\dsh` 双击即启动，自带 node + dsh 拉起 Web GUI，
 插件市场与会话内工具调用正常）。
@@ -223,6 +242,7 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 | `update_check_interval_minutes` | `60` | 一次成功的查询结果缓存多久（0 = 每次启动都查）。查询实测约 1.2–1.9 s，缓存命中 0 ms |
 | `import_shell_env` | `true` | 启动时导入登录 shell 的环境变量（见下节）。`false` 则只用 App 自身环境 |
 | `require_tested_dsh` | `false` | CLI 版本落在已测试区间外时是否拒绝启动。默认只告警并继续（状态页标注「未测试版本」） |
+| `webkit_compat` | `true` | 旧 WebView 上注入兼容层（`Iterator` 等，见[已知坑](#已知坑)），让 macOS 13.3+ 用原生窗口。`false` 恢复旧行为：缺任何能力都改用默认浏览器 |
 | `runtime` | `"auto"` | 运行时来源：`auto` 用系统已装的（通过门槛时），否则用自带；`bundled` 强制自带；`system` 保持旧行为（开发用） |
 | `env` | `{}` | 显式追加/覆盖传给 harness 的环境变量，优先级最高，如 `{"DEEPSEEK_API_KEY": "sk-…"}` |
 
@@ -260,6 +280,8 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | 端口上是**别人**启动的 Harness（CLI / Automator） | **接管**：401 特征确认身份 → 对该 PID 发 SIGTERM → 等端口释放 → 自启拿新 token |
 | 启动前发现新版 dsh | 先升级 CLI（splash 显示进度），随后重启实例跑新版本 |
 | 启动前发现新版插件市场 | 先停实例 → `dsh plugin --profile web add dshmarket@<版本>` → 重启实例（`auto_update_plugins: false` 可关） |
+| WebView 缺可补的 API（如 `Iterator`） | 向 harness 窗口注入兼容层（ES5、逐块自守卫、只装缺的那些）后照常开原生窗口，日志记 `WebView 缺少 …：已注入兼容层`；`webkit_compat: false` 时改成"未注入"并走浏览器 |
+| WebView 缺补不了的能力（目前只有 `class static block` 语法） | 不打开 harness 窗口：改用默认浏览器 + 状态窗口写明缺什么、界面需要 Safari 16.4 及以上 |
 | 端口被别的程序占用 | 错误页，提示改 `config.json` 的端口 |
 | `take_over_existing: false` 且是外部 Harness | 不接管：用系统浏览器打开并给出说明 |
 | 关闭窗口（红点 / ⌘W） | `AppHandle::exit(0)` → `RunEvent::ExitRequested` → SIGTERM 进程组 → 删状态文件 |

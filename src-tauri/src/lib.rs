@@ -103,6 +103,12 @@ pub struct Config {
     /// (`package.json` + lockfile), which is why it has its own switch next to `auto_update`.
     #[serde(default = "default_auto_update")]
     pub auto_update_plugins: bool,
+    /// Install the legacy-WebKit compat layer when the probe finds APIs the dsh front end needs
+    /// and this engine lacks (see `window::compat_script`). On by default: without it those
+    /// machines get the system browser instead of the native window. Off restores exactly that
+    /// older behaviour, which is the switch to reach for when a compat shim itself misbehaves.
+    #[serde(default = "default_webkit_compat")]
+    pub webkit_compat: bool,
 }
 
 fn default_port() -> u16 {
@@ -224,6 +230,10 @@ fn default_auto_update() -> bool {
     true
 }
 
+fn default_webkit_compat() -> bool {
+    true
+}
+
 fn default_update_interval() -> u64 {
     60
 }
@@ -264,6 +274,7 @@ impl Config {
             runtime: runtime::Preference::Auto,
             system_updates: runtime::SystemUpdates::Install,
             auto_update_plugins: true,
+            webkit_compat: true,
         };
         // The same repair a loaded file gets, so the value seeded here is already usable
         // (a `HOME` that is relative or gone would otherwise become the workspace).
@@ -1854,7 +1865,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                 // cookie is still valid for this authority (verified across restarts), so reuse
                 // it as-is instead of restarting it.
                 Some(pid) if !just_updated => {
-                    if window::unsupported_webview().is_some() {
+                    if window::unsupported_webview(config.webkit_compat).is_some() {
                         // A browser needs an authenticated URL, and the session token is per
                         // launch: the reused instance's cookie lives in this WebView, which is
                         // exactly the thing that cannot render the UI. Restart it instead — the
@@ -1876,7 +1887,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                         // Adopted, but still ours: quitting must stop it rather than leave an
                         // orphan.
                         adopt(pid, data_dir);
-                        return window::create_harness(app, &url, port).map_err(|e| e.to_string());
+                        let compat = harness_compat(&config);
+                        return window::create_harness(app, &url, port, compat.as_deref())
+                            .map_err(|e| e.to_string());
                     }
                 }
                 // Our own instance that a fresh update just made obsolete: it is our child, so
@@ -1949,13 +1962,22 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     if EXITING.load(Ordering::SeqCst) {
         return Ok(());
     }
+    // The compat layer this engine needs, when the shell is allowed to install it. Decided
+    // before the spawn so the status line says it, and logged before the window opens: a feature
+    // that misbehaves under a shim should be traceable to it.
+    let compat = harness_compat(&config);
     window::set_status(
         app,
         "正在启动 Harness…",
         &format!(
-            "dsh {version}{} · 端口 {port}",
+            "dsh {version}{} · 端口 {port}{}",
             if untested {
                 "（未测试版本）"
+            } else {
+                ""
+            },
+            if compat.is_some() {
+                " · 兼容层"
             } else {
                 ""
             }
@@ -2006,10 +2028,21 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         },
     );
 
-    if hand_the_gui_to_the_browser(app, &url, &version) {
+    if hand_the_gui_to_the_browser(app, &url, &version, config.webkit_compat) {
         return Ok(());
     }
-    if let Err(error) = window::create_harness(app, &url, actual_port) {
+    if let Some(report) = window::report().filter(|report| report.needs_compat()) {
+        harness::app_log(&format!(
+            "WebView 缺少 {}：{}",
+            report.missing.join("、"),
+            if compat.is_some() {
+                "已注入兼容层"
+            } else {
+                "webkit_compat=false，未注入兼容层"
+            }
+        ));
+    }
+    if let Err(error) = window::create_harness(app, &url, actual_port, compat.as_deref()) {
         return abort_start(pid, error.to_string());
     }
 
@@ -2039,22 +2072,38 @@ fn fail(app: &AppHandle, status: &str, detail: &str) {
 /// The splash page probes for this at load (see [`window::WebviewReport`]); the answer is
 /// normally there long before the Harness is up. A missing answer counts as supported, so a
 /// lost diagnostic can never lock the user out of a working GUI.
-fn hand_the_gui_to_the_browser(app: &AppHandle, url: &url::Url, version: &str) -> bool {
-    let Some(report) = window::unsupported_webview() else {
+///
+/// `compat` is what `config.json` allows: with it off, an engine the compat layer could patch is
+/// treated as unsupported, so the UI goes to the browser instead of into a window without its shim.
+fn hand_the_gui_to_the_browser(
+    app: &AppHandle,
+    url: &url::Url,
+    version: &str,
+    compat: bool,
+) -> bool {
+    let Some(report) = window::unsupported_webview(compat) else {
         return false;
     };
     harness::app_log(&format!(
         "WebView 缺少 dsh 前端必需的能力（{}），改用默认浏览器打开 {url}",
-        report.missing.join("、")
+        report.gaps(compat).join("、")
     ));
     window::open_external(url.as_str());
     // Notice, not failure: the Harness is alive and stays supervised here, so no restart button.
     window::show_notice(
         app,
         "系统 WebView 太旧，界面已改在浏览器中打开",
-        &report.browser_fallback_detail(version, url.as_str()),
+        &report.browser_fallback_detail(version, url.as_str(), compat),
     );
     true
+}
+
+/// The compat script the Harness window may carry, when the shell is allowed to install it.
+fn harness_compat(config: &Config) -> Option<String> {
+    config
+        .webkit_compat
+        .then(window::needed_compat_script)
+        .flatten()
 }
 
 #[cfg(test)]
