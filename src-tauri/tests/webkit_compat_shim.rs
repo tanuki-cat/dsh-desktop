@@ -31,6 +31,35 @@ fn stripped_paths() -> Vec<String> {
         .collect()
 }
 
+/// The splash page's own head scripts, in order.
+///
+/// The probe no longer decides the syntax question itself: the page carries a CSP, and the eval it
+/// would need is exactly what `script-src` forbids. The page answers instead, and the probe waits
+/// for that answer. A driver that only runs the probe therefore models a page that never reported —
+/// which is why these scripts are fed to it: together they are the contract under test.
+///
+/// Scripts that touch `document` are skipped: those belong to the status page in the body, and the
+/// syntax verdict is settled in the head before any of them run.
+fn page_head_scripts() -> String {
+    let page = include_str!("../../src/index.html");
+    let mut scripts = String::new();
+    for block in page.split("<script>").skip(1) {
+        let Some(body) = block.split("</script>").next() else {
+            continue;
+        };
+        if body.contains("document.") {
+            continue;
+        }
+        scripts.push_str(body);
+        scripts.push('\n');
+    }
+    assert!(
+        scripts.contains("__dshSyntaxMissing"),
+        "the page head must establish the syntax verdict"
+    );
+    scripts
+}
+
 /// Runs one generated script through a node driver, returning its stdout.
 fn run_in_node(name: &str, driver: &str, script: &str, extra_arg: Option<&str>) -> String {
     let Some(node) = path_lookup("node") else {
@@ -42,14 +71,17 @@ fn run_in_node(name: &str, driver: &str, script: &str, extra_arg: Option<&str>) 
     std::fs::create_dir_all(&dir).expect("temp dir must be creatable");
     let script_path = dir.join("script.js");
     let driver_path = dir.join("driver.js");
+    let page_path = dir.join("page.js");
     std::fs::write(&script_path, script).expect("generated script must be writable");
     std::fs::write(&driver_path, driver).expect("driver must be writable");
+    std::fs::write(&page_path, page_head_scripts()).expect("page scripts must be writable");
 
     let mut command = Command::new(&node);
     command.arg(&driver_path).arg(&script_path);
     if let Some(arg) = extra_arg {
         command.arg(arg);
     }
+    command.arg(&page_path);
     let output = command.output().expect("node must be spawnable");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -61,14 +93,18 @@ fn run_in_node(name: &str, driver: &str, script: &str, extra_arg: Option<&str>) 
     stdout
 }
 
-/// A probe run stands in for the splash page: `window.__TAURI_INTERNALS__` captures the report.
+/// A probe run stands in for the splash page: the page's head scripts run first (they produce the
+/// syntax verdict the probe waits for), and `window.__TAURI_INTERNALS__` captures the report.
 const PROBE_DRIVER: &str = r#"
 const assert = require("assert");
 const fs = require("fs");
 const vm = require("vm");
 
 let captured = null;
-globalThis.window = globalThis.window || {};
+// In a browser `window` IS the global object, and the page scripts rely on that: they assign
+// `window.__dshSyntaxMissing` and the probe reads it back through the same name. Modelling it as
+// a separate object would test a page shape that never ships.
+globalThis.window = globalThis;
 globalThis.window.__TAURI_INTERNALS__ = {
   invoke: function (command, args) { captured = { command: command, args: args }; }
 };
@@ -83,9 +119,16 @@ try {
 delete globalThis.Iterator;
 delete globalThis.Promise.try;
 
+// The splash page head, exactly as it ships: this is what tells the probe the syntax verdict.
+vm.runInThisContext(fs.readFileSync(process.argv[4], "utf8"), { filename: "page.js" });
+assert.ok(
+  Array.isArray(globalThis.__dshSyntaxMissing),
+  "the page must establish the syntax verdict the probe waits for"
+);
+
 vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"), { filename: "probe.js" });
 
-assert.ok(captured !== null, "the probe must report without retrying");
+assert.ok(captured !== null, "the probe must report once the page has answered");
 assert.strictEqual(captured.command, "plugin:event|emit");
 assert.strictEqual(captured.args.event, process.argv[3]);
 const payload = captured.args.payload;

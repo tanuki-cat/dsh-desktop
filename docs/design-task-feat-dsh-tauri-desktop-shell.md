@@ -56,6 +56,12 @@
   ⇒ **其它进程启动的实例，外部无法恢复其 token**，只能用它自己打印的那条 URL。
 - 无 cookie 探测的特征响应（**实测**）：`401` + body `dsh web authentication required; reopen the URL printed by dsh web.` —— 可作为"端口上是否是 harness"的无副作用探针。
 
+> **2026-09-15 修正（判据收紧）**：上面这条探针此后被实现成「`401` **或** 任意 `200` 都算 Harness」，
+> 理由是 `200` 代表"已有会话的 Harness"。这个推论不成立：本探针**从不带 cookie**，而认证栅栏是
+> **无条件**的（`BrowserAuth::writeUnauthorized` 对所有无 launch-token cookie 的请求一律回 401），
+> 所以 `200` 只可能来自非 Harness。该分支已删除，判据收敛为唯一的 401 栅栏 —— 见
+> `docs/dsh-desktop-v0.4.1-code-review.md` 第 1 项。
+
 **F4 进程与运行环境**
 - `dsh` 的 shebang：`#!/usr/bin/env node`；PATH 无 node 时 **exit 127**。
 - `SIGTERM` → 优雅退出（**实测** 2 秒内退出且端口释放）。
@@ -362,6 +368,16 @@ macOS TCC 授权归因。
 2. 外部实例一律**接管**：先用 401 特征确认是 Harness（不误杀未知进程）→ 用 `lsof -tiTCP:<port>` 取监听者 PID →
    只对该 PID 发 `SIGTERM`（不用进程组，避免连带杀掉用户终端）→ 等端口释放 → 自己启动拿新 token → 开窗。
 3. 新增配置 `take_over_existing`（默认 true）；置 false 时改为用系统浏览器打开并给出说明。
+
+> **2026-09-15 修正（默认值反转）**：`take_over_existing` 默认改为 **`false`**。上面的「默认 true」是当时的
+> 决策，理由写在第 2 条 —— 但那条只校验了「端口上是 Harness」，没有校验「这个进程就是 dsh」，而
+> `probe()` 当时还把**任意 `HTTP 200`** 也算作 Harness（见下方 F3 的注）。两者叠加的后果是：任何监听该
+> 端口并返回 200 的普通服务都会被当作外部 Harness 并收到信号。
+>
+> 现在接管需要**两道信号同时成立**：401 认证栅栏（`harness::probe`）+ 该 PID 命令行确为 `dsh web`
+> （`harness::looks_like_dsh_web`）。该规则已应用到全部四条 kill 路径。默认不接管时改用系统浏览器打开，
+> 并提示另外两个选项（设 `true` 接管 / 换端口）。仍未实现的是**运行时交互确认**（弹窗让用户当场选）——
+> 那需要新增对话框依赖，见 `docs/dsh-desktop-v0.4.1-code-review.md` 第 1 项。
 4. 关闭窗口前不再提前关闭 splash；只有拿到**带 token 的 URL**后才创建 Harness 窗口。
 
 ### 13.2 实机验证结论（2026-09-13）
@@ -405,6 +421,16 @@ TCC 归因仍待验证。
 - 时序：**更新在探测之前**；更新成功则强制重启实例（否则复用旧进程仍跑旧二进制）。
 - 可见性：检查/安装/失败都写进 `logs/harness.log`；splash 显示"正在检查 dsh 更新…/发现新版本…"。
 - 配置：`auto_update`（默认 true）、`update_tags`（默认 `["latest","next"]`）。
+
+> **2026-09-15 修正（默认值收敛）**：`update_tags` 默认改为 **`["latest"]`** —— 预发布渠道 `next` 不该是
+> 桌面用户的默认目标。同轮一并收敛的还有：`auto_update_plugins` 默认 **`false`**（profile 是用户数据）、
+> `system_updates` 默认 **`notify`**（不就地改写用户自己装的全局前缀）。
+>
+> 注意 `system_updates` 的默认值在 `design-task-feat-dsh-bundled-runtime.md` §3 里被定为 `install`
+> （理由：老用户静默失去自动升级更糟）。本次改动**推翻了那个取舍**，理由见该文档同处的注。
+>
+> 另外 `require_tested_dsh` 默认改为 `true` 后，安装与启动必须受同一区间约束，否则会自锁（装上一个
+> 随后拒绝启动的版本），因此新增 `update::may_install()`。见 `docs/dsh-desktop-v0.4.1-code-review.md` 第 2 项。
 
 验证：`cargo test` **12 passed**（6 原有 + 6 版本比较）；另加一个联网集成测试
 `tests/update_live.rs`（默认跳过，设 `DSH_DESKTOP_LIVE_TESTS=1` 才跑），实测本机 registry head =
@@ -691,6 +717,13 @@ npm 会把包装到别处：实际运行的仍是旧版，日志却写 `dsh upda
   返回 Tested / Older / Newer / Unknown，并给出可读原因；
 - 启动时（更新检查之后，因为更新可能把版本带进区间）判定：区间外记 warning、状态页显示「未测试版本」；
 - 新增配置 `require_tested_dsh`（默认 false）：开启后区间外直接拒绝启动并给出改法。
+
+> **2026-09-15 修正（默认值反转）**：默认改为 **`true`** —— 本壳靠解析 CLI 的启动行工作，区间外的版本
+> 可能以看不懂的方式失败，默认拒绝并给出改法比默认放行更可诊断。设 `false` 恢复「只告警并继续」。
+>
+> 同一开关现在也约束**自动安装**（`update::may_install()`）：会被拒绝启动的版本不会被装上，否则
+> `auto_update` 会把用户可用的版本换成壳自己又拒绝运行的那一个。见
+> `docs/dsh-desktop-v0.4.1-code-review.md` 第 2 项。
 
 **未改的一处，改为文档说明**：共用 `~/.dsh` 时的并发边界 —— 壳只保证自己端口上没有第二个实例，
 终端里另跑同 profile 的 `dsh` 仍会并发写会话存储。README 的「行为」节已写明该边界与 `dsh_home` 隔离选项。

@@ -50,16 +50,131 @@ impl Ring {
     }
 }
 
-/// Replace `token=...` with `token=***` so credentials never reach the log file.
+/// Field names whose value must never reach the log file.
+///
+/// Matched case-insensitively anywhere in a line, including as the tail of a longer identifier
+/// (`DEEPSEEK_API_KEY`, `my_token`), which is how these arrive from environment dumps and from
+/// provider errors that echo the request back.
+const SECRET_KEYS: &[&str] = &[
+    "token",
+    "api_key",
+    "apikey",
+    "api-key",
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "password",
+    "passwd",
+    "secret",
+    "private_key",
+    "access_key",
+    "session_id",
+];
+
+/// Where a value ends: the separators that follow one in a query string, a header, or an env dump.
+const VALUE_END: &[char] = &['&', ';', ',', '"', '\'', ')', '}', ']', '<', '>', '|'];
+
+/// Replace credential-bearing values with `***` so they never reach the log file.
+///
+/// The launch token was the first of these (`?token=…` in the startup URL), but it is not the only
+/// one the supervised CLI and its plugins can print: provider errors echo request headers, an env
+/// dump carries `DEEPSEEK_API_KEY`, and a failing fetch can log its cookies. Everything the log
+/// receives goes through here, so this is the single place that has to know the field names.
 pub fn redact(line: &str) -> String {
-    match line.find("token=") {
-        None => line.to_string(),
-        Some(idx) => {
-            let head = &line[..idx + "token=".len()];
-            let rest = &line[idx + "token=".len()..];
-            let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-            format!("{head}***{}", &rest[end..])
+    let mut out = redact_bearer(line);
+    for key in SECRET_KEYS {
+        out = redact_field(&out, key);
+    }
+    out
+}
+
+/// `Bearer <credential>` -> `***`, whatever key introduced it.
+///
+/// Runs before the field scan because the credential does not sit directly behind a `=` or `:`:
+/// `Authorization: Bearer sk-…` would otherwise have its value read as the word `Bearer` and the
+/// secret left behind. The scheme word goes too, so the later field pass over `authorization`
+/// finds nothing left to replace and cannot leave a stray `*** ***` behind.
+fn redact_bearer(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    let mut search = lower.as_str();
+    while let Some(at) = search.find("bearer") {
+        let after = at + "bearer".len();
+        // Only a standalone word: `bearer` inside a longer identifier is not a scheme.
+        let boundary = at == 0
+            || !line[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric());
+        if !boundary {
+            out.push_str(&rest[..after]);
+            rest = &rest[after..];
+            search = &search[after..];
+            continue;
         }
+        out.push_str(&rest[..at]);
+        rest = &rest[after..];
+        search = &search[after..];
+        // Drop the whitespace between the scheme and the credential with it.
+        let spaces = rest.len() - rest.trim_start().len();
+        rest = &rest[spaces..];
+        search = &search[spaces..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || VALUE_END.contains(&c))
+            .unwrap_or(rest.len());
+        out.push_str("***");
+        rest = &rest[end..];
+        search = &search[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `key<separator>value` -> `key<separator>***` for one field name.
+fn redact_field(line: &str, key: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    let mut search = lower.as_str();
+    loop {
+        let Some(at) = search.find(key) else {
+            out.push_str(rest);
+            return out;
+        };
+        let after = at + key.len();
+        // The key must stand alone: `tokens` and `tokenizer` are not the field.
+        let starts_a_word = at == 0
+            || !line[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric());
+        let separator = rest[after..].chars().next();
+        let Some(separator) = separator.filter(|c| matches!(c, '=' | ':')) else {
+            out.push_str(&rest[..after]);
+            rest = &rest[after..];
+            search = &search[after..];
+            continue;
+        };
+        if !starts_a_word {
+            out.push_str(&rest[..after]);
+            rest = &rest[after..];
+            search = &search[after..];
+            continue;
+        }
+        // A header (`key: value`) or an env dump (`KEY=value`) separates the name from the value,
+        // and often puts a space after the separator; that space must not be read as an empty
+        // value, which would leave the real one in place.
+        let mut value_at = after + separator.len_utf8();
+        let after_separator = &rest[value_at..];
+        value_at += after_separator.len() - after_separator.trim_start().len();
+        let end = rest[value_at..]
+            .find(|c: char| c.is_whitespace() || VALUE_END.contains(&c))
+            .unwrap_or(rest.len() - value_at);
+        out.push_str(&rest[..value_at]);
+        out.push_str("***");
+        rest = &rest[value_at + end..];
+        search = &search[value_at + end..];
     }
 }
 
@@ -92,10 +207,8 @@ fn startup_url(raw: &str) -> Option<Url> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Probe {
-    /// A Harness answered but this process holds no session cookie.
-    HarnessNoSession,
-    /// A Harness answered and accepted the request.
-    HarnessWithSession,
+    /// A Harness answered its auth fence.
+    Harness,
     /// Something else owns the port.
     Other,
     /// Nothing is listening.
@@ -106,7 +219,14 @@ pub enum Probe {
 /// must not be able to park the startup thread forever.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(600);
 
-/// Dependency-free HTTP probe over loopback: the auth fence identifies a Harness.
+/// Dependency-free HTTP probe over loopback: the auth fence is the only thing that identifies a
+/// Harness.
+///
+/// That fence is unconditional in the CLI: a request without the launch-token cookie is answered
+/// `401` with the body `dsh web authentication required; reopen the URL printed by dsh web.`, and
+/// this probe never sends a cookie. A `200` therefore proves the port is *not* a Harness — the
+/// reading that used to be treated as "a Harness that already has a session". An unrelated server
+/// that happened to listen on the port answered 200 and was signalled as if it were a Harness.
 pub fn probe(port: u16) -> Probe {
     let addr = match format!("127.0.0.1:{port}").parse() {
         Ok(a) => a,
@@ -130,15 +250,60 @@ pub fn probe(port: u16) -> Probe {
     let _ = stream.read_to_string(&mut body);
     if body.starts_with("HTTP/1.1 401") || body.starts_with("HTTP/1.0 401") {
         if body.contains("dsh web authentication required") {
-            Probe::HarnessNoSession
+            Probe::Harness
         } else {
             Probe::Other
         }
-    } else if body.starts_with("HTTP/1.1 200") || body.starts_with("HTTP/1.0 200") {
-        Probe::HarnessWithSession
     } else {
         Probe::Other
     }
+}
+
+/// Does this command line name the `dsh web` server the CLI boots?
+///
+/// The auth fence says a *Harness* is on the port; this says the process behind it is the CLI
+/// rather than some other program that answers 401 with the same words. Both are checked before a
+/// process this shell did not start is signalled, so neither signal alone can get an unrelated
+/// server killed.
+///
+/// `--profile web` is what this shell passes itself; a bare `web` token is the CLI's hardcoded
+/// alias for it, which is how the server looks when a user starts it from a terminal. A `plugin`
+/// command carries the same profile flag while managing the profile's dependencies, and it is not
+/// a server, so it is excluded explicitly.
+pub fn looks_like_dsh_web(command: &str) -> bool {
+    if !command.contains("dsh") || command.contains("plugin") {
+        return false;
+    }
+    command.contains("--profile web") || command.split_whitespace().any(|token| token == "web")
+}
+
+/// Command line of `pid`, when the platform lets us read it.
+///
+/// The auth fence proves *what* is on the port; this is the second, independent signal that
+/// names *which program* is behind it. Consulted before signalling a process this shell did not
+/// start, so a fence-shaped answer alone is not enough to get an unrelated server killed.
+pub fn process_command(pid: u32) -> Option<String> {
+    #[cfg(unix)]
+    let output = std::process::Command::new("ps")
+        // `-ww` matters: the identifying flags sit behind a long node path, and some `ps`
+        // builds truncate the command column to the terminal width without it.
+        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    // `tasklist` reports only the image name, which cannot tell one node program from another.
+    #[cfg(windows)]
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"),
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().find(|line| !line.trim().is_empty())?;
+    Some(line.trim().to_string())
 }
 
 /// PID currently listening on `port`, when the platform lets us find it cheaply.
@@ -701,5 +866,99 @@ mod tests {
         let out = redact("dsh web: http://127.0.0.1:1/?token=abcdef (LAN: x)");
         assert!(out.contains("token=***"));
         assert!(!out.contains("abcdef"));
+    }
+
+    /// The launch token was only the first credential the log could receive: a provider error
+    /// echoes request headers, and an env dump carries the API key.
+    #[test]
+    fn redacts_the_credentials_a_provider_error_can_echo() {
+        let cases = [
+            ("Authorization: Bearer sk-live-123456", "sk-live-123456"),
+            ("authorization: bearer sk-live-123456", "sk-live-123456"),
+            ("DEEPSEEK_API_KEY=sk-abc=def", "sk-abc=def"),
+            ("api_key: sk-abc", "sk-abc"),
+            ("Cookie: session=deadbeef", "deadbeef"),
+            ("set-cookie: sid=deadbeef; Path=/", "deadbeef"),
+            ("password=hunter2", "hunter2"),
+            ("client_secret: shhh", "shhh"),
+        ];
+        for (line, secret) in cases {
+            let out = redact(line);
+            assert!(!out.contains(secret), "{line} leaked {secret}: {out}");
+            assert!(out.contains("***"), "{line} was not redacted: {out}");
+        }
+    }
+
+    /// Redaction must not eat the surrounding line: the log is still meant to be readable.
+    #[test]
+    fn redaction_keeps_the_rest_of_the_line() {
+        assert_eq!(
+            redact("GET /v1/chat?token=abc&model=deepseek"),
+            "GET /v1/chat?token=***&model=deepseek"
+        );
+        assert_eq!(redact("nothing secret here"), "nothing secret here");
+        // A word that merely contains a key name is left alone.
+        assert_eq!(redact("tokenizer loaded"), "tokenizer loaded");
+        assert_eq!(redact("tokens=3"), "tokens=3");
+    }
+
+    /// The regression this probe exists for: an unrelated server that answers 200 must never be
+    /// mistaken for a Harness. Treating 200 as "a Harness that already has a session" is what let
+    /// a startup path signal whatever happened to hold the port.
+    #[test]
+    fn an_unrelated_http_server_is_not_a_harness() {
+        for response in [
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>vite dev server</html>",
+            "HTTP/1.0 200 OK\r\n\r\n{}",
+            "HTTP/1.1 401 Unauthorized\r\n\r\nlogin required",
+            "HTTP/1.1 403 Forbidden\r\n\r\n",
+            "HTTP/1.1 404 Not Found\r\n\r\n",
+        ] {
+            let port = serve_once(response);
+            assert_eq!(probe(port), Probe::Other, "misread: {response:?}");
+        }
+    }
+
+    /// And the fence the CLI really serves still identifies it, so narrowing the probe did not
+    /// cost the takeover path its ability to recognise a Harness.
+    #[test]
+    fn the_auth_fence_identifies_a_harness() {
+        let response = "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\n\r\n\
+                        dsh web authentication required; reopen the URL printed by dsh web.\n";
+        assert_eq!(probe(serve_once(response)), Probe::Harness);
+    }
+
+    /// A command line has to name the `dsh web` server before anything is signalled. Both the
+    /// flag this shell passes and the CLI's own `web` alias count.
+    #[test]
+    fn only_a_dsh_web_command_line_identifies_the_listener() {
+        assert!(looks_like_dsh_web(
+            "/opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --port 3080"
+        ));
+        assert!(looks_like_dsh_web("/usr/local/bin/dsh web --port 3080"));
+        // A dsh doing something else is not the server this shell supervises.
+        assert!(!looks_like_dsh_web("/opt/homebrew/bin/node dsh --version"));
+        assert!(!looks_like_dsh_web(
+            "dsh plugin --profile web add dshmarket"
+        ));
+        // And neither is an unrelated server that happens to hold the port.
+        assert!(!looks_like_dsh_web("/usr/bin/python3 -m http.server 3080"));
+        assert!(!looks_like_dsh_web(
+            "node /srv/vite/bin/vite.js --port 3080"
+        ));
+    }
+
+    /// Serve one canned HTTP response on a loopback port for a single probe.
+    fn serve_once(response: &str) -> u16 {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let response = response.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        port
     }
 }

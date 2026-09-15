@@ -34,9 +34,28 @@
       #retry:disabled { opacity: .6; cursor: default; }
       #retry[hidden] { display: none; }
     </style>
+    <!--
+      Syntax the dsh front end needs that no polyfill can add. The probe cannot compile this
+      itself: this page carries a CSP, and `new Function` is what `script-src` forbids — a
+      blocked eval throws exactly like an unparseable program, so every machine would look too
+      old. A script element is the honest test instead: an engine that cannot parse this block
+      discards it and runs the rest of the page, which is how the flag stays unset.
+
+      REQUIRED_SYNTAX in src-tauri/src/window.rs names the same feature; a test binds the two.
+    -->
+    <script>
+      window.__dshSyntaxMissing = [];
+    </script>
+    <!-- The flag has to live in the SAME script element as the syntax: an engine that cannot
+         parse the class body discards this whole element, and a separate one would run anyway. -->
+    <script>
+      class Probe { static { 1; } }
+      window.__dshSyntaxChecked = true;
+    </script>
     <script>
       // Rust pushes status through WebviewWindow::eval, which can land before the body
       // exists. Buffer the value here so the first messages are not dropped.
+      if (!window.__dshSyntaxChecked) window.__dshSyntaxMissing.push("class static block");
       //
       // The third element marks the terminal page: that is the one offering to start the
       // Harness again, and the only one that should show the button.

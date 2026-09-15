@@ -51,10 +51,19 @@ const WATCHED_APIS: &[(&str, &str)] = &[("structuredClone", "structuredClone")];
 
 /// Syntax the client bundles use that no polyfill can add: the module has to parse.
 ///
-/// `new Function` is the only way to ask an engine whether it can parse something, and the splash
-/// page has no CSP (`csp: null` in `tauri.conf.json`), so it works. `class static block` (Safari
-/// 16.4, macOS 13.3) is the newest syntax the bundles use, which is what makes the compat layer's
-/// floor 13.3 rather than the 10.15 the bundle declares; newer syntax goes in this list.
+/// `class static block` (Safari 16.4, macOS 13.3) is the newest syntax the bundles use, which is
+/// what makes the compat layer's floor 13.3 rather than the 10.15 the bundle declares; newer
+/// syntax goes in this list.
+///
+/// The source is not compiled from here. The splash page carries a CSP (see `tauri.conf.json`),
+/// and `new Function` is exactly what `script-src` forbids — a blocked eval throws the same way
+/// an unparseable program does, so probing that way would report every machine as too old.
+/// `src/index.html` carries the block instead, where a script element this engine cannot parse is
+/// discarded on its own while the rest of the page keeps running.
+///
+/// The page owns the verdict, so this is only the list a test checks that page against; the label
+/// the user sees travels in the page's own report.
+#[cfg(test)]
 const REQUIRED_SYNTAX: &[(&str, &str)] = &[("class static block", "class Probe { static { 1; } }")];
 
 /// What the splash page found missing in this WebView.
@@ -195,28 +204,54 @@ pub fn record_report(payload: &str) {
 /// `None` means "no reason known" — either the report says the WebView is fine or the probe
 /// never arrived (see [`REPORT`]).
 pub fn unsupported_webview(compat: bool) -> Option<WebviewReport> {
-    let deadline = Instant::now() + PROBE_WAIT;
-    loop {
-        if let Some(report) = REPORT.lock().unwrap().as_ref() {
-            return (!report.supported(compat)).then(|| report.clone());
-        }
-        if Instant::now() >= deadline {
-            harness::app_log("WebView 能力探测没有上报，按支持处理");
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let report = wait_for_report()?;
+    (!report.supported(compat)).then_some(report)
 }
 
 /// The compat script the Harness window should carry, when the probe found something to install.
 ///
 /// `None` on an engine that has everything, and on one whose probe never reported: a diagnostic
 /// that failed must not put a patch into a window.
+///
+/// Waits for the report like [`unsupported_webview`] does, and for the same reason. The splash
+/// page probes while the CLI is still booting, so whether the answer has arrived by any given
+/// moment is a race — and reading the slot without waiting turned that race into a silently
+/// unpatched window: the caller logs "webkit_compat=false" for an engine whose probe said the
+/// opposite, and the page then fails to load exactly as it would have without the compat layer.
 pub fn needed_compat_script() -> Option<String> {
-    let report = REPORT.lock().unwrap().clone()?;
+    let report = wait_for_report()?;
     report
         .needs_compat()
         .then(|| compat_script(&report.missing))
+}
+
+/// The report, waiting up to [`PROBE_WAIT`] for the splash page to send one.
+///
+/// `None` means the probe never arrived. Callers treat that as "no reason known" rather than as a
+/// verdict: a lost diagnostic must not refuse to start, and must not patch a window either.
+fn wait_for_report() -> Option<WebviewReport> {
+    let report = wait_for(|| REPORT.lock().unwrap().clone());
+    if report.is_none() {
+        harness::app_log("WebView 能力探测没有上报，按支持处理");
+    }
+    report
+}
+
+/// Poll `read` until it produces a value, giving up after [`PROBE_WAIT`].
+///
+/// A function of its reader rather than of the report slot, so the waiting itself is testable
+/// without competing for the process-wide state every other report test owns.
+fn wait_for<T>(read: impl Fn() -> Option<T>) -> Option<T> {
+    let deadline = Instant::now() + PROBE_WAIT;
+    loop {
+        if let Some(value) = read() {
+            return Some(value);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// The last report the splash page sent, for the startup log and the status page.
@@ -237,30 +272,34 @@ pub fn probe_script() -> String {
             ));
         }
     }
-    // Syntax cannot be feature-detected with `typeof`: compiling it is the only question an
-    // engine answers truthfully, and a failed compile is exactly what a client bundle would hit.
-    for (name, source) in REQUIRED_SYNTAX {
-        let source = json!(source);
-        checks.push_str(&format!(
-            "  try {{ new Function({source}); }} catch (error) {{ syntax.push(\"{name}\"); }}\n"
-        ));
-    }
     PROBE_TEMPLATE
         .replace("%CHECKS%", &checks)
         .replace("%EVENT%", PROBE_EVENT)
 }
 
 /// The probe's JavaScript. ES5 on purpose: it has to run on the very engines this exists to
-/// diagnose. `window.__TAURI_INTERNALS__` may not exist yet (Tauri installs its IPC bridge in
-/// its own initialization script), so the report retries briefly and then gives up quietly.
+/// diagnose.
+///
+/// Two things are not ready when an initialization script runs at document start: Tauri installs
+/// its IPC bridge in its own script, and the syntax verdict comes from the page's own head (see
+/// [`REQUIRED_SYNTAX`]). The report therefore waits for both and then gives up quietly — a
+/// diagnostic that failed must not decide anything.
 const PROBE_TEMPLATE: &str = r#"
 (function () {
   var missing = [];
   var degraded = [];
-  var syntax = [];
 %CHECKS%
-  var payload = { missing: missing, degraded: degraded, syntax: syntax, agent: navigator.userAgent };
   function report(attempt) {
+    if (window.__dshSyntaxMissing === undefined) {
+      if (attempt < 40) setTimeout(function () { report(attempt + 1); }, 25);
+      return;
+    }
+    var payload = {
+      missing: missing,
+      degraded: degraded,
+      syntax: window.__dshSyntaxMissing,
+      agent: navigator.userAgent
+    };
     try {
       if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) {
         window.__TAURI_INTERNALS__.invoke("plugin:event|emit", { event: "%EVENT%", payload: payload });
@@ -780,6 +819,9 @@ enum LivenessAction {
     Unattended,
     /// Nothing conclusive yet: wait for the next probe.
     Wait { misses: u32 },
+    /// The page looks dead, but someone is typing in it: reloading would throw that away, so
+    /// wait one more interval and ask again.
+    Busy { misses: u32 },
     /// The page stopped drawing, or stopped answering: load the URL again.
     Reload { attempt: u32 },
     /// Reloads did not bring it back: stop, and tell the user.
@@ -795,7 +837,19 @@ enum LivenessAction {
 /// `attended` is whether the user can be looking at the window. It gates *frozen* only: a window
 /// behind another app is allowed to stop drawing, and judging it would turn "the user switched
 /// away" into a reload loop. A page that answers nothing is broken wherever it is.
-fn liveness_action(state: PageState, attended: bool, misses: u32, reloads: u32) -> LivenessAction {
+///
+/// `busy` is whether the page reports recent typing. A reload is the only recovery for a frozen
+/// page and also the thing that discards an unsent prompt, so a page someone is working in gets
+/// another interval instead. It delays the reload; it does not cancel it — a page that stays dead
+/// while the user keeps typing is still reloaded once they stop, and the streak is preserved so
+/// the retry budget is unaffected.
+fn liveness_action(
+    state: PageState,
+    attended: bool,
+    busy: bool,
+    misses: u32,
+    reloads: u32,
+) -> LivenessAction {
     match state {
         PageState::Drawing => LivenessAction::Alive,
         PageState::Frozen if !attended => LivenessAction::Unattended,
@@ -803,6 +857,9 @@ fn liveness_action(state: PageState, attended: bool, misses: u32, reloads: u32) 
             let misses = misses.saturating_add(1);
             if misses < LIVENESS_MISSES {
                 return LivenessAction::Wait { misses };
+            }
+            if busy {
+                return LivenessAction::Busy { misses };
             }
             let attempt = reloads.saturating_add(1);
             if attempt > LIVENESS_RELOADS {
@@ -849,6 +906,67 @@ const FRAME_PROBE: &str = r#"
   return w.__dshFrames;
 })()
 "#;
+
+/// Ask the page whether someone is working in it right now.
+///
+/// The frame counter says the page stopped drawing; it cannot say whether a person is mid-sentence
+/// in it. Reloading is what recovers a frozen page, and it is also what discards an unsent prompt,
+/// so the watchdog asks first. ES5 like the frame probe, and read-only: it installs its listeners
+/// once and only reports.
+const ACTIVITY_PROBE: &str = r#"
+(function () {
+  var w = window;
+  if (typeof w.__dshLastInput !== "number") {
+    w.__dshLastInput = 0;
+    var note = function () { w.__dshLastInput = Date.now(); };
+    var events = ["keydown", "keypress", "input", "pointerdown", "paste", "compositionstart"];
+    for (var i = 0; i < events.length; i++) {
+      document.addEventListener(events[i], note, true);
+    }
+  }
+  var active = document.activeElement;
+  var editing = false;
+  if (active) {
+    var tag = (active.tagName || "").toLowerCase();
+    editing = tag === "input" || tag === "textarea" || active.isContentEditable === true;
+  }
+  var idle = w.__dshLastInput === 0 ? 1e9 : Date.now() - w.__dshLastInput;
+  return JSON.stringify({ editing: editing, idle: idle });
+})()
+"#;
+
+/// What the activity probe reported.
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+struct Activity {
+    /// The focused element takes typed text.
+    #[serde(default)]
+    editing: bool,
+    /// Milliseconds since the last input event; huge when there has never been one.
+    #[serde(default)]
+    idle: u64,
+}
+
+/// Whether the page says someone is working in it right now.
+///
+/// A page that cannot answer is not busy: it is gone, and waiting for it would only delay the
+/// recovery. The idle window is one probe interval, so "typed since the last check" counts.
+fn page_is_busy(answer: Option<&str>) -> bool {
+    let Some(activity) = answer.and_then(|raw| serde_json::from_str::<Activity>(raw).ok()) else {
+        return false;
+    };
+    activity.editing || activity.idle < LIVENESS_INTERVAL.as_millis() as u64
+}
+
+/// Ask the page whether it is being used, with the same bounded wait as the frame probe.
+fn probe_activity(window: &WebviewWindow) -> Option<String> {
+    let (tx, rx) = mpsc::channel();
+    window
+        .eval_with_callback(ACTIVITY_PROBE, move |answer| {
+            let _ = tx.send(answer.trim().to_string());
+        })
+        .ok()?;
+    rx.recv_timeout(LIVENESS_TIMEOUT).ok()
+}
 
 /// Navigations of the same startup URL, including the first one.
 const LOAD_ATTEMPTS: u32 = 3;
@@ -1054,7 +1172,10 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64) {
         if let Some(count) = answer {
             frames = Some(count);
         }
-        match liveness_action(state, attended(&window), misses, reloads) {
+        // Only asked once a probe has already failed: a healthy page needs no second question,
+        // and the answer costs another round trip through the UI process.
+        let busy = state != PageState::Drawing && page_is_busy(probe_activity(&window).as_deref());
+        match liveness_action(state, attended(&window), busy, misses, reloads) {
             LivenessAction::Alive => {
                 if misses > 0 || reloads > 0 {
                     harness::app_log(&format!(
@@ -1079,6 +1200,19 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64) {
                         _ => "Harness 页面没有响应存活检查，继续观察",
                     });
                 }
+            }
+            LivenessAction::Busy { misses: now } => {
+                misses = now;
+                // The streak is kept, not reset: the page is still not drawing, and the user
+                // typing is a reason to wait rather than evidence that it recovered.
+                harness::app_log(&format!(
+                    "Harness 页面仍未恢复（{}），但检测到正在输入：推迟重新加载，避免丢失未提交的内容",
+                    match state {
+                        PageState::Frozen => "停止绘制",
+                        _ => "无响应",
+                    }
+                ));
+                set_title(&window, "DeepSeek Harness（页面已停止刷新，等待输入结束…）");
             }
             LivenessAction::Reload { attempt } => {
                 misses = 0;
@@ -1273,10 +1407,7 @@ fn wait_for_load(signals: &LoadSignals, timeout: Duration) -> bool {
 /// True while the port answers as a Harness: the launch URL is only worth revisiting while the
 /// process behind it is still there.
 fn port_serving(port: u16) -> bool {
-    matches!(
-        harness::probe(port),
-        harness::Probe::HarnessWithSession | harness::Probe::HarnessNoSession
-    )
+    matches!(harness::probe(port), harness::Probe::Harness)
 }
 
 fn downloads_dir() -> PathBuf {
@@ -1511,6 +1642,45 @@ mod tests {
         );
     }
 
+    /// The splash page probes while the CLI is still booting, so a reader that does not wait turns
+    /// that race into a silently unpatched window: `needed_compat_script` used to return `None` for
+    /// a report that was merely late, and the caller then logged `webkit_compat=false` for an
+    /// engine whose probe had said the opposite (found by running the built app, 2026-09-15).
+    ///
+    /// One test owns the process-wide report slot (see [`the_gate_reads_what_the_page_reported`]),
+    /// so this asserts the wait without competing for it: the slot is emptied, a writer is started,
+    /// and the reader must pick the answer up rather than give up on the empty slot.
+    #[test]
+    fn a_value_that_arrives_late_is_still_read() {
+        let reads = std::cell::Cell::new(0);
+        let started = Instant::now();
+        // Answers on the fifth poll, i.e. after an empty slot for ~80 ms.
+        let value = wait_for(|| {
+            reads.set(reads.get() + 1);
+            (reads.get() >= 5).then_some("late")
+        });
+
+        assert_eq!(value, Some("late"), "a late value must still be read");
+        assert!(
+            started.elapsed() >= Duration::from_millis(80),
+            "the reader must have waited for the answer"
+        );
+    }
+
+    /// A probe that never reports is not a verdict: the wait ends and the caller sees nothing,
+    /// which both readers turn into "no reason known" rather than into a refusal or a patch.
+    #[test]
+    fn a_slot_that_stays_empty_ends_the_wait() {
+        let started = Instant::now();
+        let value: Option<u8> = wait_for(|| None);
+
+        assert_eq!(value, None);
+        assert!(
+            started.elapsed() >= PROBE_WAIT,
+            "it must have waited the full budget before giving up"
+        );
+    }
+
     #[test]
     fn the_probe_asks_about_every_shimmed_api_and_the_syntax_floor() {
         let script = probe_script();
@@ -1519,9 +1689,12 @@ mod tests {
         // Prototype methods are not globals: the check names the expression it asks about.
         assert!(script.contains("typeof [].findLast === \"undefined\""));
         assert!(script.contains("Math.sumPrecise"));
-        // Syntax is compiled, not probed with typeof.
-        assert!(script.contains("new Function(\"class Probe { static { 1; } }\")"));
-        assert!(script.contains("syntax.push(\"class static block\")"));
+        // The syntax verdict comes from the page, not from an eval the page's CSP would block.
+        assert!(script.contains("__dshSyntaxMissing"));
+        assert!(
+            !script.contains("new Function"),
+            "the probe must not eval: script-src forbids it, and a blocked eval is\n             indistinguishable from syntax this engine cannot parse"
+        );
         // It reports through the splash window's core capability.
         assert!(script.contains(PROBE_EVENT));
         assert!(script.contains("plugin:event|emit"));
@@ -1529,6 +1702,60 @@ mod tests {
         assert!(!script.contains("=>"), "the probe must stay ES5");
         assert!(!script.contains('`'), "the probe must stay ES5");
         assert!(!script.contains("??"), "the probe must stay ES5");
+    }
+
+    /// The syntax verdict is produced by the splash page, so the two halves have to agree: every
+    /// feature named here must be probed there, and the page must report the same label. Splitting
+    /// them silently is how a machine that cannot parse a bundle gets told it can.
+    #[test]
+    fn the_page_probes_the_syntax_this_shell_expects_it_to() {
+        let page = include_str!("../../src/index.html");
+        for (name, source) in REQUIRED_SYNTAX {
+            assert!(
+                page.contains(source),
+                "index.html does not test {name:?} ({source})"
+            );
+            assert!(
+                page.contains(&format!("\"{name}\"")),
+                "index.html never reports {name:?} as missing"
+            );
+        }
+        // The page is what sets it, so the probe must not invent the field itself.
+        assert!(page.contains("__dshSyntaxMissing"));
+        // The flag must sit in the same script element as the syntax it guards: an engine that
+        // cannot parse the class body discards that element, and a flag in a separate one would
+        // still run and report the engine as fine. Checked against the text up to the next
+        // closing tag.
+        for (_, source) in REQUIRED_SYNTAX {
+            let after = page
+                .split(source)
+                .nth(1)
+                .expect("the source was found above");
+            let until_close = after.split("</script>").next().unwrap_or_default();
+            assert!(
+                until_close.contains("__dshSyntaxChecked"),
+                "the syntax flag must be inside the same <script> as {source}"
+            );
+        }
+    }
+
+    /// The splash page is our own document and the only window with a capability, so it is the
+    /// one place a CSP can be enforced at all: the Harness window loads a remote origin that
+    /// Tauri never sees. Assert the config keeps that protection rather than trusting it stays.
+    #[test]
+    fn the_local_page_is_served_with_a_restrictive_csp() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let csp = config["app"]["security"]["csp"]
+            .as_str()
+            .expect("the local page must carry a CSP");
+        // No inline script and no eval: Tauri hashes the page's own scripts instead.
+        assert!(!csp.contains("unsafe-inline"), "{csp}");
+        assert!(!csp.contains("unsafe-eval"), "{csp}");
+        // Tauri's IPC fast path is a fetch to its own scheme, which connect-src has to allow.
+        assert!(csp.contains("ipc:"), "{csp}");
+        assert!(csp.contains("http://ipc.localhost"), "{csp}");
+        assert!(csp.contains("object-src 'none'"), "{csp}");
     }
 
     #[test]
@@ -1591,39 +1818,43 @@ mod tests {
     fn a_page_that_stops_drawing_is_reloaded_and_then_reported() {
         let drawing = PageState::Drawing;
         let frozen = PageState::Frozen;
+        let idle = false;
         // One bad probe is a hiccup: the shell waits instead of throwing away the page state.
         assert_eq!(
-            liveness_action(frozen, true, 0, 0),
+            liveness_action(frozen, true, idle, 0, 0),
             LivenessAction::Wait { misses: 1 }
         );
         // The second one in a row is a page that has stopped drawing.
         assert_eq!(
-            liveness_action(frozen, true, 1, 0),
+            liveness_action(frozen, true, idle, 1, 0),
             LivenessAction::Reload { attempt: 1 }
         );
         // Anything that draws clears the streak, whatever the reload count was.
-        assert_eq!(liveness_action(drawing, true, 5, 2), LivenessAction::Alive);
+        assert_eq!(
+            liveness_action(drawing, true, idle, 5, 2),
+            LivenessAction::Alive
+        );
         // Reloads are budgeted: the shell stops instead of looping over a page that never returns.
         assert_eq!(
-            liveness_action(frozen, true, 1, 1),
+            liveness_action(frozen, true, idle, 1, 1),
             LivenessAction::Reload { attempt: 2 }
         );
         assert_eq!(
-            liveness_action(frozen, true, 1, 3),
+            liveness_action(frozen, true, idle, 1, 3),
             LivenessAction::Report { attempts: 3 }
         );
         // A bad probe mid-recovery does not reset the reload budget.
         assert_eq!(
-            liveness_action(frozen, true, 0, 3),
+            liveness_action(frozen, true, idle, 0, 3),
             LivenessAction::Wait { misses: 1 }
         );
         assert_eq!(
-            liveness_action(frozen, true, 1, u32::MAX),
+            liveness_action(frozen, true, idle, 1, u32::MAX),
             LivenessAction::Report { attempts: u32::MAX }
         );
         // A silent page is broken wherever it is: focus is no excuse for answering nothing.
         assert_eq!(
-            liveness_action(PageState::Silent, false, 1, 0),
+            liveness_action(PageState::Silent, false, idle, 1, 0),
             LivenessAction::Reload { attempt: 1 }
         );
     }
@@ -1632,20 +1863,73 @@ mod tests {
     /// reloading it would turn "the user switched away" into a reload loop.
     #[test]
     fn a_background_window_is_not_accused_of_being_frozen() {
+        let idle = false;
         assert_eq!(
-            liveness_action(PageState::Frozen, false, 0, 0),
+            liveness_action(PageState::Frozen, false, idle, 0, 0),
             LivenessAction::Unattended
         );
         // Even a long streak of unattended probes stays unattended: no reloads are spent.
         assert_eq!(
-            liveness_action(PageState::Frozen, false, 4, 2),
+            liveness_action(PageState::Frozen, false, idle, 4, 2),
             LivenessAction::Unattended
         );
         // Drawing is drawing, attended or not.
         assert_eq!(
-            liveness_action(PageState::Drawing, false, 0, 0),
+            liveness_action(PageState::Drawing, false, idle, 0, 0),
             LivenessAction::Alive
         );
+    }
+
+    /// Reloading is the only recovery for a frozen page, and it is also what discards an unsent
+    /// prompt. Someone typing in a page that stopped drawing gets another interval first.
+    #[test]
+    fn a_page_someone_is_typing_in_is_not_reloaded_yet() {
+        // The user is mid-sentence: wait, and keep the streak so the budget is untouched.
+        assert_eq!(
+            liveness_action(PageState::Frozen, true, true, 1, 0),
+            LivenessAction::Busy { misses: 2 }
+        );
+        // The moment they stop, the reload the page still needs happens.
+        assert_eq!(
+            liveness_action(PageState::Frozen, true, false, 2, 0),
+            LivenessAction::Reload { attempt: 1 }
+        );
+        // Typing never spends or restores the reload budget.
+        assert_eq!(
+            liveness_action(PageState::Frozen, true, true, 2, 2),
+            LivenessAction::Busy { misses: 3 }
+        );
+        // A page that answers nothing is not "busy": the probe that would say so is the code
+        // that stopped running, so silence must still reload rather than wait for ever.
+        assert_eq!(
+            liveness_action(PageState::Silent, true, false, 1, 0),
+            LivenessAction::Reload { attempt: 1 }
+        );
+        // And a page that is drawing is alive whether or not anyone is typing.
+        assert_eq!(
+            liveness_action(PageState::Drawing, true, true, 0, 0),
+            LivenessAction::Alive
+        );
+    }
+
+    /// The activity probe decides whether a reload would cost the user work, so its reading of
+    /// the page's answer is the difference between a lost prompt and a recovered window.
+    #[test]
+    fn activity_is_read_as_busy_only_when_someone_is_working() {
+        // Typing in a field: busy, however long the pause between keystrokes.
+        assert!(page_is_busy(Some(r#"{"editing":true,"idle":900000}"#)));
+        // Not focused, but typed in within the last interval.
+        assert!(page_is_busy(Some(r#"{"editing":false,"idle":100}"#)));
+        // Focused elsewhere, idle for minutes: nothing to lose.
+        assert!(!page_is_busy(Some(r#"{"editing":false,"idle":900000}"#)));
+        // Never typed since the page loaded.
+        assert!(!page_is_busy(Some(
+            r#"{"editing":false,"idle":1000000000}"#
+        )));
+        // A page that cannot answer is gone, not busy: waiting would only delay recovery.
+        assert!(!page_is_busy(None));
+        assert!(!page_is_busy(Some("not json")));
+        assert!(!page_is_busy(Some("")));
     }
 
     /// The frame counter is the whole signal, so its algebra has to be exact.

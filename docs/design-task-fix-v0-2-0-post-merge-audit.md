@@ -22,7 +22,7 @@
 |---|---|---|---|---|
 | A1 | P1 | 插件市场自动更新在 GUI 启动下必然失败（PATH 上没有 pnpm），且每次启动都先停一次 Harness、失败不记 attempted | `src-tauri/src/update.rs::install_plugin`、`lib.rs:1221` | **已修**（§10.1） |
 | A2 | P2 | 首启播种后立刻联网装插件市场，与"离线首启"目标冲突 | `src-tauri/src/lib.rs:1075` 与 `1221` | **已修**（§10.2） |
-| A3 | P3 | `system_updates: notify` 与 `auto_update_plugins` 策略不一致：前者承诺不动用户的安装，后者仍重写用户 profile | `src-tauri/src/lib.rs:1221` 一带 | 待定 |
+| A3 | P3 | `system_updates: notify` 与 `auto_update_plugins` 策略不一致：前者承诺不动用户的安装，后者仍重写用户 profile | `src-tauri/src/lib.rs:1221` 一带 | **已修**（2026-09-15，见 §4 注） |
 | A4 | P3 | `is_session_supervisor` 仍是子串匹配（上一轮已提出，未改） | `src-tauri/src/lib.rs::is_session_supervisor` | 可不改 |
 | A5 | P3 | 插件安装的 `Err` 分支记 attempted，与 `carried_attempt` 叠加后把"瞬时失败"变成"永久不再尝试" | `src-tauri/src/lib.rs`（3b3 的 `Err` 分支）、`update.rs::carried_attempt` | **已修**（§11.3） |
 | A6 | P3 | 复用分支现在也要等登录 shell 抓取（`ChildEnv` 前移的副作用） | `src-tauri/src/lib.rs`（3b4） | 记录备查（§11.2） |
@@ -151,6 +151,10 @@ dsh: pnpm not found on PATH — install pnpm to manage profile plugins
 
 两条路可选，需要产品侧拍板：用同一个偏好收口（系统运行时 + `notify` 时也不动 profile），
 或保留现状但在 README 写明这条例外。
+
+> **2026-09-15 已修（取第一条路）**：`auto_update_plugins` 默认改为 **`false`**，于是「不动用户安装」这条
+> 承诺默认成立，两个开关不再矛盾；想保持 profile 自动更新就显式写 `true`。
+> 该改动随 v0.4.1 代码审查的修复一并落地，见 `docs/dsh-desktop-v0.4.1-code-review.md` 第 2 项。
 
 ---
 

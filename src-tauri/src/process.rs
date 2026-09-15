@@ -74,6 +74,30 @@ pub fn terminate_pid(pid: u32, grace: Duration) -> bool {
     !is_alive(pid)
 }
 
+/// Stop a process this shell spawned for a short-lived job (npm, pnpm, the CLI's plugin command)
+/// together with whatever it spawned.
+///
+/// Unlike [`terminate`] this does not wait for a graceful exit: the caller has already decided
+/// the job ran past its budget, and a package manager that ignored SIGTERM once will ignore it
+/// again. It is never used on a Harness the user may be watching — only on the update helpers,
+/// whose whole purpose is to finish and exit.
+pub fn kill_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        // The child was spawned with `process_group(0)`, so the negative pid is its own group.
+        // Falling back to the pid covers a caller that spawned it without one.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        // `/T` reaches the tree, `/F` skips the grace period the caller already spent.
+        let _ = taskkill(pid, true, true);
+    }
+}
+
 pub enum TermSignal {
     Term,
     Kill,
@@ -198,8 +222,49 @@ pub fn restrict(path: &Path) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
 
-#[cfg(not(unix))]
-pub fn restrict(_path: &Path) {}
+/// Windows: replace the file's ACL with one entry for this user only.
+///
+/// The user profile directory is not a boundary here: a file created under it inherits whatever
+/// the parent grants, which on a shared or domain-joined machine can include other accounts and
+/// the local `Users` group. `config.json` may hold an API key and `state.json` names the
+/// supervised process, so both get an explicit owner-only ACL rather than an inherited one.
+///
+/// `icacls` is part of every supported Windows install, which is why this does not pull in a
+/// Win32 security dependency: the shell already reaches for `taskkill` and `netstat` the same way.
+#[cfg(windows)]
+pub fn restrict(path: &Path) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // Without an account to grant there is nothing safe to do: `/inheritance:r` on its own
+    // would strip every entry and could leave the file unreachable, so the ACL stays as it is.
+    let Some(account) = current_account() else {
+        return;
+    };
+    // `/inheritance:r` drops everything inherited from the parent, and `/grant:r` replaces this
+    // account's entries with full control, so the result is exactly one principal.
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{account}:F"))
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    // Best effort, like the Unix branch: a failure here must not stop the app from starting.
+    let _ = status;
+}
+
+/// The account an ACL grant should name, as `DOMAIN\user` or a bare user name.
+#[cfg(windows)]
+fn current_account() -> Option<String> {
+    // `USERDOMAIN\USERNAME` is what `icacls` accepts for a local or domain account; a bare
+    // `USERNAME` is the fallback when the domain is not in the environment.
+    match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(user)) if !domain.is_empty() && !user.is_empty() => {
+            Some(format!("{domain}\\{user}"))
+        }
+        (_, Ok(user)) if !user.is_empty() => Some(user),
+        _ => None,
+    }
+}
 
 #[cfg(test)]
 mod tests {

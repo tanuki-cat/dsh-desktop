@@ -60,14 +60,17 @@ pub struct Config {
     /// or relative path is ignored for this run.
     #[serde(default)]
     pub dsh_path: Option<PathBuf>,
-    /// When another Harness owns the port and we hold no session, stop it and take over,
-    /// so the window always ends up with a valid session. Disable to only warn.
+    /// When another Harness owns the port, stop it and take over so this shell ends up with a
+    /// valid session. Off by default: that instance may be a terminal session or an agent run
+    /// the user still wants, and killing it is not a decision a startup path should take
+    /// silently. With it off the shell opens the running instance in the system browser.
     #[serde(default = "default_take_over")]
     pub take_over_existing: bool,
     /// Check the npm registry before every start and install a newer CLI when there is one.
     #[serde(default = "default_auto_update")]
     pub auto_update: bool,
-    /// Dist-tags consulted in auto mode; the highest version among them wins.
+    /// Dist-tags consulted in auto mode; the highest version among them wins. Only `latest` by
+    /// default: a prerelease channel is not something to move a desktop user onto unasked.
     #[serde(default = "default_update_tags")]
     pub update_tags: Vec<String>,
     /// Trust a successful registry answer for this many minutes (0 = query on every start).
@@ -82,8 +85,10 @@ pub struct Config {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// Refuse to start a CLI outside the range this shell was tested against, instead of
-    /// running it and failing in a confusing way. Off by default: we warn and continue.
-    #[serde(default)]
+    /// running it and failing in a confusing way. On by default: the shell drives the CLI
+    /// through flags it parses back out of stdout, so a version outside the tested window can
+    /// fail in ways that look like a broken install. Set false to warn and continue anyway.
+    #[serde(default = "default_require_tested_dsh")]
     pub require_tested_dsh: bool,
     /// Which runtime to supervise: `auto` (use an installed one when it passes the gates,
     /// otherwise the bundled halves), `bundled` (always the shipped runtime) or `system`
@@ -91,17 +96,17 @@ pub struct Config {
     #[serde(default)]
     pub runtime: runtime::Preference,
     /// What to do when the supervised CLI is the user's own installation and a newer version
-    /// exists: `install` (default — upgrade it in place, the pre-bundled behaviour) or
-    /// `notify` (report it and leave the tree alone, §2.4: never rewrite a prefix we do not
-    /// own). Only affects system installations; a bundled runtime always updates its shadow
-    /// prefix.
-    #[serde(default)]
+    /// exists: `notify` (default — report it and leave the tree alone, §2.4: never rewrite a
+    /// prefix we do not own) or `install` (upgrade it in place). Only affects system
+    /// installations; a bundled runtime always updates its own shadow prefix.
+    #[serde(default = "default_system_updates")]
     pub system_updates: runtime::SystemUpdates,
     /// Keep the plugin market (`dshmarket`) in the profile current, the same way the CLI itself
     /// is kept current: check the dist-tags, stop the instance using the profile, install, and
     /// restart so the new plugin is what loads. It rewrites files in the profile
-    /// (`package.json` + lockfile), which is why it has its own switch next to `auto_update`.
-    #[serde(default = "default_auto_update")]
+    /// (`package.json` + lockfile), so it is off by default: a profile is user data, and the
+    /// plugin tree is the part of it most likely to be mid-edit. Set true to keep it current.
+    #[serde(default)]
     pub auto_update_plugins: bool,
     /// Install the legacy-WebKit compat layer when the probe finds APIs the dsh front end needs
     /// and this engine lacks (see `window::compat_script`). On by default: without it those
@@ -223,7 +228,7 @@ fn default_import_shell_env() -> bool {
 }
 
 fn default_take_over() -> bool {
-    true
+    false
 }
 
 fn default_auto_update() -> bool {
@@ -234,12 +239,22 @@ fn default_webkit_compat() -> bool {
     true
 }
 
+fn default_require_tested_dsh() -> bool {
+    true
+}
+
+fn default_system_updates() -> runtime::SystemUpdates {
+    runtime::SystemUpdates::Notify
+}
+
 fn default_update_interval() -> u64 {
     60
 }
 
+/// Only the release channel: `next` is a prerelease tag, and following it by default would move
+/// a desktop user onto an untested build without them asking.
 fn default_update_tags() -> Vec<String> {
-    vec!["latest".to_string(), "next".to_string()]
+    vec!["latest".to_string()]
 }
 
 impl Config {
@@ -264,17 +279,17 @@ impl Config {
             workspace: default_workspace(),
             dsh_home: None,
             dsh_path: None,
-            take_over_existing: true,
-            auto_update: true,
+            take_over_existing: default_take_over(),
+            auto_update: default_auto_update(),
             update_tags: default_update_tags(),
             update_check_interval_minutes: default_update_interval(),
-            import_shell_env: true,
+            import_shell_env: default_import_shell_env(),
             env: BTreeMap::new(),
-            require_tested_dsh: false,
+            require_tested_dsh: default_require_tested_dsh(),
             runtime: runtime::Preference::Auto,
-            system_updates: runtime::SystemUpdates::Install,
-            auto_update_plugins: true,
-            webkit_compat: true,
+            system_updates: default_system_updates(),
+            auto_update_plugins: false,
+            webkit_compat: default_webkit_compat(),
         };
         // The same repair a loaded file gets, so the value seeded here is already usable
         // (a `HOME` that is relative or gone would otherwise become the workspace).
@@ -1092,6 +1107,11 @@ fn take_over_handoff_and_start(
             harness::app_log(&format!(
                 "端口 {port} 已由 pid {pid} 服务，但 take_over_existing=false：交给启动流程处理"
             ));
+        } else if !identified_dsh_web(pid) {
+            return Err(format!(
+                "端口 {port} 上的 pid {pid} 按 Harness 协议应答，但无法确认它就是 dsh web；\n\
+                 为避免误杀其它程序，本应用不会接管它。请先手动停止该进程，或在 config.json 里换一个端口。"
+            ));
         } else {
             harness::app_log(&format!(
                 "端口 {port} 上出现了外部重启的 Harness pid {pid}：停掉它，用本壳的 workspace 重新启动"
@@ -1110,7 +1130,14 @@ fn take_over_handoff_and_start(
         // and make the one remaining attempt. Only when takeover is allowed: with
         // take_over_existing=false that instance is exactly what the user asked us to keep.
         Err(reason) if config.take_over_existing => match harness_listener(port) {
-            None => Err(reason),
+            // Unidentified: report the original failure rather than killing a process this
+            // shell cannot prove is the CLI.
+            Some(pid) if !identified_dsh_web(pid) => {
+                harness::app_log(&format!(
+                    "端口 {port} 由 pid {pid} 服务，但无法确认它是 dsh web：不接管"
+                ));
+                Err(reason)
+            }
             Some(pid) => {
                 harness::app_log(&format!(
                     "本次启动失败（{reason}），但端口 {port} 已由 pid {pid} 服务：接管后重试一次"
@@ -1120,21 +1147,70 @@ fn take_over_handoff_and_start(
                 let _ = wait_for_port_free(port, TERMINATE_GRACE);
                 start(app, data_dir)
             }
+            None => Err(reason),
         },
         Err(reason) => Err(reason),
     }
 }
 
+/// What the startup path does about a Harness it did not start.
+#[derive(Debug, PartialEq, Eq)]
+enum ForeignAction {
+    /// Stop that instance and start our own on the port.
+    TakeOver { pid: u32 },
+    /// Leave it running and open it in the system browser instead.
+    UseBrowser,
+    /// Leave it running and explain why this shell cannot use the port.
+    Refuse { reason: String },
+}
+
+/// Decide what to do about a foreign Harness, from the two identity signals.
+///
+/// `command` is the listener's command line, or `None` when the platform would not report it.
+/// Both a fence-shaped answer and a `dsh web` command line are required before anything is
+/// signalled: the fence proves a Harness protocol is on the port, and the command line proves the
+/// process is the CLI rather than an unrelated server that happens to answer the same way. A
+/// missing command line is treated as "not proven", which is why takeover also needs `allow`.
+fn foreign_instance_action(
+    allow: bool,
+    owner: Option<u32>,
+    command: Option<&str>,
+) -> ForeignAction {
+    let identified = command.is_some_and(harness::looks_like_dsh_web);
+    match (allow, owner, identified) {
+        // Nothing may be signalled that this shell cannot identify, whoever asked.
+        (_, _, false) => ForeignAction::Refuse {
+            reason: "端口上有进程按 Harness 协议应答，但无法确认它就是 dsh web（读不到命令行，或命令行不像 dsh）。为避免误杀其它程序，本应用不会接管它。请先手动停止该进程，或在 config.json 里换一个端口。"
+                .to_string(),
+        },
+        (false, _, true) => ForeignAction::UseBrowser,
+        (true, Some(pid), true) => ForeignAction::TakeOver { pid },
+        // `identified` already proved a command line exists, so this arm is unreachable; it keeps
+        // the match total without a panic in a startup path.
+        (true, None, true) => ForeignAction::Refuse {
+            reason: "端口上的 Harness 无法定位到具体进程（lsof 不可用）。请先手动停止它。"
+                .to_string(),
+        },
+    }
+}
+
 /// The pid serving `port` as a Harness, when one is.
 fn harness_listener(port: u16) -> Option<u32> {
-    if matches!(
-        harness::probe(port),
-        harness::Probe::HarnessWithSession | harness::Probe::HarnessNoSession
-    ) {
+    if matches!(harness::probe(port), harness::Probe::Harness) {
         harness::listener_pid(port)
     } else {
         None
     }
+}
+
+/// Is this pid proven to be the `dsh web` CLI, and so safe to signal?
+///
+/// The same two-signal rule the startup path applies through [`foreign_instance_action`]: the auth
+/// fence put a Harness on the port, and the command line has to name the CLI. A pid whose command
+/// line cannot be read is not proven, and every kill path consults this rather than assuming the
+/// fence was enough.
+fn identified_dsh_web(pid: u32) -> bool {
+    harness::process_command(pid).is_some_and(|command| harness::looks_like_dsh_web(&command))
 }
 
 /// Wait out a handoff: another process may be booting a replacement on our port.
@@ -1353,7 +1429,7 @@ fn looks_like_our_harness(output: &str, parent: Parent) -> bool {
     let Some((_, command)) = parse_ps_identity(output) else {
         return false;
     };
-    command.contains("--profile web") && command.contains("dsh") && parent != Parent::Live
+    harness::looks_like_dsh_web(&command) && parent != Parent::Live
 }
 
 /// The npm package this shell supervises, for the messages that have to name it.
@@ -1724,6 +1800,19 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                                 &format!("有新版本 v{to}（system_updates=notify，未自动更新）"),
                                 &format!("v{from} -> v{to}"),
                             );
+                        } else if !update::may_install(&to, config.require_tested_dsh) {
+                            // Installing a version the startup check below would refuse to boot
+                            // leaves the user with a CLI this shell just wrote and will not run,
+                            // and the working version is already overwritten. Report it instead.
+                            harness::app_log(&format!(
+                                "update available: {from} -> {to}, but it is outside the tested range ({}); not installing",
+                                update::compatibility(&to).describe()
+                            ));
+                            window::set_status(
+                                app,
+                                &format!("有新版本 v{to}（超出已测试区间，未自动安装）"),
+                                &format!("v{from} -> v{to}；如需使用请在 config.json 里设置 \"require_tested_dsh\": false"),
+                            );
                         } else {
                             harness::app_log(&format!(
                                 "update available: {from} -> {to}, installing"
@@ -1985,7 +2074,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     // 3c) Detection. Runs after the update so a freshly installed CLI is what we boot. The startup URL carries a per-process token that no other process can
     //     recover, so a foreign instance can never hand us a session.
     match harness::probe(port) {
-        harness::Probe::HarnessWithSession | harness::Probe::HarnessNoSession => {
+        harness::Probe::Harness => {
             let owner = harness::listener_pid(port);
             let ours = process::read_state(data_dir)
                 .map(|state| state.pid)
@@ -2030,27 +2119,35 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                     process::terminate(pid, TERMINATE_GRACE);
                 }
                 None => {
-                    if !config.take_over_existing {
-                        window::open_external(&format!("http://127.0.0.1:{port}/"));
-                        return Err(format!(
-                            "127.0.0.1:{port} 已被另一个 Harness 占用（不是本应用启动的），已改用系统浏览器打开。                     如要让本应用接管，请保持 take_over_existing=true 或先停止该实例。"
-                        ));
-                    }
-
-                    // Foreign instance: stop it (the auth fence already proved it is a Harness),
-                    // then start our own so the window receives a fresh authenticated URL. Never a
-                    // group signal: its process group belongs to whatever started it.
-                    window::set_status(
-                        app,
-                        "检测到其它 Harness，正在接管…",
-                        &format!("127.0.0.1:{port}"),
-                    );
-                    if let Some(pid) = owner {
-                        process::terminate_pid(pid, TERMINATE_GRACE);
-                    } else {
-                        return Err(format!(
-                            "127.0.0.1:{port} 上已有 Harness，但无法确定它的进程（lsof 不可用）。请先手动停止它。"
-                        ));
+                    // Two independent signals have to agree before a process this shell did not
+                    // start is signalled: the auth fence named a Harness, and the command line
+                    // names the CLI. Either one alone is a guess.
+                    let command = owner.and_then(harness::process_command);
+                    match foreign_instance_action(
+                        config.take_over_existing,
+                        owner,
+                        command.as_deref(),
+                    ) {
+                        ForeignAction::UseBrowser => {
+                            window::open_external(&format!("http://127.0.0.1:{port}/"));
+                            return Err(format!(
+                                "127.0.0.1:{port} 已被另一个 Harness 占用（不是本应用启动的），已改用系统浏览器打开。\n\n\
+                                 要继续用这个实例就用浏览器；想让本应用接管，请在 config.json 里设 \"take_over_existing\": true \
+                                 （会终止该实例及其当前会话）；也可以先自己停掉它，或换一个端口。"
+                            ));
+                        }
+                        ForeignAction::Refuse { reason } => return Err(reason),
+                        ForeignAction::TakeOver { pid } => {
+                            // Stop it, then start our own so the window receives a fresh
+                            // authenticated URL. Never a group signal: its process group belongs
+                            // to whatever started it (a terminal, or an agent run).
+                            window::set_status(
+                                app,
+                                "检测到其它 Harness，正在接管…",
+                                &format!("pid {pid}"),
+                            );
+                            process::terminate_pid(pid, TERMINATE_GRACE);
+                        }
                     }
                 }
             }
@@ -2093,17 +2190,17 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     if EXITING.load(Ordering::SeqCst) {
         return Ok(());
     }
-    // The compat layer this engine needs, when the shell is allowed to install it. Decided
-    // before the spawn so the status line says it, and logged before the window opens: a feature
-    // that misbehaves under a shim should be traceable to it.
-    let compat = harness_compat(&config);
     // The source is named on the status page, not just in the log: "which dsh is this" is the
     // first question when the UI behaves like a different installation (2026-09-15).
+    //
+    // The compat layer is deliberately not named here. Its answer comes from the splash page,
+    // which probes while this thread is still resolving and updating, so a read taken now is a
+    // guess — and a guess printed on the status line is worse than no hint at all.
     window::set_status(
         app,
         "正在启动 Harness…",
         &format!(
-            "dsh {version}{} · {}{} · 端口 {port}{}",
+            "dsh {version}{} · {} · {} · 端口 {port}",
             if untested {
                 "（未测试版本）"
             } else {
@@ -2111,11 +2208,6 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
             },
             runtime::Origin::label_of(resolved.origin),
             resolved.dsh_js.display(),
-            if compat.is_some() {
-                " · 兼容层"
-            } else {
-                ""
-            }
         ),
     );
     let spawned = harness::spawn(&resolved.node, &resolved.dsh_js, &options)
@@ -2163,15 +2255,28 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         },
     );
 
+    // This call waits for the splash page's report, so everything below reads a settled answer
+    // rather than a race.
     if hand_the_gui_to_the_browser(app, &url, &version, config.webkit_compat) {
         return Ok(());
     }
+    // Decided here, not before the spawn: the report only exists once the splash page has run its
+    // probe, and reading the slot earlier returned `None` for a report that had simply not arrived
+    // yet — which silently opened an unpatched window and blamed it on `webkit_compat`
+    // (found by running the built app, 2026-09-15).
+    let compat = harness_compat(&config);
     if let Some(report) = window::report().filter(|report| report.needs_compat()) {
+        // The reason has to name the real one. `compat` is decided before the spawn, and the
+        // report arrives while the CLI boots, so a missing script can also mean the probe was
+        // not in yet — blaming the config for that sent a reader looking at a setting that was
+        // never the problem (found by running the built app, 2026-09-15).
         harness::app_log(&format!(
             "WebView 缺少 {}：{}",
             report.missing.join("、"),
             if compat.is_some() {
                 "已注入兼容层"
+            } else if config.webkit_compat {
+                "探测未在上报窗口内到达，未注入兼容层"
             } else {
                 "webkit_compat=false，未注入兼容层"
             }
@@ -2517,10 +2622,43 @@ mod tests {
         // Someone else owns the port: never install over it.
         assert!(may_stop_before_update(&Probe::Other, false, true).is_err());
         // Our own leftover instance may always be stopped.
-        assert!(may_stop_before_update(&Probe::HarnessNoSession, true, false).is_ok());
+        assert!(may_stop_before_update(&Probe::Harness, true, false).is_ok());
         // A foreign Harness only with explicit permission.
-        assert!(may_stop_before_update(&Probe::HarnessNoSession, false, true).is_ok());
-        assert!(may_stop_before_update(&Probe::HarnessNoSession, false, false).is_err());
+        assert!(may_stop_before_update(&Probe::Harness, false, true).is_ok());
+        assert!(may_stop_before_update(&Probe::Harness, false, false).is_err());
+    }
+
+    /// Taking the port from another Harness kills a session someone may be watching, so the
+    /// decision needs both an identity and explicit permission.
+    #[test]
+    fn a_foreign_instance_is_only_taken_over_when_it_is_identified() {
+        const CMD: &str = "/opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --port 3080";
+
+        // Identified and allowed: the only path that signals anything.
+        assert_eq!(
+            foreign_instance_action(true, Some(4242), Some(CMD)),
+            ForeignAction::TakeOver { pid: 4242 }
+        );
+        // Identified, not allowed: the default. The instance keeps running.
+        assert_eq!(
+            foreign_instance_action(false, Some(4242), Some(CMD)),
+            ForeignAction::UseBrowser
+        );
+        // The port answers like a Harness, but nothing proves which program it is. This is the
+        // case the old code killed: an unrelated server on the configured port.
+        assert!(matches!(
+            foreign_instance_action(true, Some(4242), Some("/usr/bin/python3 -m http.server")),
+            ForeignAction::Refuse { .. }
+        ));
+        // A command line the platform would not report is not proof either, even with permission.
+        assert!(matches!(
+            foreign_instance_action(true, Some(4242), None),
+            ForeignAction::Refuse { .. }
+        ));
+        assert!(matches!(
+            foreign_instance_action(true, None, Some(CMD)),
+            ForeignAction::Refuse { .. }
+        ));
     }
 
     #[test]
@@ -2632,22 +2770,46 @@ mod tests {
     }
 
     #[test]
-    fn system_updates_defaults_to_upgrading_the_user_install() {
+    fn system_updates_defaults_to_leaving_the_user_install_alone() {
         let dir = std::env::temp_dir().join("dsh-desktop-system-updates-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // The pre-bundled behaviour: an upgrade installs. Losing that silently would be a
-        // regression for everyone already running this shell.
-        assert_eq!(
-            Config::load(&dir).system_updates,
-            runtime::SystemUpdates::Install
-        );
-        std::fs::write(dir.join("config.json"), "{\"system_updates\": \"notify\"}").unwrap();
+        // A prefix this shell does not own is not rewritten unless the user asks for it: an
+        // automatic `npm install -g` can change a CLI other tools on the machine share.
         assert_eq!(
             Config::load(&dir).system_updates,
             runtime::SystemUpdates::Notify
         );
+        std::fs::write(dir.join("config.json"), "{\"system_updates\": \"install\"}").unwrap();
+        assert_eq!(
+            Config::load(&dir).system_updates,
+            runtime::SystemUpdates::Install
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The defaults a user gets without editing anything. Every one of these decides whether the
+    /// shell may touch something it does not own, so each is asserted rather than assumed.
+    #[test]
+    fn defaults_do_not_take_over_foreign_state() {
+        let dir = std::env::temp_dir().join("dsh-desktop-config-defaults-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config::load(&dir);
+
+        // Killing whatever holds the port is the user's call, not a startup path's.
+        assert!(!config.take_over_existing);
+        // A prerelease channel is not a default target for a desktop user.
+        assert_eq!(config.update_tags, vec!["latest".to_string()]);
+        // A profile is user data; keeping its plugin tree current is opt-in.
+        assert!(!config.auto_update_plugins);
+        // The shell parses the CLI's startup line, so an untested version is refused by default.
+        assert!(config.require_tested_dsh);
+        assert_eq!(config.system_updates, runtime::SystemUpdates::Notify);
+        // Still on: the bundled/shadow runtime is this shell's own tree to update.
+        assert!(config.auto_update);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

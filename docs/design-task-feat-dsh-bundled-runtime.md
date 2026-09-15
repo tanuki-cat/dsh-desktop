@@ -153,6 +153,15 @@ DSH Desktop.app/Contents/Resources/runtime/
   用户自己的前缀"的既有行为 —— 老用户静默失去自动升级比一次 npm 全局写入更糟；想只提示就写 `notify`。
   装到哪个前缀仍由 `update::install_prefix(dsh_js)` 从 CLI 位置反推（与旧实现一致）；自带运行时不受该开关
   影响（始终写影子前缀）。"GUI 偷偷改我环境"的顾虑交给这个显式开关，而不是替用户默认关掉；
+
+  > **2026-09-15 修正（默认值反转）**：`system_updates` 默认改为 **`notify`**。上面这条决策的权衡是
+  > 「老用户静默失去自动升级比一次 npm 全局写入更糟」；反转的理由是：`npm install -g` 改的是**机器上
+  > 其它工具也在用**的全局前缀，而桌面壳无法知道谁还在用它。想保留原来的行为就显式写 `install`。
+  > 自带/影子运行时的自动更新不受影响 —— 那棵树是本壳自己的。
+  >
+  > 同轮一并收敛：`auto_update_plugins` 默认 `false`（profile 是用户数据；这也消解了
+  > `design-task-fix-v0-2-0-post-merge-audit.md` 的 A3「两个更新开关策略不一致」），
+  > `update_tags` 默认 `["latest"]`。见 `docs/dsh-desktop-v0.4.1-code-review.md` 第 2 项。
 - **决策要稳定且可见**：系统运行时依赖登录 shell 探测，rc 文件改动或导入失败都会让结果在两次启动之间翻转。
   因此：探测一次后把结论与版本写进配置/诊断，并保留手动 `runtime: system | bundled | auto` 覆盖；
   启动日志与状态页显示 `runtime: system (node 22.23.2 / dsh 0.1.5-rc.2)` 这类信息。

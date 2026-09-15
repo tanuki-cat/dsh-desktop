@@ -8,9 +8,114 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+/// Whole-process budget for an npm/pnpm operation.
+///
+/// `--fetch-timeout` only bounds one registry request. npm still hangs on a proxy that accepts
+/// and stalls, a DNS server that never answers, a lock held by another npm, a lifecycle script
+/// waiting on stdin, or a child of its own that outlives it — none of which the fetch budget
+/// covers. The supervised Harness is already stopped when these run, so an unbounded call leaves
+/// the user with no window and no Harness until they kill the app.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A shorter budget for a read-only registry query: the same stalls apply, and the startup path
+/// is blocked on the answer.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for the last of a killed command's output before giving up on it.
+///
+/// The bytes are only ever used to explain a failure, so a straggler must not become a second
+/// unbounded wait after the first one was already cut short.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// What one finished command produced.
+struct Output {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run a command with a whole-process timeout, killing it and its children on expiry.
+///
+/// `Command::output()` waits for ever, so a hung npm parks the startup thread and leaves the user
+/// on a splash page with no way out. The child gets its own process group (its own console group on
+/// Windows) so the kill reaches whatever npm spawned: signalling only the parent leaves a node
+/// child holding the registry connection.
+fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<Output, String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("无法执行命令: {error}"))?;
+    let pid = child.id();
+
+    // Drain both pipes on their own threads: a child that fills a pipe buffer blocks for ever,
+    // and the timeout below would then fire on a process that was only waiting to be read.
+    let stdout = child.stdout.take().map(drain);
+    let stderr = child.stderr.take().map(drain);
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                crate::process::kill_tree(pid);
+                let _ = child.wait();
+                return Err(format!("命令超过 {} 秒未结束，已终止", timeout.as_secs()));
+            }
+            Err(error) => {
+                crate::process::kill_tree(pid);
+                let _ = child.wait();
+                return Err(format!("等待命令结束失败: {error}"));
+            }
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: collected(stdout),
+        stderr: collected(stderr),
+    })
+}
+
+/// Read one of the child's pipes to the end on its own thread, reporting through a channel.
+///
+/// A channel rather than a `JoinHandle`: the reader ends when the last writer closes the pipe, and
+/// a grandchild that survived the kill would hold it open for ever. Waiting on a join there would
+/// reintroduce exactly the unbounded wait the timeout exists to remove, so the caller bounds it.
+fn drain<R: Read + Send + 'static>(mut pipe: R) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = pipe.read_to_end(&mut buffer);
+        let _ = tx.send(buffer);
+    });
+    rx
+}
+
+/// Whatever a drain thread managed to read before its budget ran out.
+fn collected(rx: Option<mpsc::Receiver<Vec<u8>>>) -> Vec<u8> {
+    rx.and_then(|rx| rx.recv_timeout(DRAIN_GRACE).ok())
+        .unwrap_or_default()
+}
 
 /// The CLI this shell supervises.
 pub const PACKAGE: &str = "@deepseek-ai/dsh";
@@ -139,6 +244,17 @@ impl Compatibility {
     }
 }
 
+/// May the shell install `to`, given whether it would refuse to run it afterwards?
+///
+/// `auto_update` and `require_tested_dsh` pull in opposite directions the moment `latest` moves
+/// past the tested window. Installing first and refusing to boot afterwards is the worst of the
+/// two outcomes: the user is left with a CLI this shell just wrote there and will not start, and
+/// the previous, working version is already gone. The install is therefore bounded by the same
+/// range the startup check enforces — what will not be run is not installed.
+pub fn may_install(to: &str, require_tested: bool) -> bool {
+    !require_tested || matches!(compatibility(to), Compatibility::Tested)
+}
+
 /// Compare an installed CLI version against the tested range. Pure: the caller decides whether
 /// to warn or refuse.
 pub fn compatibility(version: &str) -> Compatibility {
@@ -245,18 +361,20 @@ fn npm_command(npm: &Path) -> Command {
 
 /// Read `npm view <pkg> dist-tags --json` and return the tags that exist.
 pub fn fetch_dist_tags(npm: &Path, package: &str) -> Result<Vec<(String, String)>, String> {
-    let timeout = format!("--fetch-timeout={FETCH_TIMEOUT_MS}");
-    let output = npm_command(npm)
-        .args([
-            "view",
-            package,
-            "dist-tags",
-            "--json",
-            timeout.as_str(),
-            "--fetch-retries=1",
-        ])
-        .output()
-        .map_err(|error| format!("无法执行 npm: {error}"))?;
+    let fetch = format!("--fetch-timeout={FETCH_TIMEOUT_MS}");
+    let mut command = npm_command(npm);
+    command.args([
+        "view",
+        package,
+        "dist-tags",
+        "--json",
+        fetch.as_str(),
+        "--fetch-retries=1",
+    ]);
+    // A whole-process budget on top of `--fetch-timeout`: the flag bounds one request, while a
+    // stalled proxy or a registry that never answers can park the startup path indefinitely.
+    let output =
+        run_with_timeout(command, QUERY_TIMEOUT).map_err(|error| format!("npm view: {error}"))?;
     if !output.status.success() {
         let tail: String = String::from_utf8_lossy(&output.stderr)
             .lines()
@@ -400,6 +518,11 @@ pub fn install(
 ) -> Result<(), String> {
     let mut command = npm_command(npm);
     command.args(["install", "-g", "--no-fund", "--no-audit"]);
+    // A whole-process budget as well as npm's own fetch flags: lifecycle scripts, a lock held
+    // by another npm, or a registry that stops answering mid-install all outlive `--fetch-timeout`
+    // and would otherwise park this call for ever — with the Harness already stopped.
+    command.arg(format!("--fetch-timeout={FETCH_TIMEOUT_MS}"));
+    command.arg("--fetch-retries=1");
     // The dependency tree is ~289 MB: point npm at this app's own cache instead of the
     // user's global one (plan §4, review P2-11).
     if let Some(dir) = cache {
@@ -414,9 +537,8 @@ pub fn install(
         }
     }
     command.arg(format!("{package}@{version}"));
-    let output = command
-        .output()
-        .map_err(|error| format!("无法执行 npm install: {error}"))?;
+    let output = run_with_timeout(command, INSTALL_TIMEOUT)
+        .map_err(|error| format!("npm install: {error}"))?;
     if output.status.success() {
         return Ok(());
     }
@@ -492,9 +614,10 @@ pub fn install_plugin(
     if let Some(home) = dsh_home {
         command.env("DSH_HOME", home);
     }
-    let output = command
-        .output()
-        .map_err(|error| format!("无法执行 dsh plugin: {error}"))?;
+    // pnpm runs under this call and installs into the user's profile: same budget as the core
+    // install, for the same reason (it runs after the Harness was stopped).
+    let output = run_with_timeout(command, INSTALL_TIMEOUT)
+        .map_err(|error| format!("dsh plugin add: {error}"))?;
     if output.status.success() {
         return Ok(());
     }
@@ -1295,6 +1418,25 @@ mod tests {
         assert!(
             Version::parse(TESTED_MIN).unwrap() < Version::parse(TESTED_MAX_EXCLUSIVE).unwrap()
         );
+    }
+
+    /// `auto_update` and `require_tested_dsh` are on together by default, so the update path has
+    /// to respect the same range the startup check enforces. Installing a version that would then
+    /// be refused leaves the user with a CLI this shell wrote and will not run, and the working
+    /// version already overwritten.
+    #[test]
+    fn a_version_that_would_not_be_run_is_not_installed() {
+        // Inside the tested range: install normally.
+        assert!(may_install("0.1.5-rc.2", true));
+        assert!(may_install("0.1.9", true));
+        // Past it: the startup check would refuse, so the install must not happen either.
+        assert!(!may_install("0.2.0", true));
+        assert!(!may_install("1.0.0", true));
+        assert!(!may_install("未知", true));
+        // With the gate switched off the user has accepted untested versions, so both steps
+        // let them through.
+        assert!(may_install("0.2.0", false));
+        assert!(may_install("1.0.0", false));
     }
 
     #[cfg(unix)]

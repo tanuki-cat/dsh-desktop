@@ -19,7 +19,16 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 > 并在状态窗口里写清原因 —— 不会再把用户丢给 harness 那句 `Failed to load plugins`。
 > 其中 `Math.sumPrecise` 是**所有** Safari 都没有的 API（随包 PDF 写路径一直因此抛错），所以现代系统上
 > 也会注入这一小块。
-> `minimumSystemVersion` 仍是 11.0：那只约束安装与进程启动，界面另有这道运行时判定（见[已知坑](#已知坑)）。
+>
+> **三个不同的下限，别混为一谈**：
+>
+> | 说的是什么 | 下限 | 由谁决定 |
+> |---|---|---|
+> | 精简壳能装、能启动 | macOS 10.15 | `tauri.conf.json` 的 `minimumSystemVersion` |
+> | **自带运行时**版能装、能启动 | macOS 11.0 | 随包 node 22 的 `minos`；`make bundle-bundled` 用 `--config` 覆盖。声明 10.15 会「能装、能开壳、一起 harness 就崩」 |
+> | 界面能用**原生窗口** | Safari 16.4（macOS 13.3） | 壳在打开界面前的运行时能力探测 + 兼容层 |
+>
+> 低于第三个下限不是「不能用」：壳会改用系统浏览器渲染界面，自己继续监管 harness（见[已知坑](#已知坑)）。
 >
 > **分支策略**：自带运行时开发用的 `feat/bundled-runtime` 已合并回 `main`（2026-09-13），
 > 后续开发直接在 `main` 上进行；该分支只作历史快照保留。
@@ -35,7 +44,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 
 - locator：解析 dsh 启动器、其真实 `lib/bin.js`（穿软链）、以及 node（GUI 启动没有 Homebrew PATH）
 - 启动：launcher flag 顺序、显式 cwd（agent workspace）、`--patch` overlay 强制 `printUrl`、独立进程组
-- 输出：持续读 stdout/stderr、token 脱敏写日志（5MB × 3 份轮转，写入前判定）、200 行环缓冲用于错误页
+- 输出：持续读 stdout/stderr、**凭据脱敏**写日志（launch token、`Bearer`、`api_key`、`Cookie`/`Set-Cookie`、`password`、`secret` 等，见下）、5MB × 3 份轮转（写入前判定）、200 行环缓冲用于错误页
 - URL：解析首个 token（对 `(LAN: ...)` 后缀健壮）、首启 90s / 常态 30s 超时
 - 实例：固定端口；探测 → 复用自己上次的实例 / 接管外部 Harness / 占用时错误页
 - 生命周期：退出即 SIGTERM 进程组（5s 后 SIGKILL）并删除 state.json —— 关闭窗口（`RunEvent::ExitRequested`）
@@ -45,11 +54,15 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 - 看护线程：启动成功后继续 `wait` 子进程，Harness 意外退出会清掉 state.json 并**自动把它拉起来**：先给 8s（崩溃/被杀只给 2s）等一次"交接"——插件市场的「立即重启」就是宿主干净退出、由 detached helper 在同一端口拉起替代进程；端口重新服务时先停掉那个替代进程（它的 cwd 是 CLI 目录、不是本壳配置的 workspace），再按本壳的 runtime/workspace/凭据启动自己的实例，成功后直接把窗口切到新的 token URL。连续 3 次短命重启都没稳定下来才弹终态状态页；运行满 60s 记一次健康、计数归零。状态页带「重新启动 Harness」按钮（同一进程内重跑启动流程），此时另起一个实例（single-instance 回调）或点 Dock 图标（macOS 的 `RunEvent::Reopen`）也等价于按这个按钮；浏览器回退页没有按钮、也不响应这两个入口
 - 残留自愈：只有强杀/崩溃这类拿不到回调的场景才靠下次启动清理；state.json 0600。记录的 pid 仍监听记录的端口时才发信号；仍服务**本次端口**的记录会保留，让启动流程直接复用而不是重启；pid 已不拥有该端口时，只有"命令行含 `--profile web`/`dsh`，且父进程已消失或由 launchd / `systemd --user` 接管"的残留才会被清理（pid 复用、以及别人正在跑的会话都不动）
 - 安全：Harness 窗口零 capability、导航限定当次 authority、外链与 `window.open` 只把 `http`/`https` 交系统浏览器（`file:`、自定义 scheme 记 `external scheme blocked` 后丢弃）
+- CSP：本地 splash 页面走 `tauri.conf.json` 的 `app.security.csp`（无 `unsafe-inline`/`unsafe-eval`，Tauri 为页面内联脚本自动补 sha256、为样式补 nonce）。**作用范围仅限本地资产**：harness 窗口加载的是 `http://127.0.0.1:<port>/`，Tauri 不参与该请求，也就无法给它加 CSP —— 那一边靠的是零 capability + 导航围栏。
 - 下载：`on_download` 落盘到 `~/Downloads`，同名文件自动加 `-1`/`-2` 后缀（不静默覆盖）；
   附件上传由 wry 的 `runOpenPanel` 原生处理
-- **升级**：每次启动查 registry（默认取 `latest`+`next` 最高版本）—— dsh 核心有新版就装并重启实例；
-  profile 里的插件市场 `dshmarket` 走同一套机制（自己的缓存窗口，装完同样重启让新插件生效）；
-  npm 子进程显式带上 node 所在目录的 PATH（否则 GUI 启动下 `#!/usr/bin/env node` 必然 exit 127）
+- **升级**：每次启动查 registry（默认只取 `latest`）—— dsh 核心有新版、且**在已测试区间内**时才装并重启实例；
+  用户自己装的那棵树默认只提示（`system_updates: notify`）。profile 里的插件市场 `dshmarket` 走同一套机制
+  （自己的缓存窗口，装完同样重启让新插件生效），但默认关闭（`auto_update_plugins: false`）；
+  npm 子进程显式带上 node 所在目录的 PATH（否则 GUI 启动下 `#!/usr/bin/env node` 必然 exit 127），
+  且整个子进程有**进程级超时**（`--fetch-timeout` 只管单次请求；代理挂起、锁等待、生命周期脚本都可能
+  让它永不返回，而那时 harness 已经被停掉了）
 - 打包：`pnpm tauri build --bundles app` → `DSH Desktop.app`
 
 **验证**
@@ -72,7 +85,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   `plugin update available: dshmarket 1.45.1 -> 1.46.1, installing`、`plugin updated: dshmarket 1.45.1 -> 1.46.1`，
   随后 harness 重启并正常服务；profile 的依赖范围被改写为 `^1.46.1`、`node_modules` 内实装 1.46.1，
   且 `plugin-check.json` 与核心的 `update-check.json` 各自独立（时间戳与内容互不影响）。
-- 离线测试：`cargo test` **102 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
+- 离线测试：`cargo test` **116 passed**，另有 **5 个集成用例**（在真实 node 引擎里跑兼容层与探测脚本）。单测覆盖：URL 解析含 LAN 后缀、凭据脱敏（`Bearer`/`api_key`/`Cookie` 等）、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
   缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口与跨窗口都不重复安装"、npm PATH 前缀、沉默对端探针超时、
   package.json 版本解析、部分/损坏 config.json 处理、workspace / dsh_path 回退不改文件、HOME 缺失不回落 `/`、
@@ -97,7 +110,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   合并自带运行时后另有：运行时决策矩阵与能力门槛、
   影子前缀与版本仲裁、`Origin::Env` 不算自带、播种与首启超时、更新后切树回读、
   插件市场 profile 判定与插件缓存隔离）。
-- 权限：`config.json`（`env` 字段可能放 API Key）与 `state.json` 均为 0600；旧版本留下的 0644 文件会在下次启动时被就地收紧（实机已确认）。
+- 权限：`config.json`（`env` 字段可能放 API Key）与 `state.json` 在 Unix 上为 0600，Windows 上为「去掉继承 + 仅当前用户」的显式 ACL；旧版本留下的 0644 文件会在下次启动时被就地收紧（实机已确认）。
 - 更新链路的失败证据也来自实机日志：修复前每次 GUI 启动都记 `npm view 失败: env: node: No such file or directory`
   （见设计文档 §13.8）。
 - 联网测试：`make test-live` → registry head = 0.1.5-rc.2 且不降级；**冷查询 1168–1217 ms → 缓存命中 0 ms**。
@@ -112,7 +125,8 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 `process.rs` 的存活探测用的是 `OpenProcess` + `GetExitCodeProcess`。本机可用
 `cargo clippy --target x86_64-pc-windows-gnu` 对 `cfg(windows)` 代码做回归（只检查类型与 lint，不能运行 PE）。
 
-**未做**：签名与公证（对外分发必需）、多 workspace 切换 UI、"回退 + last-known-good"（方案 §2.3 规则 2）。
+**未做**：签名与公证（对外分发必需）、多 workspace 切换 UI、"回退 + last-known-good"（方案 §2.3 规则 2，
+即更新事务/原子切换/失败回滚）。这三项都不在代码层可独立完成：前两项需要开发者证书，第三项是独立特性。
 **自带运行时（打包 Node/dsh）**已随 `feat/bundled-runtime` 并入 `main`（2026-09-13）：macOS `.app`
 本机实测可跑、Windows 免安装包实机验证通过，见下方[自带运行时](#自带运行时已并入-main)一节。
 
@@ -199,8 +213,8 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   能力探测带 5 秒超时，版本管理器 shim 挂住时不会把启动页卡死；
 - 自带时：首启播种 profile 模板（含插件市场）、PATH 前置自带工具目录、注入 `npm_config_prefix`／
   `PNPM_HOME` 指向可写前缀；核心更新只落到 `app-data/runtime/prefix`；
-- 用系统安装时：**默认仍然就地升级**（`system_updates: install`，与自带运行时之前的行为一致），
-  想自己管升级就写 `system_updates: notify`（只提示，不动用户的全局前缀）；
+- 用系统安装时：**默认只提示不升级**（`system_updates: notify`）—— 那棵树是用户自己装的，
+  `npm install -g` 会改动机器上别的工具也在用的全局前缀；想让壳就地升级就写 `system_updates: install`；
 - **node 与 dsh 分开解析**：系统装了 node 但没装 dsh 时，可以「系统 node + 自带 dsh」混用（方案 §2.4 的那一格以前不可达）；
 - **只有本壳自己的树才算「自带」**：seed（包内）与影子前缀（`app-data/runtime/prefix`）会得到 PATH 前置、
   `npm_config_prefix`／`PNPM_HOME` 注入与首启播种；`DSH_DESKTOP_DSH`／`DSH_DESKTOP_RUNTIME` 指向的树按**用户的**处理 ——
@@ -236,8 +250,10 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 ### 与 CLI 的兼容边界（已实测）
 
 壳对 `dsh` CLI 有 5 个隐含契约：`--profile web`、`--patch <yaml>`、`--no-open`、`--port N`（顺序固定），
-以及 stdout 里的启动 URL 行。区间外的版本会在启动日志里记一条 warning，状态页显示「未测试版本」；
-把 `require_tested_dsh` 设成 `true` 可改为直接拒绝启动。当前测试区间：`>= 0.1.5-rc.1, < 0.2.0`（常量在 `update.rs`）。
+以及 stdout 里的启动 URL 行。区间外的版本**默认拒绝启动**（`require_tested_dsh: true`），错误页写明原因；
+设成 `false` 则只记一条 warning 并在状态页标注「未测试版本」。同一开关也约束自动安装 —— 会被拒绝启动的
+版本不会被装上（否则壳会把你正在用的版本换成它自己又拒绝运行的那一个）。当前测试区间：
+`>= 0.1.5-rc.1, < 0.2.0`（常量在 `update.rs`）。
 
 启动 URL 的解析**不依赖**上游那行文案：优先按 `dsh web:` 前缀取第一个 token，前缀不在时就退化为
 「扫描行内第一个 loopback `http://127.0.0.1:…/?token=…`」，scheme/host/token query 仍然强校验。
@@ -252,13 +268,14 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 | `workspace` | `$HOME` | 传给 dsh 的工作目录 = agent 的 workspace root。不是已存在的绝对目录时本次回落到默认值并记日志（**不改写你的文件**） |
 | `dsh_path` | `null` | 记住的 `dsh` 启动器绝对路径：自动搜索顺序为 `DSH_DESKTOP_DSH` → 本字段 → PATH → 常见目录 → login shell。相对路径或不存在的文件本次忽略并记日志 |
 | `dsh_home` | `null` | `null` 表示共用 `~/.dsh`（插件/设置/会话全保留）；指向别的目录则隔离 |
-| `take_over_existing` | `true` | 端口被外部 Harness 占用时，停止它并接管；`false` 则改用系统浏览器打开 |
-| `auto_update` | `true` | 启动时检查并安装 dsh 新版本 |
-| `auto_update_plugins` | `true` | 同时也把 profile 里的插件市场（`dshmarket`）更新到 registry 上的最新版；它会改写你 profile 的 `package.json`/锁文件，所以单独一个开关 |
-| `update_tags` | `["latest","next"]` | 取其中最高版本；只跟正式版就写 `["latest"]` |
+| `take_over_existing` | `false` | 端口被**外部** Harness（不是本应用启动的）占用时是否停掉它并接管。默认不接管：改用系统浏览器打开那个实例。设为 `true` 才会接管，且**只在该进程的命令行确实像 `dsh web` 时**才发信号 |
+| `auto_update` | `true` | 启动时检查并安装 dsh 新版本（自带/影子运行时总是更新自己的树） |
+| `auto_update_plugins` | `false` | 是否把 profile 里的插件市场（`dshmarket`）也更新到 registry 上的最新版。默认关：它会改写你 profile 的 `package.json`/锁文件，而 profile 是用户数据 |
+| `update_tags` | `["latest"]` | 取其中最高版本。默认只跟正式版；想跟预发布再加 `"next"` |
 | `update_check_interval_minutes` | `60` | 一次成功的查询结果缓存多久（0 = 每次启动都查）。查询实测约 1.2–1.9 s，缓存命中 0 ms |
 | `import_shell_env` | `true` | 启动时导入登录 shell 的环境变量（见下节）。`false` 则只用 App 自身环境 |
-| `require_tested_dsh` | `false` | CLI 版本落在已测试区间外时是否拒绝启动。默认只告警并继续（状态页标注「未测试版本」） |
+| `require_tested_dsh` | `true` | CLI 版本落在已测试区间外时是否拒绝启动。默认拒绝：本壳靠解析 CLI 的启动行工作，区间外可能以看不懂的方式失败。设 `false` 则只告警并继续（状态页标注「未测试版本」）。它同时约束**自动安装**：会被拒绝启动的版本也不会被装上 |
+| `system_updates` | `"notify"` | 被监管的 CLI 是**用户自己装的**且上游有新版本时：`notify` 只提示、不动你的全局前缀；`install` 就地升级（自带/影子运行时不受此项影响，它总是更新自己的树） |
 | `webkit_compat` | `true` | 旧 WebView 上注入兼容层（`Iterator` 等，见[已知坑](#已知坑)），让 macOS 13.3+ 用原生窗口。`false` 恢复旧行为：缺任何能力都改用默认浏览器 |
 | `runtime` | `"auto"` | 运行时来源：`auto` 用系统已装的（通过门槛时），否则用自带；`bundled` 强制自带；`system` 保持旧行为（开发用） |
 | —— | —— | **候选必须真的是 `@deepseek-ai/dsh`**：PATH 上同名但不是这个 npm 包的 `dsh`（Homebrew 的 Dancer's shell、自定义 shim…）会被跳过并记日志；全部候选都不合格时报错页，而不是随便监管一个同名程序。识别不出来的 node 启动脚本只有在 `--version` 真的打印出版本号时才被采用（旧布局的兜底） |
@@ -267,7 +284,16 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 只要写你想改的字段即可：`port` / `workspace` 缺失会取默认值，其余字段本就有默认值。
 若文件整体无法解析，本次运行使用默认配置并记一条日志，**但不会覆盖你的文件**（只有文件不存在时才会写入）。
 
-状态与日志：`<app-data>/state.json`（0600）、`<app-data>/logs/harness.log`（脱敏；写入前判定 5MB × 3 份轮转，即 `harness.log` + `.1`/`.2`/`.3`）。
+状态与日志：`<app-data>/state.json`、`<app-data>/logs/harness.log`（脱敏；写入前判定 5MB × 3 份轮转，
+即 `harness.log` + `.1`/`.2`/`.3`）。两个文件都按「仅当前用户可读」写入：Unix 上是 `0600`，
+Windows 上用 `icacls` 去掉继承并只授权当前用户 —— `config.json` 的 `env` 可能存着 API Key，
+而用户目录下的文件默认会继承父目录的 ACL（共享/域机器上可能包含其他账户）。
+
+**日志脱敏范围**：`token=` 只是第一个。凡是经过日志行的内容都会把下列字段的值替换为 `***` ——
+`token`、`api_key`/`apikey`/`api-key`、`authorization`（含 `Bearer <凭据>`）、`cookie`/`set-cookie`、
+`password`/`passwd`、`secret`、`private_key`、`access_key`、`session_id`。provider 报错常把请求头原样回显，
+这条覆盖的是那种情况。**不含** workspace 路径等隐私信息：日志要能定位问题，路径是其中一部分，
+需要更少留存时请自行清理 `<app-data>/logs/`。
 macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.desktop/`。
 
 ## 环境变量（API Key 等）
@@ -281,6 +307,9 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 
 - 实测开销 **约 160 ms**（在版本读取/更新检查的同一时间段内并行执行，基本不占启动关键路径），
   取到约 46 个变量，输出 0 行噪音；
+- **它会执行你的 `.zprofile`/`.zshrc`**：这两个文件里若有联网、改文件、拉起后台进程或耗时操作，
+  每次启动应用都会连带发生。8 秒超时只能让壳不再等它，**不能撤销已经发生的副作用**。
+  不想这样就设 `"import_shell_env": false`，改用下面的 `env` 字段显式给出需要的变量；
 - **只把变量名写进日志**（值可能是密钥，永不落盘）；
 - 保留 App 自己管理的变量：`HOME`/`TMPDIR`/`SHELL`/`SHLVL`/`PWD`/`_`/`DSH_*` 等不导入；
 - `PATH` 走合并策略：**自带 node 目录 → `/opt/homebrew/bin` → `/usr/local/bin` → shell 的 PATH → App 的 PATH**（去重、只保留绝对路径），
@@ -295,13 +324,14 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 |---|---|
 | 端口无监听 | 定位 dsh/node（**逐个候选校验身份**，见配置表末行）→ 启动 → 等 URL → 打开窗口。状态页写明用的是哪棵树：`dsh 0.1.5-rc.2 · system /opt/homebrew/lib/node_modules/… · 端口 3080` |
 | 端口上是本应用上次启动的实例（state.json 对得上且存活） | 直接复用（cookie 对同一 authority 仍有效，实测跨重启有效） |
-| 端口上是**别人**启动的 Harness（CLI / Automator） | **接管**：401 特征确认身份 → 对该 PID 发 SIGTERM → 等端口释放 → 自启拿新 token |
-| 启动前发现新版 dsh | 先升级 CLI（splash 显示进度），随后重启实例跑新版本 |
-| 启动前发现新版插件市场 | 先停实例 → `dsh plugin --profile web add dshmarket@<版本>` → 重启实例（`auto_update_plugins: false` 可关） |
+| 端口上是**别人**启动的 Harness（CLI / Automator） | 默认**不接管**：用系统浏览器打开那个实例并说明原因。`take_over_existing: true` 时才接管，且需两道身份同时成立 —— 401 特征 + 该 PID 命令行像 `dsh web`（`plugin` 子命令不算）→ 对该 PID 发 SIGTERM（只发单进程，不碰它的进程组）→ 等端口释放 → 自启拿新 token |
+| 启动前发现新版 dsh | 先升级 CLI（splash 显示进度），随后重启实例跑新版本。用户自己装的那棵树默认**只提示不升级**（`system_updates: notify`）；新版本若超出已测试区间，在 `require_tested_dsh` 默认开启时**不安装**（装了也会被拒绝启动） |
+| 启动前发现新版插件市场 | 先停实例 → `dsh plugin --profile web add dshmarket@<版本>` → 重启实例。默认**不做**（`auto_update_plugins: false`），设为 `true` 才开启 |
 | WebView 缺可补的 API（如 `Iterator`） | 向 harness 窗口注入兼容层（ES5、逐块自守卫、只装缺的那些）后照常开原生窗口，日志记 `WebView 缺少 …：已注入兼容层`；`webkit_compat: false` 时改成"未注入"并走浏览器 |
 | WebView 缺补不了的能力（目前只有 `class static block` 语法） | 不打开 harness 窗口：改用默认浏览器 + 状态窗口写明缺什么、界面需要 Safari 16.4 及以上 |
-| 端口被别的程序占用 | 错误页，提示改 `config.json` 的端口 |
-| `take_over_existing: false` 且是外部 Harness | 不接管：用系统浏览器打开并给出说明 |
+| 端口被别的程序占用（不是 Harness 协议） | 错误页，提示改 `config.json` 的端口。**普通 HTTP 服务（含返回 200 的 Vite/Node/Java）走这一条**：401 认证栅栏是唯一的 Harness 判据 |
+| `take_over_existing: false`（默认）且是外部 Harness | 不接管：用系统浏览器打开并给出说明 |
+| 端口按 Harness 协议应答，但读不到 / 不像 `dsh web` 的命令行 | 不接管也不报"被别的程序占用"：拒绝接管并说明无法确认身份（避免误杀），提示手动停止或换端口 |
 | 关闭窗口（红点 / ⌘W） | `AppHandle::exit(0)` → `RunEvent::ExitRequested` → SIGTERM 进程组 → 删状态文件 |
 | ⌘Q / Dock 退出 / `quit app` | tao `application_will_terminate` → `RunEvent::Exit` → 同样的清理（幂等） |
 | 退出发生在 Harness 启动途中 | `EXITING` 标志：刚起来的子进程立即停掉，不会漏成孤儿 |
@@ -310,8 +340,8 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | 启动等待 URL 超时 / 窗口创建失败 | 停掉刚起的子进程 → 状态页报错（不会留下占着端口的半启动实例） |
 | 启动成功后 Harness 意外退出 | 看护线程发现退出 → 清 state.json → 销毁 Harness 窗口、状态页显示"正在重新启动…" → **自动重启**：干净退出（退出码 0，插件市场「立即重启」就是这一种）先等 8s，端口被替代实例接管时先停掉它再按本壳的 workspace 启自己的；崩溃/被杀 2s 后直接自启。成功后切到新的 token URL；连续 3 次短命重启未稳定才停在终态报错页（带「重新启动 Harness」按钮） |
 | 窗口首次加载失败 | 20 s 内没有收到"加载开始"事件（导航根本没起来，无论端口是否健康）→ 退避重试同一 token URL，最多 3 次；已经开始加载则一律不打扰。次数用尽且端口也不再服务才弹状态页；端口仍健康时只记日志，不在事件不投递的环境里给正常应用弹错误页 |
-| 页面停止刷新（能点击能输入、模型输出不更新） | 页面里的动画帧计数连续 2 次没变化 → 重新加载当前 URL（最多 3 次），标题显示"页面已停止刷新，正在重新加载…"（日志记 `Harness 页面停止绘制（输入仍有响应）`）。窗口不在前台时 WebKit 本就可以停画，这种探测不计数、不消耗重载预算 |
-| 页面完全无响应（渲染进程被杀 / 主线程卡死） | 15s 一次的探测连续 2 次收不到应答 → 同样重新加载（最多 3 次）；macOS 上渲染进程被系统结束时会立刻重载（日志记 `WebView 渲染进程被系统结束（多为内存压力）`）。加载完成后标题自动恢复；3 次仍不回来 → 标题停在"页面已停止刷新，请重启应用"并记日志 |
+| 页面停止刷新（能点击能输入、模型输出不更新） | 页面里的动画帧计数连续 2 次没变化 → 重新加载当前 URL（最多 3 次），标题显示"页面已停止刷新，正在重新加载…"（日志记 `Harness 页面停止绘制（输入仍有响应）`）。窗口不在前台时 WebKit 本就可以停画，这种探测不计数、不消耗重载预算。**重载前会先问页面是否正在被输入**：焦点在输入框、或最近 15 s 内有按键/粘贴 → 推迟一轮（标题显示"等待输入结束…"），避免丢掉未提交的提示词；输入停下后照常重载，重载预算不受影响 |
+| 页面完全无响应（渲染进程被杀 / 主线程卡死） | 15s 一次的探测连续 2 次收不到应答 → 同样重新加载（最多 3 次）。**无应答不算"正在输入"**：能回答"我在输入"的代码正是已经停掉的那部分，所以静默一律按需要恢复处理；macOS 上渲染进程被系统结束时会立刻重载（日志记 `WebView 渲染进程被系统结束（多为内存压力）`）。加载完成后标题自动恢复；3 次仍不回来 → 标题停在"页面已停止刷新，请重启应用"并记日志 |
 | 页面里的非 http/https 链接（`file:`、自定义 scheme…） | 不交给系统：日志记 `external scheme blocked: <scheme> (...)` 后丢弃 |
 | 有新版 dsh 但端口上是外部实例且不允许接管 | 跳过本次更新（不重写别人正在用的树），实例继续服务，日志记 `update deferred` |
 | 下载同名文件 | 自动改名 `name-1.ext`，不覆盖已有文件 |
@@ -336,7 +366,8 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 
 0. **先看缓存**：`<app-data>/update-check.json` 里的结论在 `update_check_interval_minutes`（默认 60）内且已安装版本未变 → 直接沿用，不联网（实测 0 ms vs 1.2 s）。查询失败也会缓存，但只缓存 5 分钟，离线时不至于每次启动都干等；
 1. 需要联网时：`npm view @deepseek-ai/dsh dist-tags --json` → 在 `update_tags` 里取版本号最高者
-   （fetch 超时压到 **8 s**，离线时快速回退而不是等 npm 默认的 25 s）；
+   （fetch 超时压到 **8 s**，且整个 npm 子进程有**进程级超时** —— `--fetch-timeout` 只管单次请求，
+   代理挂起、锁等待、生命周期脚本都可能让 npm 永远不返回；超时后连同其子进程一起清理）；
 2. 与已安装版本做 semver 比较（`rc.2 > rc.1 > alpha.2`，正式版高于同号预发布版），**从不降级**；
 3. **先把正在使用这棵 CLI 树的实例停掉**：npm 是原地重写依赖树，而 node 按需懒加载模块 ——
    树被换走后运行中的 harness 下一次 `require()` 会直接 `MODULE_NOT_FOUND`（实测）。所以先 SIGTERM 停实例、
