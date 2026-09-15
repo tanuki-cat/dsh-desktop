@@ -413,16 +413,19 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("failed to build dsh-desktop")
-        .run(|app, event| match event {
+        // The parameter is underscore-prefixed because only the macOS Reopen arm reads it: using
+        // it there is fine, and every other target stays warning-free.
+        .run(|_app, event| match event {
             RunEvent::ExitRequested { .. } | RunEvent::Exit => shutdown(),
             // macOS activates a running app instead of starting a second one, so the Dock icon
             // (or Finder) is how "open it again" reaches a shell parked on a failure page. It
             // means the same thing there as the restart button does.
             #[cfg(target_os = "macos")]
             RunEvent::Reopen { .. }
-                if window::retry_offered() && app.get_webview_window(window::HARNESS).is_none() =>
+                if window::retry_offered()
+                    && _app.get_webview_window(window::HARNESS).is_none() =>
             {
-                request_restart(app);
+                request_restart(_app);
             }
             _ => {}
         });
