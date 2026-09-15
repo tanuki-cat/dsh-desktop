@@ -19,3 +19,6 @@ src-tauri/gen/
 
 # icon artwork scratch space
 .icon-work/
+
+# local release artifacts (the CI writes its zips to the same directory)
+dist/
