@@ -158,7 +158,7 @@ fn parse_dsh_url(line: &str) -> Option<Url> {
 ## 5. 进程生命周期（修正版）
 
 - **正常退出**：向进程组发 SIGTERM → 等 5s → SIGKILL；实测 harness 2s 内优雅退出。
-- **崩溃孤儿（macOS/Linux）**：Tauri 被强杀时子进程会存活。壳在 `App Data/dsh-desktop/state.json` 记录 `{pid, port, cwd, startedAt}`，**下次启动先自愈清理**（只在记录的 pid 仍监听记录的端口时才发信号，避免 pid 复用误杀）；启动后不轮询，改由看护线程阻塞 `wait` 子进程，退出即报错页（**2026-09-13 修正**：早期设计的“启动后每 30s 校验一次存活”从未实施，§13.8 已记录用阻塞 `wait` 取代）。
+- **崩溃孤儿（macOS/Linux）**：Tauri 被强杀时子进程会存活。壳在 `App Data/dsh-desktop/state.json` 记录 `{pid, port, cwd, startedAt}`，**下次启动先自愈清理**（只在记录的 pid 仍监听记录的端口时才发信号，避免 pid 复用误杀）；启动后不轮询，改由看护线程阻塞 `wait` 子进程（**2026-09-13 修正**：早期设计的“启动后每 30s 校验一次存活”从未实施，§13.8 已记录用阻塞 `wait` 取代）；退出**不再停在报错页** —— **2026-09-15 修正**：干净退出（插件市场「立即重启」）先等 8s 交接并接管替代实例、崩溃/被杀 2s 后自启，连续 3 次短命重启未稳定才弹带「重新启动 Harness」按钮的终态页（另起实例或点 Dock 图标等价于按它），见 §13.12。
 - **Windows**：V1 用 `taskkill /PID <pid> /T /F`；正式版换 Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）。
 - **单实例**：`tauri-plugin-single-instance` 只保证“一个壳”，不代表“一个 harness”，需与 §6 一起看。
 
@@ -610,6 +610,10 @@ Dock 里就只剩一个没有窗口的进程。
 `Harness pid N exited unexpectedly (code …)`，`disown` + 清 state.json，并用 `window::show_failure` 弹回状态页
 显示退出码与最近输出。
 
+> **2026-09-15 修正**：这一步不再直接停在报错页 —— 退出先走自动恢复（交接 → 接管 → 自启），只有自动
+> 重试用完或失败才弹终态页。状态页也拆成了三面：`show_progress`（进行中）、`show_failure`（终态，
+> 带「重新启动 Harness」按钮）、`show_notice`（终态无按钮，旧 WebView 的浏览器回退用）。见 §13.12。
+
 **P2-2 config.json 是 0644**
 
 `restrict(0600)` 原先只作用于 state.json，而 README 建议把 API Key 放进 config.json 的 `env`。
@@ -630,7 +634,8 @@ Dock 里就只剩一个没有窗口的进程。
   `config.json` 权限由 0644 就地改成 0600。
 - 崩溃提示路径（P2-1）已实机验证：启动后 `kill -9 <harness pid>`，日志记
   `Harness pid 94329 exited unexpectedly (code None)`，状态页重新弹出报错、
-  `state.json` 被清除、应用自身保持运行。
+  `state.json` 被清除、应用自身保持运行。（该轮的"停在报错页"行为已于 2026-09-15 改为自动恢复，
+  见 §13.12。）
 
 ### 13.11 收尾：安装结果校验与公开仓库前的检查（2026-09-13）
 
@@ -720,3 +725,39 @@ sleep 0.4 && rm -rf /tmp/tree-demo            # 模拟"树被换走"
 **验证**：新增单测 `update_only_stops_an_instance_it_is_allowed_to_stop` 覆盖策略矩阵（空闲 / 他人占用 / 自家残留 /
 允许接管的外部实例 / 不允许接管的外部实例），`cargo test` **29 passed**、`make clippy` 0 warning。
 真实更新路径需要 registry 有新版本才能触发，本轮只做策略级验证。
+
+### 13.12 Harness 意外退出后的自动恢复（2026-09-15）
+
+**触发**：用户反馈"插件更新后要求重启 dsh，dsh 重启后桌面端停在错误页、无法恢复"。
+
+**证据（两份日志对得上）**：插件市场 `.dsh-market/log.ndjson` 记
+`{"event":"restart","detail":"scheduled pid=99772 helper=1726"}`，紧接着桌面壳日志
+`Harness pid 99772 exited unexpectedly (code Some(0))`。即市场的「立即重启」让宿主干净退出
+（`profile-boot` 里 `process.on("SIGTERM", () => interrupt(0))`），detached helper 随后在同一端口
+拉起替代实例；而看护线程把这次退出当崩溃：清 state.json、销毁窗口、弹终态报错页。此后没有任何回到
+harness 的代码路径（`FAILURE_SHOWN` 是一次性闩锁，也没有线程再看端口），macOS 上再点 Dock 图标只会
+激活同一个失败页，用户只能退出应用重开 —— 重开还会 SIGTERM 掉市场刚拉起的实例。
+
+**修复**：
+
+- `exit_action(uptime, previous, clean)`（纯函数，可单测）：干净退出（退出码 0）先等 `HANDOFF_GRACE`
+  8s 交接，崩溃/被杀只等 2s；连续短命重启到达 `MAX_AUTO_RESTARTS`（3 次）就报错；运行满
+  `HEALTHY_RUN`（60s）记一次健康、计数归零；
+- `take_over_handoff_and_start()`：交接窗内端口重新服务时先 `terminate_pid` 停掉替代实例 —— 它重放了
+  CLI 自身 argv，cwd 是 CLI 目录而不是本壳配置的 workspace —— 再走本壳的 `start()`（正确的
+  runtime／workspace／凭据 + 新 token URL）；晚到的交接在自启失败后接管重试一次；
+  `take_over_existing=false` 时不动它，交回启动流程；
+- 状态页三面：`show_progress`（进行中，不闩锁）、`show_failure`（终态，页面带「重新启动 Harness」
+  按钮）、`show_notice`（终态无按钮，旧 WebView 的浏览器回退用）；`allow_next_failure()` 让重试失败
+  能替换页面，状态注入脚本在页面 `<head>` 就绪前重试；
+- "再开一次"三个入口等价于按按钮：页面按钮（`dsh-desktop:restart-harness` 事件）、single-instance
+  回调、macOS `RunEvent::Reopen`（点 Dock 图标不会启动第二个进程，只能靠它）；
+- 退出码文案不再泄露 Rust `Option` 的调试形态：`Some(0)`/`None` → `退出码 0`/`被信号 9 终止`。
+
+**验证**：单测 83 → 88（`exit_action` 策略矩阵、`exit_reason` 文案、状态页脚本转义、页面事件名与壳
+常量一致）；实测 `dsh web` 冷启到打印 URL 约 4s、SIGTERM 退出码 0（临时 `DSH_HOME` + 3099 端口，
+作为 8s 交接窗的依据）。**真机演练待做**：kill 掉 harness 看它自动回来、在市场点「立即重启」不再进
+错误页，步骤写在 README 的验证一节。
+
+**同轮后续**：紧接着落地的旧 WebView 兼容层复用了这套状态页拆分，见
+[`design-task-feat-legacy-webkit-compat-layer.md`](./design-task-feat-legacy-webkit-compat-layer.md)。

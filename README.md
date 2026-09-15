@@ -25,7 +25,9 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 > 后续开发直接在 `main` 上进行；该分支只作历史快照保留。
 
 设计依据：[`docs/design-task-feat-dsh-tauri-desktop-shell.md`](docs/design-task-feat-dsh-tauri-desktop-shell.md)
-（正文为设计，实施偏差与验证证据见其 §13.1–13.4）。
+（正文为设计，实施偏差与验证证据见其 §13.1–13.4，Harness 退出后的自动恢复见 §13.12）。
+WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs/design-task-feat-legacy-webkit-compat-layer.md)
+（取代 [`docs/design-task-fix-webview-compat-audit.md`](docs/design-task-fix-webview-compat-audit.md) 中"缺能力即改用浏览器"的结论）。
 
 ## 当前状态
 
@@ -156,6 +158,8 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
   （`window.rs::WebviewReport` + `lib.rs::hand_the_gui_to_the_browser`），状态窗口里保留 harness 的
   管理职责（更新、退出清理），关掉它就停 harness。兼容层可用 `"webkit_compat": false` 关掉，关掉后
   行为等同旧版（缺任何能力都走浏览器）。彻底修法仍在上游的插件包里（那行 guard 加个全局判断）。
+  完整证据与设计（含为什么推翻 2026-09-14"不在 WebView 里打补丁"的结论）见
+  [`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs/design-task-feat-legacy-webkit-compat-layer.md)。
   Intel 机器更容易停在旧系统，所以这个现象看着像「macos-x64 专属」。
 
 ### 自带运行时（已并入 main）

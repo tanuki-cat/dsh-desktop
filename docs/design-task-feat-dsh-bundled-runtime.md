@@ -872,3 +872,13 @@ pdfjs-dist 6.3.289，其中给 `Iterator.prototype.join` 打补丁的那行没�
 
 完整结论、证据链（BCD／WebKit 发布说明／pdfjs 那行源码）、影响面与未做项（上游修 + 真机验证）见
 [`design-task-fix-webview-compat-audit.md`](./design-task-fix-webview-compat-audit.md)。测试 77 → 82。
+
+> **2026-09-15 修正**：本节"必需项只有 `Iterator`、缺口一律改用浏览器"的结论已被兼容层取代。
+> 探针改成「可补的 API 清单 + 用 `new Function` 编译 `class static block` 的语法判定」双清单；
+> 可补的（`Iterator`、`Promise.try`、`Promise.withResolvers`、`Symbol.dispose`、`Math.sumPrecise`、
+> `Uint8Array.fromBase64`、`Object.hasOwn`、`findLast`）由 harness 窗口经 `initialization_script`
+> 注入 ES5 补丁（逐块自守卫、只装缺的那些），界面下限因此降到 **Safari 16.4（macOS 13.3）**；只有补不了
+> 的语法才回退默认浏览器，且 `config.json` 的 `"webkit_compat": false` 可整体关掉。
+> 本节保留当时的决策与理由；现行判定在 `window.rs::WebviewReport::gaps` / `compat_script`、
+> `lib.rs::hand_the_gui_to_the_browser(app, url, version, compat)`。完整设计与证据见
+> [`design-task-feat-legacy-webkit-compat-layer.md`](./design-task-feat-legacy-webkit-compat-layer.md)。
