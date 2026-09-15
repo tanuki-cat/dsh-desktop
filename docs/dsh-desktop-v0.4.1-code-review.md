@@ -23,7 +23,7 @@
 与第 10 项的**更新事务与回滚**（原「未做」）。两者各有独立设计文档：
 [`design-task-feat-takeover-confirmation.md`](./design-task-feat-takeover-confirmation.md)、
 [`design-task-feat-update-transaction.md`](./design-task-feat-update-transaction.md)。
-当前库内单测 **134 passed / 0 failed**（v0.4.1 轮为 116），集成用例 5 → 6 项，`cargo fmt --check` 通过，
+当前库内单测 **138 passed / 0 failed**（v0.4.1 轮为 116），集成用例 5 → 6 项，`cargo fmt --check` 通过，
 `cargo clippy --all-targets` 0 warning。
 
 独立验证：`cargo test` **116 passed / 0 failed**（单测；另有 5 个集成用例在真实 node 引擎里跑。原 102）、
@@ -98,12 +98,24 @@ P0-1 做了实机双向验证：普通返回 `200` 的本地服务被判为 `Oth
 - 第 5 条建议：**已补做（2026-09-16）**。接管前弹面板让用户当场选，且没有引入 `tauri-plugin-dialog`：
   询问面板画在 splash 页面上（那个窗口本来就持有 `core:default`），复用「重新启动 Harness」按钮同一条
   core 事件桥，新增事件 `dsh-desktop:takeover-choice`。面板写明对方 pid、**完整命令行**、端口，以及
-  **接管后会改用本应用配置的 workspace**（不会继续对方的工作目录）。三个选项：接管 / 保留并用浏览器
-  打开 / 什么都不做退出。120 秒无答复才回落到 `take_over_existing` 的语义。
+  **接管后会改用本应用配置的 workspace**（不会继续对方的工作目录）。选项：接管 / 保留并用浏览器打开 /
+  **保留并让本应用换端口** / 什么都不做退出。120 秒无答复才回落到 `take_over_existing` 的语义。
 
   四条会对外部进程发信号的路径全部接上（启动检测、交接后接管、自启失败重试接管、更新前停止实例）；
-  身份校验仍然是发信号的前提 —— 未识别的进程连问题都不会问。详见
-  [`design-task-feat-takeover-confirmation.md`](./design-task-feat-takeover-confirmation.md)。
+  身份校验是唯一的闸门 —— 未识别的进程连问题都不会问。
+
+  > **同日修正（第一版把询问也交给了配置项）**：第一版在 `take_over_existing: false` 时直接返回
+  > `UseBrowser`，只有 `true` 才询问。测试与文档都按这个行为写了，但**默认用户因此永远看不到面板** ——
+  > 选择权被前置成了一道配置题，与第 14 项「让用户选择」的要求相反。实机确认了后果：默认配置下启动，
+  > 直接以浏览器形式打开并停在错误页。现在**识别出来就问**，配置项只决定 120 秒无答复时怎么办；
+  > 更新前的停止判据（`may_stop_before_update`）有同一处错误，已一并改掉。
+  >
+  > 同时修掉一个由此暴露的循环：浏览器回退页原本走 `show_failure`，带着一个**必然失败**的重启按钮 ——
+  > 外部实例还活着、本壳又不接管它，所以每次点击都重跑一遍注定失败的启动、再开一个浏览器标签页。
+  > 该情形改用 `show_notice`（无按钮）。用户日志里的 6 次 `restart requested from the status page`
+  > 就是这个循环。
+
+  详见 [`design-task-feat-takeover-confirmation.md`](./design-task-feat-takeover-confirmation.md)。
 
 **实机验证**：普通返回 `200` 的服务 → `Other`；3080 上真实 Harness → 仍识别为 `Harness`。
 
@@ -361,8 +373,8 @@ CLI 自己拥有，无法先在别处装好再切换 —— 因此可逆性靠**
 与第 9 项的关系：进程级超时（已修）保证**不会永久挂起**，但不保证**中途失败后目录仍可用** —— 两者互补，
 不能互相替代。
 
-验证：`cargo test` **134 passed / 0 failed**（库内单测 116 → 134：新增 `transaction.rs` 11 项、更新事务相关
-`lib.rs` 4 项、接管确认 `lib.rs` 2 项与 `window.rs` 2 项，并删掉 1 项被取代的 `installed_cli` 用例；
+验证：`cargo test` **138 passed / 0 failed**（库内单测 116 → 138：新增 `transaction.rs` 11 项、更新事务相关
+`lib.rs` 4 项、接管确认 `lib.rs` 6 项与 `window.rs` 2 项，并删掉 1 项被取代的 `installed_cli` 用例；
 集成用例 5 → 6 项）；
 另用真实的 `npm install -g --prefix` 装 `@deepseek-ai/dsh@0.1.5-rc.2` 确认了暂存布局与校验函数的前提
 （`OK: staged @deepseek-ai/dsh 0.1.5-rc.2`，298 MB，冷缓存 3m18s）。**未做**：真实切换 + 启动失败回滚的
@@ -458,10 +470,15 @@ README 顶部新增一张表，把三个下限分开说明，并标注各自由�
 选择接管时也加了第二道身份校验：只有 401 认证栅栏 + 命令行确为 `dsh web` 同时成立才发信号，
 因此不会出现「确认目标不是 Harness 却照样杀」的情况。
 
-**已补做（2026-09-16）**：真正的交互式选择已实现，即本条建议里的三个选项（用浏览器打开 / 终止并接管 /
-什么都不做），画在 splash 页面上的面板里。没有引入对话框依赖 —— 该窗口本就持有 `core:default`，
-复用重启按钮那条事件桥即可。`take_over_existing` 的语义因此从「是否接管」细化为「**没答复时**是否接管」：
-`true` 不再等于静默接管。详见 [`design-task-feat-takeover-confirmation.md`](./design-task-feat-takeover-confirmation.md)。
+**已补做（2026-09-16）**：真正的交互式选择已实现，覆盖本条建议的全部三个选项 ——「用浏览器打开」、
+「终止并接管」、以及本条额外提到的**「更换桌面端口」**（在配置端口之上取第一个空闲端口，只对本次启动
+生效），另加「什么都不做退出」。画在 splash 页面上的面板里，没有引入对话框依赖 —— 该窗口本就持有
+`core:default`，复用重启按钮那条事件桥即可。
+
+`take_over_existing` 的语义因此从「是否接管」收敛为「**没答复时**是否接管」：`true` 不再等于静默接管，
+`false` 也不再等于不问。**这后半句是第一版漏掉的** —— 第一版按配置项决定要不要问，默认用户看不到面板，
+与「检测到外部实例后让用户选择」相反；同日已修正。详见
+[`design-task-feat-takeover-confirmation.md`](./design-task-feat-takeover-confirmation.md)。
 
 ### 15. Windows 发布形态仍不完整
 
@@ -553,6 +570,8 @@ body、平台相关的现象抓不住回归；标志在任何平台都会失败�
 1. ~~**接管前的交互确认**（第 1 项第 5 条建议、第 14 项）~~ —— **已完成（2026-09-16）**：
    [`design-task-feat-takeover-confirmation.md`](./design-task-feat-takeover-confirmation.md)。
    没有引入对话框依赖：面板画在 splash 页面（本就持有 `core:default`）上，复用重启按钮那条 core 事件桥。
+   ⚠️ 第一版按 `take_over_existing` 决定**要不要问**，默认用户看不到面板；同日修正为「识别出来就问」，
+   配置项只决定 120 秒无答复时怎么办。
 2. ~~**更新事务与回滚**（第 10 项）~~ —— **已完成（2026-09-16）**：
    [`design-task-feat-update-transaction.md`](./design-task-feat-update-transaction.md)。
 3. **代码签名与公证**（第 4 项）—— 其余分发相关项（第 3、15 项）的前置条件。

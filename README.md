@@ -268,7 +268,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 | `workspace` | `$HOME` | 传给 dsh 的工作目录 = agent 的 workspace root。不是已存在的绝对目录时本次回落到默认值并记日志（**不改写你的文件**） |
 | `dsh_path` | `null` | 记住的 `dsh` 启动器绝对路径：自动搜索顺序为 `DSH_DESKTOP_DSH` → 本字段 → PATH → 常见目录 → login shell。相对路径或不存在的文件本次忽略并记日志 |
 | `dsh_home` | `null` | `null` 表示共用 `~/.dsh`（插件/设置/会话全保留）；指向别的目录则隔离 |
-| `take_over_existing` | `false` | 端口被**外部** Harness（不是本应用启动的）占用时，是否**允许**停掉它并接管。设为 `true` 时不会静默接管：先弹面板让你当场选（接管 / 保留并用浏览器打开 / 什么都不做），面板写明对方 pid、完整命令行与本应用将要使用的 workspace；**120 秒没有选择才按本项决定**。默认 `false` 即「没选择就不接管」。任何情况下都**只在该进程的命令行确实像 `dsh web` 时**才会问这个问题 |
+| `take_over_existing` | `false` | **没答复时**怎么处理（不是「是否询问」）。端口被**外部** Harness（不是本应用启动的）占用、且该进程命令行确实像 `dsh web` 时，**一定会弹面板**让你当场选：接管 / 保留并用浏览器打开 / 保留并让本应用换端口 / 什么都不做。面板写明对方 pid、完整命令行与本应用将要使用的 workspace。**120 秒没有选择才按本项决定**：`false`（默认）= 用系统浏览器打开，`true` = 终止并接管 |
 | `auto_update` | `true` | 启动时检查并安装 dsh 新版本（自带/影子运行时总是更新自己的树） |
 | `auto_update_plugins` | `false` | 是否把 profile 里的插件市场（`dshmarket`）也更新到 registry 上的最新版。默认关：它会改写你 profile 的 `package.json`/锁文件，而 profile 是用户数据 |
 | `update_tags` | `["latest"]` | 取其中最高版本。默认只跟正式版；想跟预发布再加 `"next"` |
@@ -324,13 +324,14 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 |---|---|
 | 端口无监听 | 定位 dsh/node（**逐个候选校验身份**，见配置表末行）→ 启动 → 等 URL → 打开窗口。状态页写明用的是哪棵树：`dsh 0.1.5-rc.2 · system /opt/homebrew/lib/node_modules/… · 端口 3080` |
 | 端口上是本应用上次启动的实例（state.json 对得上且存活） | 直接复用（cookie 对同一 authority 仍有效，实测跨重启有效） |
-| 端口上是**别人**启动的 Harness（CLI / Automator） | 先做两道身份校验（401 特征 + 该 PID 命令行像 `dsh web`，`plugin` 子命令不算）；都通过才**弹面板询问**：接管 / 保留并用浏览器打开 / 什么都不做。选接管 → 对该 PID 发 SIGTERM（只发单进程，不碰它的进程组）→ 等端口释放 → 自启拿新 token。面板写明对方的 pid、完整命令行、端口，以及**接管后会改用本应用配置的 workspace**（不会继续对方的工作目录）。`take_over_existing: false`（默认）时不问，直接用系统浏览器打开；`true` 时询问，**120 秒无选择才按 `true` 处理** |
+| 端口上是**别人**启动的 Harness（CLI / Automator） | 先做两道身份校验（401 特征 + 该 PID 命令行像 `dsh web`，`plugin` 子命令不算）；都通过就**弹面板询问**（与 `take_over_existing` 无关，那一项只决定 120 秒无答复时怎么办）：**接管**（对该 PID 发 SIGTERM，只发单进程不碰它的进程组 → 等端口释放 → 自启拿新 token）／**保留并用系统浏览器打开**（本应用退出，页面**不带**重启按钮）／**保留并换端口**（本应用改用配置端口之上的第一个空闲端口启动，对方不受影响；仅当找到空闲端口时出现）／**什么都不做退出**。面板写明对方 pid、完整命令行、端口，以及**接管后会改用本应用配置的 workspace**（不会继续对方的工作目录） |
 | 启动前发现新版 dsh | 先升级 CLI（splash 显示进度），随后重启实例跑新版本。用户自己装的那棵树默认**只提示不升级**（`system_updates: notify`）；新版本若超出已测试区间，在 `require_tested_dsh` 默认开启时**不安装**（装了也会被拒绝启动） |
 | 启动前发现新版插件市场 | 先停实例 → `dsh plugin --profile web add dshmarket@<版本>` → 重启实例。默认**不做**（`auto_update_plugins: false`），设为 `true` 才开启 |
 | WebView 缺可补的 API（如 `Iterator`） | 向 harness 窗口注入兼容层（ES5、逐块自守卫、只装缺的那些）后照常开原生窗口，日志记 `WebView 缺少 …：已注入兼容层`；`webkit_compat: false` 时改成"未注入"并走浏览器 |
 | WebView 缺补不了的能力（目前只有 `class static block` 语法） | 不打开 harness 窗口：改用默认浏览器 + 状态窗口写明缺什么、界面需要 Safari 16.4 及以上 |
 | 端口被别的程序占用（不是 Harness 协议） | 错误页，提示改 `config.json` 的端口。**普通 HTTP 服务（含返回 200 的 Vite/Node/Java）走这一条**：401 认证栅栏是唯一的 Harness 判据 |
-| `take_over_existing: false`（默认）且是外部 Harness | 不询问也不接管：用系统浏览器打开并给出说明 |
+| 选了「保留并用系统浏览器打开」 | 打开 `http://127.0.0.1:<端口>/` 并在状态页说明；**没有重启按钮** —— 外部实例还活着，本应用没有可重启的 Harness，给了按钮只会重复失败并再开一个标签页。浏览器需要已有该 authority 的登录 cookie；若显示 `authentication required`，请在启动那个实例的终端里重新打开一次它打印的 URL |
+| 选了「保留并换端口」 | 本应用在配置端口之上的**第一个空闲端口**启动自己的 Harness。这个选择**只对本次启动有效**、不写回 `config.json`：会话 cookie 与固定端口绑定，静默永久迁移比下次再问一次更糟 |
 | 端口按 Harness 协议应答，但读不到 / 不像 `dsh web` 的命令行 | 不接管也不报"被别的程序占用"：拒绝接管并说明无法确认身份（避免误杀），提示手动停止或换端口 |
 | 关闭窗口（红点 / ⌘W） | `AppHandle::exit(0)` → `RunEvent::ExitRequested` → SIGTERM 进程组 → 删状态文件 |
 | ⌘Q / Dock 退出 / `quit app` | tao `application_will_terminate` → `RunEvent::Exit` → 同样的清理（幂等） |
@@ -371,7 +372,7 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 2. 与已安装版本做 semver 比较（`rc.2 > rc.1 > alpha.2`，正式版高于同号预发布版），**从不降级**；
 3. **先把正在使用这棵 CLI 树的实例停掉**：npm 是原地重写依赖树，而 node 按需懒加载模块 ——
    树被换走后运行中的 harness 下一次 `require()` 会直接 `MODULE_NOT_FOUND`（实测）。所以先 SIGTERM 停实例、
-   等端口释放，再安装；不能停时（外部实例且 `take_over_existing=false`、或拿不到 PID）**跳过本次更新**并记日志，
+   等端口释放，再安装；不能停时（用户在面板里选择保留该外部实例、或拿不到 PID）**跳过本次更新**并记日志，
    实例不受任何影响；
 4. **装进暂存目录，不碰正在用的那棵树**：有新版则
    `npm install -g --no-fund --no-audit --cache <app-data>/runtime/npm-cache --prefix <app-data>/runtime/staging/staging-<版本>/prefix @deepseek-ai/dsh@<解析出的具体版本>`；

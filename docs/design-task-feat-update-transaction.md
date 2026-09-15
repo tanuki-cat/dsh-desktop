@@ -89,9 +89,13 @@
 - `stop_instance_before_update()` 仍在最前：树被换走时运行中的 harness 下一次 lazy require 会
   `MODULE_NOT_FOUND`（实测），这一点没有改变。
 
+  **2026-09-16 修正**：它的前置判据 `may_stop_before_update()` 不再接收 `take_over_existing` —— 该函数
+  现在只区分「端口空闲 / 是 Harness」与「端口被非 Harness 占用」，是否停掉外部实例由用户在面板里的答复
+  决定。原先按配置项直接拒绝，会让默认用户既看不到面板、更新也被静默跳过（见接管确认文档 §3.2.1）。
+
 ## 3. 验证
 
-### 3.1 单测（库内 116 → 134，本项占 14 项）
+### 3.1 单测（库内 116 → 138，本项占 14 项）
 
 `transaction.rs` 11 项：暂存目录的清理与自删、按**名字与版本**双重校验（含"暂存的是别的包"、
 缺入口脚本、版本不符）、切换保留旧树、切换失败放回旧树、回滚保留失败树、代际裁剪（含 `0.10.0 > 0.9.0` 的版本序与非法名优先级）、
@@ -116,7 +120,7 @@
 
 ### 3.3 门禁
 
-`cargo test` **134 passed / 0 failed**（另有 6 项集成用例）、`cargo fmt --check` 通过、`cargo clippy --all-targets`
+`cargo test` **138 passed / 0 failed**（另有 6 项集成用例）、`cargo fmt --check` 通过、`cargo clippy --all-targets`
 0 warning。
 
 ### 3.4 未验证

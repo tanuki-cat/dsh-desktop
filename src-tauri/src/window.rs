@@ -297,7 +297,7 @@ static ASKED: Mutex<Option<Asked>> = Mutex::new(None);
 /// alone), which is also the default the shell had before it asked at all.
 pub const CHOICE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// How long to wait for the answer to question @@id@@, giving up after @@timeout@@.
+/// How long to wait for the answer to question `id`, giving up after `timeout`.
 ///
 /// A function of its reader so the waiting is testable without a window, and so the timeout can
 /// be a few milliseconds in a test.
@@ -322,9 +322,9 @@ pub fn wait_for_choice(
 
 /// Ask the user what to do about a Harness this shell did not start, and wait for the answer.
 ///
-/// Returns @@None@@ when the question could not be put (no status window, a page that never
-/// loaded) or when the timeout ran out. The caller answers that with the safe option: leaving
-/// another instance alone is always recoverable, killing one is not.
+/// Returns `None` when the question could not be put (no status window, a page that never
+/// loaded) or when the timeout ran out. The caller turns that into the answer `config.json`
+/// gives for an unanswered question, so this function never decides what silence means.
 pub fn ask_choice(
     app: &AppHandle,
     status: &str,
@@ -365,7 +365,10 @@ pub fn ask_choice(
             Some(choice.id)
         }
         None => {
-            harness::app_log("接管确认没有收到答复（超时或页面未加载），按最安全的选项处理");
+            // Not "the safe option": the caller decides, and with `take_over_existing: true` the
+            // config's answer is to take over. Saying which of the two it was leaves the log
+            // useful either way.
+            harness::app_log("接管确认没有收到答复（超时或页面未加载），按 config.json 的答复处理");
             None
         }
     }

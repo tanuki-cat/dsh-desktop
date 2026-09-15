@@ -370,10 +370,12 @@ const bodies = [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[
 assert.ok(bodies.length >= 4, "the page must ship its head and body scripts");
 bodies.forEach((body) => vm.runInThisContext(body, { filename: "page.js" }));
 
-// Rust asks the question, exactly as `window::choice_script` does.
+// Rust asks the question, exactly as `window::choice_script` does. Four options is the full
+// case: the port choice is offered only when a free port was found.
 const options = [
   { id: "take-over", label: "终止 pid 4242 并接管端口 3080" },
   { id: "browser", label: "保留它，用系统浏览器打开" },
+  { id: "port", label: "保留它，本应用改用端口 3091" },
   { id: "cancel", label: "什么都不做，退出本应用" }
 ];
 globalThis.__askChoice(7, "检测到其它 Harness", "进程: pid 4242\nworkspace: /Users/me/project", options, "120 秒内没有选择将按配置处理。");
@@ -387,17 +389,21 @@ assert.strictEqual(byId.retry.hidden, true, "the restart button must not race th
 const buttons = panel.querySelectorAll();
 assert.strictEqual(buttons.length, options.length, "one button per option, no more");
 assert.strictEqual(buttons[0].textContent, options[0].label);
+assert.strictEqual(buttons[1].textContent, options[1].label);
 assert.strictEqual(buttons[2].textContent, options[2].label);
+assert.strictEqual(buttons[3].textContent, options[3].label);
 assert.ok(panel.children.length > options.length, "the timeout hint is shown as well");
 
-buttons[1].click();
+// The third button is the one that changes the port; clicking it must report its own id, not
+// a neighbour index.
+buttons[2].click();
 assert.strictEqual(sent.length, 1, "one click, one answer");
 assert.strictEqual(sent[0].command, "plugin:event|emit");
 assert.strictEqual(sent[0].args.event, process.argv[3]);
 assert.strictEqual(sent[0].args.payload.question, 7, "the answer must name its question");
-assert.strictEqual(sent[0].args.payload.id, "browser");
+assert.strictEqual(sent[0].args.payload.id, "port");
 assert.ok(buttons.every((b) => b.disabled), "a second click must not answer twice");
-assert.strictEqual(buttons[1].textContent, "已选择：" + options[1].label);
+assert.strictEqual(buttons[2].textContent, "已选择：" + options[2].label);
 
 // Clearing the question takes the panel away again.
 globalThis.__askChoice(8, "正在启动 Harness…", "", [], "");

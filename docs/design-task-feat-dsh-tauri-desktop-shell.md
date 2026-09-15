@@ -378,12 +378,14 @@ macOS TCC 授权归因。
 > （`harness::looks_like_dsh_web`）。该规则已应用到全部四条 kill 路径。默认不接管时改用系统浏览器打开，
 > 并提示另外两个选项（设 `true` 接管 / 换端口）。
 >
-> **2026-09-16 修正（交互确认已实现）**：`take_over_existing: true` 不再等于静默接管 —— 两道身份校验
-> 通过后会**弹面板让用户当场选**（接管 / 保留并用浏览器打开 / 什么都不做），120 秒无答复才回落到该配置
-> 项。面板画在 splash 页面上（该窗口本就持有 `core:default`），复用重启按钮那条 core 事件桥，
-> **没有引入 `tauri-plugin-dialog`** —— 上面写的「需要新增对话框依赖」这一判断不成立。
-> `take_over_existing` 的语义因此细化为「**没答复时**是否接管」。详见
-> [`design-task-feat-takeover-confirmation.md`](./design-task-feat-takeover-confirmation.md)。
+> **2026-09-16 修正（交互确认已实现）**：两道身份校验通过后**一定会弹面板让用户当场选**（接管 / 保留并用
+> 浏览器打开 / 保留并换端口 / 什么都不做），120 秒无答复才回落到 `take_over_existing`。面板画在 splash
+> 页面上（该窗口本就持有 `core:default`），复用重启按钮那条 core 事件桥，**没有引入 `tauri-plugin-dialog`**
+> —— 上面写的「需要新增对话框依赖」这一判断不成立。`take_over_existing` 的语义因此收敛为
+> 「**没答复时**是否接管」，既不决定「是否询问」，也不再让 `false` 等于静默走浏览器。
+>
+> 第一版仍按该配置项决定**要不要问**，于是默认用户看不到面板（实机确认：直接开浏览器并停在错误页）；
+> 同日修正。详见 [`design-task-feat-takeover-confirmation.md`](./design-task-feat-takeover-confirmation.md)。
 4. 关闭窗口前不再提前关闭 splash；只有拿到**带 token 的 URL**后才创建 Harness 窗口。
 
 ### 13.2 实机验证结论（2026-09-13）
@@ -753,11 +755,11 @@ sleep 0.4 && rm -rf /tmp/tree-demo            # 模拟"树被换走"
 
 **修复**：把"停实例"提到安装之前，并抽出一个纯函数承载策略（可单测）：
 
-- `may_stop_before_update(probe, is_ours, take_over_existing)`：端口空闲 → 放行；端口被非 Harness 占用 → 拒绝；
-  是自家实例、或允许接管的外部实例 → 放行；外部实例且 `take_over_existing=false` → 拒绝；
-  （2026-09-16：`take_over_existing=true` 时改为先问用户 —— `stop_instance_before_update()` 在对外部实例
-  发信号前调用 `confirm_takeover()`，拒绝即跳过本次更新。函数本身的判据未变，它现在表达的是
-  「没答复时是否接管」）
+- `may_stop_before_update(probe)`：端口空闲 → 放行；端口被非 Harness 占用 → 拒绝；是 Harness（自家的或
+  别人的）→ 放行，是否真能停由下一步的用户答复决定。
+  （2026-09-16 两次修正：先是让 `take_over_existing=true` 也先问用户；随后发现**只要按配置项决定问不问，
+  默认用户就看不到面板**，于是把 `take_over_existing` 从判据里整个移除，只留「没答复时是否接管」这一层
+  语义。`stop_instance_before_update()` 对非自家实例先调用 `confirm_takeover()`，拿不到接管答复即跳过本次更新）
 - `stop_instance_before_update()`：按策略判定后 SIGTERM 目标进程组、等端口释放（复用 `TERMINATE_GRACE`），
   成功后清掉过期的 state.json，并记一条 `stopped Harness pid N before updating the CLI`；
 - **拒绝时跳过本次更新**（不是跳过启动）：记 `update deferred, keeping vA: …`，随后照常走检测/接管/启动流程，
@@ -788,7 +790,7 @@ harness 的代码路径（`FAILURE_SHOWN` 是一次性闩锁，也没有线程�
 - `take_over_handoff_and_start()`：交接窗内端口重新服务时先 `terminate_pid` 停掉替代实例 —— 它重放了
   CLI 自身 argv，cwd 是 CLI 目录而不是本壳配置的 workspace —— 再走本壳的 `start()`（正确的
   runtime／workspace／凭据 + 新 token URL）；晚到的交接在自启失败后接管重试一次；
-  `take_over_existing=false` 时不动它，交回启动流程；
+  该实例不是自家的时候不再在此处询问：交回启动流程统一问一次（同一次重启问两遍只会让人困惑）；
 - 状态页三面：`show_progress`（进行中，不闩锁）、`show_failure`（终态，页面带「重新启动 Harness」
   按钮）、`show_notice`（终态无按钮，旧 WebView 的浏览器回退用）；`allow_next_failure()` 让重试失败
   能替换页面，状态注入脚本在页面 `<head>` 就绪前重试；

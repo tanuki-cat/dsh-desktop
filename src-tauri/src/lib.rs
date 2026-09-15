@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Listener, Manager, RunEvent};
@@ -371,6 +371,39 @@ static AUTO_RESTARTS: AtomicU32 = AtomicU32::new(0);
 /// Harnesses racing for one port is exactly the failure this guards against.
 static RESTARTING: AtomicBool = AtomicBool::new(false);
 
+/// A port chosen for this launch because the user asked to leave the configured one alone.
+///
+/// Set when the takeover question is answered with "use another port". Deliberately not written
+/// back to `config.json`: this run adapts and the user's file stays as they left it, the same
+/// principle a repaired workspace follows. It lasts for this launch, so the next start asks again
+/// instead of silently migrating a fixed port — which the session cookie is bound to.
+static PORT_OVERRIDE: AtomicU16 = AtomicU16::new(0);
+
+/// How far above the configured port to look for a free one.
+///
+/// A bounded scan keeps the choice predictable: the same machine state picks the same port, so a
+/// second launch that meets the same external instance lands in the same place and the session
+/// cookie still matches.
+const PORT_SEARCH_RANGE: u16 = 20;
+
+/// The port this launch uses: the configured one unless the user moved this run elsewhere.
+fn runtime_port(configured: u16) -> u16 {
+    match PORT_OVERRIDE.load(Ordering::SeqCst) {
+        0 => configured,
+        port => port,
+    }
+}
+
+/// A free loopback port above `from`, when there is one within [`PORT_SEARCH_RANGE`].
+///
+/// Binding is the test: a port something already listens on cannot be bound, which covers both
+/// another Harness and an unrelated server.
+fn free_port_from(from: u16) -> Option<u16> {
+    let last = from.saturating_add(PORT_SEARCH_RANGE);
+    (from.saturating_add(1)..=last)
+        .find(|candidate| std::net::TcpListener::bind(("127.0.0.1", *candidate)).is_ok())
+}
+
 /// Remember the supervised Harness so every exit path can stop it.
 fn adopt(pid: u32, data_dir: &Path) {
     *LIVE.lock().unwrap() = Some(Live {
@@ -463,20 +496,14 @@ pub fn run() {
 /// it serves from? Node loads modules lazily, so updating a live tree breaks the running
 /// Harness on its next `require()` — the tree must not be touched while it is in use.
 ///
-/// `is_ours` is the state-file match and nothing else. A foreign instance is not refused here
-/// when `take_over_existing` is on: it is asked about instead (see
-/// [`stop_instance_before_update`]), because the config says what an unanswered question
-/// means, not that the question may be skipped.
-fn may_stop_before_update(
-    probe: &harness::Probe,
-    is_ours: bool,
-    take_over_existing: bool,
-) -> Result<(), String> {
+/// `is_ours` is the state-file match and nothing else. A foreign Harness is never refused here:
+/// whether it may be stopped is the user's answer to the question [`stop_instance_before_update`]
+/// puts, and the config only decides what an unanswered question means. Refusing on the config
+/// would skip the question for the same reason it was skipped on the startup path (2026-09-16).
+fn may_stop_before_update(probe: &harness::Probe) -> Result<(), String> {
     match probe {
-        harness::Probe::Closed => Ok(()),
+        harness::Probe::Closed | harness::Probe::Harness => Ok(()),
         harness::Probe::Other => Err("端口被其它程序占用，跳过本次更新".to_string()),
-        _ if is_ours || take_over_existing => Ok(()),
-        _ => Err("端口上是外部 Harness，且 take_over_existing=false，跳过本次更新".to_string()),
     }
 }
 
@@ -525,7 +552,7 @@ fn stop_instance_before_update(
     let ours = process::read_state(data_dir)
         .map(|state| state.pid)
         .filter(|pid| Some(*pid) == owner && process::is_alive(*pid));
-    may_stop_before_update(&probe, ours.is_some(), config.take_over_existing)?;
+    may_stop_before_update(&probe)?;
 
     let Some(pid) = owner else {
         return Err(format!(
@@ -1451,43 +1478,24 @@ fn take_over_handoff_and_start(
     grace: Duration,
 ) -> Result<(), String> {
     let config = Config::load(data_dir);
-    let port = config.port;
+    let port = runtime_port(config.port);
     if let Some(pid) = wait_for_handoff(port, grace) {
-        if !config.take_over_existing {
-            // The user turned takeover off: leave that instance alone and let the normal
-            // startup path decide — it opens the system browser and reports why.
-            harness::app_log(&format!(
-                "端口 {port} 已由 pid {pid} 服务，但 take_over_existing=false：交给启动流程处理"
-            ));
-        } else if !identified_dsh_web(pid) {
-            return Err(format!(
-                "端口 {port} 上的 pid {pid} 按 Harness 协议应答，但无法确认它就是 dsh web；\n\
-                 为避免误杀其它程序，本应用不会接管它。请先手动停止该进程，或在 config.json 里换一个端口。"
-            ));
-        } else if !confirm_takeover(app, &config, port, pid) {
-            // The question came back "keep it", or nobody answered and the config says not
-            // to take over. Either way the port stays with that instance.
-            harness::app_log(&format!(
-                "端口 {port} 上的 Harness pid {pid} 未被接管：交回启动流程处理"
-            ));
-        } else {
-            harness::app_log(&format!(
-                "端口 {port} 上出现了外部重启的 Harness pid {pid}：停掉它，用本壳的 workspace 重新启动"
-            ));
-            window::set_status(app, "正在接管重新启动的 Harness…", &format!("pid {pid}"));
-            process::terminate_pid(pid, TERMINATE_GRACE);
-            if !wait_for_port_free(port, TERMINATE_GRACE) {
-                return Err(format!("停止 pid {pid} 后端口 {port} 仍被占用"));
-            }
-        }
+        // A replacement is on the port, and it is not ours to adopt for the reason above. What to
+        // do about it is not decided here: the startup path below owns that question, asks it once
+        // for an identified instance, and knows every answer (take over, browser, another port,
+        // cancel). Asking here as well would put the same question twice for one restart.
+        harness::app_log(&format!(
+            "端口 {port} 在交接窗内已由 pid {pid} 服务：交由启动流程处理（不采用它重放的 cwd）"
+        ));
     }
     match start(app, data_dir) {
         Ok(()) => Ok(()),
         // A handoff slower than the grace can still take the port while our own launch boots.
-        // Reporting a failure there would be wrong — the port is serving a Harness — so stop it
-        // and make the one remaining attempt. Only when takeover is allowed: with
-        // take_over_existing=false that instance is exactly what the user asked us to keep.
-        Err(reason) if config.take_over_existing => match harness_listener(port) {
+        // Reporting a failure there would be wrong — the port is serving a Harness — so ask about
+        // that instance and make the one remaining attempt if the answer allows it. The guard is
+        // the identity, not the config: whether to signal is the user's answer, and the config
+        // only decides what an unanswered question means.
+        Err(reason) => match harness_listener(port) {
             // Unidentified: report the original failure rather than killing a process this
             // shell cannot prove is the CLI.
             Some(pid) if !identified_dsh_web(pid) => {
@@ -1513,9 +1521,9 @@ fn take_over_handoff_and_start(
                 let _ = wait_for_port_free(port, TERMINATE_GRACE);
                 start(app, data_dir)
             }
+            // Nothing owns the port any more: report the original failure.
             None => Err(reason),
         },
-        Err(reason) => Err(reason),
     }
 }
 
@@ -1528,41 +1536,38 @@ enum ForeignAction {
     UseBrowser,
     /// Leave it running and explain why this shell cannot use the port.
     Refuse { reason: String },
-    /// A Harness this shell can identify, and the user asked to be consulted before it is
-    /// signalled. The caller puts the question and turns the answer back into one of the arms
-    /// above.
+    /// A Harness this shell can identify. The caller puts the question and turns the answer back
+    /// into one of the other arms.
     Ask { pid: u32 },
+    /// Leave that instance alone and start on another port, so neither side is disturbed.
+    UseOtherPort { port: u16 },
 }
 
-/// Decide what to do about a foreign Harness, from the two identity signals.
+/// Decide what to do about a foreign Harness, from the two identity signals alone.
 ///
 /// `command` is the listener's command line, or `None` when the platform would not report it.
 /// Both a fence-shaped answer and a `dsh web` command line are required before anything is
 /// signalled: the fence proves a Harness protocol is on the port, and the command line proves the
-/// process is the CLI rather than an unrelated server that happens to answer the same way. A
-/// missing command line is treated as "not proven", which is why takeover also needs `allow`.
+/// process is the CLI rather than an unrelated server that happens to answer the same way.
 ///
-/// `allow` is the config default for a question nobody answered, not the answer itself: with it
-/// on the user is asked first, and the config only decides what an unanswered question means.
-fn foreign_instance_action(
-    allow: bool,
-    owner: Option<u32>,
-    command: Option<&str>,
-) -> ForeignAction {
+/// A process that passes both is **always** asked about, whatever `config.json` says. The config
+/// is the answer for a question nobody replied to, never a reason to skip asking: gating the
+/// question on it made the choice invisible to everyone who had not already edited the file,
+/// which is the opposite of what the review asked for (2026-09-16).
+fn foreign_instance_action(owner: Option<u32>, command: Option<&str>) -> ForeignAction {
     let identified = command.is_some_and(harness::looks_like_dsh_web);
-    match (allow, owner, identified) {
+    match (owner, identified) {
         // Nothing may be signalled that this shell cannot identify, whoever asked.
-        (_, _, false) => ForeignAction::Refuse {
+        (_, false) => ForeignAction::Refuse {
             reason: "端口上有进程按 Harness 协议应答，但无法确认它就是 dsh web（读不到命令行，或命令行不像 dsh）。为避免误杀其它程序，本应用不会接管它。请先手动停止该进程，或在 config.json 里换一个端口。"
                 .to_string(),
         },
-        // Identified and allowed: ask, because stopping it kills a session someone may be
-        // watching and restarts the instance under a different workspace.
-        (true, Some(pid), true) => ForeignAction::Ask { pid },
-        (false, _, true) => ForeignAction::UseBrowser,
+        // Identified: ask, because stopping it kills a session someone may be watching and
+        // restarts the instance under a different workspace.
+        (Some(pid), true) => ForeignAction::Ask { pid },
         // `identified` already proved a command line exists, so this arm is unreachable; it keeps
         // the match total without a panic in a startup path.
-        (true, None, true) => ForeignAction::Refuse {
+        (None, true) => ForeignAction::Refuse {
             reason: "端口上的 Harness 无法定位到具体进程（lsof 不可用）。请先手动停止它。"
                 .to_string(),
         },
@@ -1573,6 +1578,36 @@ fn foreign_instance_action(
 const CHOICE_TAKE_OVER: &str = "take-over";
 const CHOICE_BROWSER: &str = "browser";
 const CHOICE_CANCEL: &str = "cancel";
+/// Start on another port instead, leaving the instance where it is.
+const CHOICE_PORT: &str = "port";
+
+/// Which terminal page an outcome lands on.
+///
+/// Not cosmetic: [`window::show_failure`] arms the restart button *and* the Dock/Reopen entry
+/// points, so a page offering a restart this shell cannot perform turns a dead end into a loop.
+/// The browser fallback did exactly that — every click ran `start()` again, opened another tab,
+/// and landed on the same page (2026-09-16).
+#[derive(Debug, PartialEq, Eq)]
+enum TerminalPage {
+    /// Something can still be started here: offer another attempt.
+    Failure,
+    /// Nothing this shell will start: report it and stop.
+    Notice,
+}
+
+/// A restart only helps when the shell would plausibly start its own Harness next time.
+///
+/// Leaving the port to an instance this shell will not take over is the case where it cannot:
+/// the instance is alive and serving, so a second attempt repeats the first exactly.
+fn terminal_page(action: &ForeignAction) -> TerminalPage {
+    match action {
+        ForeignAction::UseBrowser => TerminalPage::Notice,
+        // A refusal names something the user has to change — an unproven identity, a port held
+        // by an unrelated program. The fix may well be followed by another attempt right here,
+        // so the button is worth offering.
+        _ => TerminalPage::Failure,
+    }
+}
 
 /// The question put to the user when a Harness this shell did not start is in the way.
 ///
@@ -1600,10 +1635,12 @@ fn takeover_question(
 
 /// Put the takeover question and turn the answer into an action.
 ///
-/// Every way of not getting a real answer — no window, a page that never loaded, the timeout —
-/// falls back to what `allow` says an unanswered question means, which is the behaviour the
-/// shell had before it asked at all. The browser option is always offered, so a user who does not
-/// want to decide can leave the instance running.
+/// Never answering is not the same as choosing the browser: `config.json` says what an unanswered
+/// question means, and the hint under the buttons repeats it, so the timeout runs the config's
+/// answer rather than a hardcoded one.
+///
+/// A question that cannot be put at all — no status window, a page that never loaded — is
+/// *unanswered* in the same sense, which keeps one rule for both.
 fn resolve_foreign_action(
     app: &AppHandle,
     config: &Config,
@@ -1615,7 +1652,10 @@ fn resolve_foreign_action(
     };
     let command = harness::process_command(pid);
     let (status, detail) = takeover_question(port, pid, command.as_deref(), &config.workspace);
-    let options = vec![
+    // Offered only when a free port exists: a dead button is worse than one option fewer, and the
+    // search is what the arm below would need anyway.
+    let other_port = free_port_from(port);
+    let mut options = vec![
         window::ChoiceOption {
             id: CHOICE_TAKE_OVER.to_string(),
             label: format!("终止 pid {pid} 并接管端口 {port}"),
@@ -1624,11 +1664,17 @@ fn resolve_foreign_action(
             id: CHOICE_BROWSER.to_string(),
             label: "保留它，用系统浏览器打开".to_string(),
         },
-        window::ChoiceOption {
-            id: CHOICE_CANCEL.to_string(),
-            label: "什么都不做，退出本应用".to_string(),
-        },
     ];
+    if let Some(free) = other_port {
+        options.push(window::ChoiceOption {
+            id: CHOICE_PORT.to_string(),
+            label: format!("保留它，本应用改用端口 {free}"),
+        });
+    }
+    options.push(window::ChoiceOption {
+        id: CHOICE_CANCEL.to_string(),
+        label: "什么都不做，退出本应用".to_string(),
+    });
     let hint = format!(
         "{} 秒内没有选择将按 config.json 的 take_over_existing={} 处理。",
         window::CHOICE_TIMEOUT.as_secs(),
@@ -1638,30 +1684,38 @@ fn resolve_foreign_action(
     match window::ask_choice(app, &status, &detail, &options, &hint).as_deref() {
         Some(CHOICE_TAKE_OVER) => ForeignAction::TakeOver { pid },
         Some(CHOICE_BROWSER) => ForeignAction::UseBrowser,
+        Some(CHOICE_PORT) if other_port.is_some() => ForeignAction::UseOtherPort {
+            port: other_port.unwrap_or(port),
+        },
         Some(CHOICE_CANCEL) => ForeignAction::Refuse {
             reason: format!(
                 "已按你的选择保留端口 {port} 上的 Harness（pid {pid}），本应用没有接管它。"
             ),
         },
-        // Unanswered: the config decides, which is what the shell did before it could ask.
-        _ => {
-            if config.take_over_existing {
-                ForeignAction::TakeOver { pid }
-            } else {
-                ForeignAction::UseBrowser
-            }
-        }
+        // Unanswered, or an id this build no longer offers: the config decides.
+        _ => unanswered_choice(config.take_over_existing, pid),
+    }
+}
+
+/// What an unanswered question means, which is what `config.json` asked for.
+///
+/// Split out so the rule is testable without a window: a timeout and a question that could not be
+/// put have to land in exactly the same place, or a headless launch would behave differently from
+/// an ignored one.
+fn unanswered_choice(allow: bool, pid: u32) -> ForeignAction {
+    if allow {
+        ForeignAction::TakeOver { pid }
+    } else {
+        ForeignAction::UseBrowser
     }
 }
 
 /// The same question for a Harness that appeared during a handoff or a restart.
 ///
-/// Returns whether the caller may signal it. `allow` false never asks: that instance is exactly
-/// what the user asked the shell to keep.
+/// Returns whether the caller may signal it. An unanswered question follows `config.json`, and
+/// "use another port" is *not* permission to signal: that instance is exactly what the user asked
+/// the shell to keep.
 fn confirm_takeover(app: &AppHandle, config: &Config, port: u16, pid: u32) -> bool {
-    if !config.take_over_existing {
-        return false;
-    }
     matches!(
         resolve_foreign_action(app, config, port, ForeignAction::Ask { pid }),
         ForeignAction::TakeOver { .. }
@@ -2103,7 +2157,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     // The config comes first: step 1 needs the port this run will use to tell a leftover
     // instance it may hand to the reuse branch from one it must stop.
     let config = Config::load(data_dir);
-    let port = config.port;
+    // The port this run uses, which is the configured one unless an earlier takeover question
+    // moved it (see [`PORT_OVERRIDE`]). Mutable because the question below can move it again.
+    let mut port = runtime_port(config.port);
     // The two paths every startup failure is traced back to; cheap to log, and the only way
     // to diagnose a machine we cannot run on.
     harness::app_log(&format!(
@@ -2518,6 +2574,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         }
     }
 
+    // Whether the detection step signalled something and must therefore wait for the port to
+    // come free before spawning.
+    let mut took_over = false;
     // 3c) Detection. Runs after the update so a freshly installed CLI is what we boot. The startup URL carries a per-process token that no other process can
     //     recover, so a foreign instance can never hand us a session.
     match harness::probe(port) {
@@ -2574,23 +2633,50 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                     // Two independent signals have to agree before a process this shell did not
                     // start is signalled: the auth fence named a Harness, and the command line
                     // names the CLI. Either one alone is a guess.
+                    //
+                    // Set only when this shell actually signalled something: the wait below is
+                    // for a port that was just vacated, and would be meaningless (and
+                    // mislabelled) after a choice that leaves the other instance running.
+                    took_over = false;
                     let command = owner.and_then(harness::process_command);
-                    let action = foreign_instance_action(
-                        config.take_over_existing,
-                        owner,
-                        command.as_deref(),
-                    );
-                    // An identified instance the config allows taking over is still a question:
-                    // it may be a terminal session or an agent run the user wants to keep.
+                    let action = foreign_instance_action(owner, command.as_deref());
+                    // An identified instance is always a question: it may be a terminal session
+                    // or an agent run the user wants to keep, and only they can say.
                     let action = resolve_foreign_action(app, &config, port, action);
+                    let page = terminal_page(&action);
                     match action {
                         ForeignAction::UseBrowser => {
                             window::open_external(&format!("http://127.0.0.1:{port}/"));
-                            return Err(format!(
-                                "127.0.0.1:{port} 已被另一个 Harness 占用（不是本应用启动的），已改用系统浏览器打开。\n\n\
-                                 要继续用这个实例就用浏览器；想让本应用接管，请在 config.json 里设 \"take_over_existing\": true \
-                                 （会终止该实例及其当前会话）；也可以先自己停掉它，或换一个端口。"
+                            let status = format!("端口 {port} 已被另一个 Harness 占用");
+                            let detail = format!(
+                                "已按你的选择在系统浏览器中打开 127.0.0.1:{port}。\n\n\
+                                 本应用没有接管它，因此没有可重新启动的 Harness：关闭本窗口即退出应用。\n\n\
+                                 想改这个行为，就在 config.json 里设 \"take_over_existing\": true \
+                                 （接管会终止该实例及其当前会话），或先自己停掉它。\n\n\
+                                 浏览器需要已有该实例的登录 cookie；若看到 authentication required，\
+                                 请在启动那个实例的终端里重新打开一次它打印的 URL。"
+                            );
+                            match page {
+                                TerminalPage::Notice => window::show_notice(app, &status, &detail),
+                                TerminalPage::Failure => fail(app, &status, &detail),
+                            }
+                            return Ok(());
+                        }
+                        // Leave that instance where it is and start this shell on a port of its
+                        // own. Recorded for this launch only: the configured port is what the
+                        // session cookie is bound to, so a silent permanent migration would be
+                        // worse than asking again next time.
+                        ForeignAction::UseOtherPort { port: free } => {
+                            harness::app_log(&format!(
+                                "端口 {port} 上的 Harness（{}) 保留不动，本应用改用端口 {free}",
+                                owner
+                                    .map(|pid| format!("pid {pid}"))
+                                    .unwrap_or_else(|| "pid 未知".to_string())
                             ));
+                            PORT_OVERRIDE.store(free, Ordering::SeqCst);
+                            // The spawn below reads `port`, so the rest of this attempt runs
+                            // against the new one.
+                            port = free;
                         }
                         ForeignAction::Refuse { reason } => return Err(reason),
                         // The startup path answers the question through
@@ -2607,16 +2693,22 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                             // to whatever started it (a terminal, or an agent run).
                             window::set_status(app, "正在接管其它 Harness…", &format!("pid {pid}"));
                             process::terminate_pid(pid, TERMINATE_GRACE);
+                            took_over = true;
                         }
                     }
                 }
             }
-            let deadline = std::time::Instant::now() + TERMINATE_GRACE;
-            while !matches!(harness::probe(port), harness::Probe::Closed) {
-                if std::time::Instant::now() > deadline {
-                    return Err(format!("接管失败：端口 {port} 仍被占用。"));
+            // Only a takeover needs this: it just vacated the port, and the spawn below cannot
+            // bind it otherwise. Every other answer either left the port to that instance (the
+            // new one is free by construction) or returned already.
+            if took_over {
+                let deadline = std::time::Instant::now() + TERMINATE_GRACE;
+                while !matches!(harness::probe(port), harness::Probe::Closed) {
+                    if std::time::Instant::now() > deadline {
+                        return Err(format!("接管失败：端口 {port} 仍被占用。"));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }
         harness::Probe::Other => {
@@ -3249,47 +3341,103 @@ mod tests {
     fn update_only_stops_an_instance_it_is_allowed_to_stop() {
         use harness::Probe;
         // Nothing running: update freely.
-        assert!(may_stop_before_update(&Probe::Closed, false, false).is_ok());
+        assert!(may_stop_before_update(&Probe::Closed).is_ok());
         // Someone else owns the port: never install over it.
-        assert!(may_stop_before_update(&Probe::Other, false, true).is_err());
-        // Our own leftover instance may always be stopped.
-        assert!(may_stop_before_update(&Probe::Harness, true, false).is_ok());
-        // A foreign Harness only with explicit permission.
-        assert!(may_stop_before_update(&Probe::Harness, false, true).is_ok());
-        assert!(may_stop_before_update(&Probe::Harness, false, false).is_err());
+        assert!(may_stop_before_update(&Probe::Other).is_err());
+        // A Harness — ours or somebody else's — may be stopped only after the question is put,
+        // which is `stop_instance_before_update`'s job. The config is not consulted here: doing
+        // so skipped the question for everyone who had not edited `config.json` (2026-09-16).
+        assert!(may_stop_before_update(&Probe::Harness).is_ok());
     }
 
-    /// Taking the port from another Harness kills a session someone may be watching, so the
-    /// decision needs both an identity and the user asking for it.
+    /// Taking the port from another Harness kills a session someone may be watching, so an
+    /// identified instance is always asked about — never signalled, and never silently resolved
+    /// to a browser either. Gating the question on `take_over_existing` hid it from every user
+    /// who had not already edited `config.json` (2026-09-16).
     #[test]
-    fn a_foreign_instance_is_only_asked_about_when_it_is_identified() {
+    fn an_identified_foreign_instance_is_always_asked_about() {
         const CMD: &str = "/opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --port 3080";
 
-        // Identified and allowed: the question is put, and only the answer may signal anything.
+        // Identified: the question is put, and only the answer may signal anything. Both values
+        // of the config reach this same arm — that is the fix.
         assert_eq!(
-            foreign_instance_action(true, Some(4242), Some(CMD)),
+            foreign_instance_action(Some(4242), Some(CMD)),
             ForeignAction::Ask { pid: 4242 }
-        );
-        // Identified, not allowed: the default. The instance keeps running.
-        assert_eq!(
-            foreign_instance_action(false, Some(4242), Some(CMD)),
-            ForeignAction::UseBrowser
         );
         // The port answers like a Harness, but nothing proves which program it is. This is the
         // case the old code killed: an unrelated server on the configured port.
         assert!(matches!(
-            foreign_instance_action(true, Some(4242), Some("/usr/bin/python3 -m http.server")),
+            foreign_instance_action(Some(4242), Some("/usr/bin/python3 -m http.server")),
             ForeignAction::Refuse { .. }
         ));
-        // A command line the platform would not report is not proof either, even with permission.
+        // A command line the platform would not report is not proof either.
         assert!(matches!(
-            foreign_instance_action(true, Some(4242), None),
+            foreign_instance_action(Some(4242), None),
             ForeignAction::Refuse { .. }
         ));
         assert!(matches!(
-            foreign_instance_action(true, None, Some(CMD)),
+            foreign_instance_action(None, Some(CMD)),
             ForeignAction::Refuse { .. }
         ));
+    }
+
+    /// The page a startup outcome lands on decides whether the user gets a button that can work.
+    /// The browser fallback has nothing to restart, so offering one looped: click, re-run the same
+    /// doomed start, open another tab, land here again (observed in the field, 2026-09-16).
+    #[test]
+    fn leaving_the_instance_alone_does_not_offer_a_restart() {
+        assert_eq!(
+            terminal_page(&ForeignAction::UseBrowser),
+            TerminalPage::Notice
+        );
+        // A refusal is something the user can act on and retry in place, so the button stays.
+        assert_eq!(
+            terminal_page(&ForeignAction::Refuse {
+                reason: "port held".to_string()
+            }),
+            TerminalPage::Failure
+        );
+        assert_eq!(
+            terminal_page(&ForeignAction::TakeOver { pid: 1 }),
+            TerminalPage::Failure
+        );
+    }
+
+    /// An unanswered question runs the config, and a question that could not be put at all has to
+    /// land in the same place: otherwise a headless launch and an ignored one would disagree.
+    #[test]
+    fn an_unanswered_question_follows_the_config() {
+        assert_eq!(
+            unanswered_choice(true, 4242),
+            ForeignAction::TakeOver { pid: 4242 }
+        );
+        assert_eq!(unanswered_choice(false, 4242), ForeignAction::UseBrowser);
+    }
+
+    /// A free port is what makes the third option real. The configured port is not free by
+    /// definition — that is why the question is being asked — so the search starts above it.
+    #[test]
+    fn another_port_is_offered_only_when_one_is_actually_free() {
+        // Hold a port, then ask for a free one starting there: the answer must skip it.
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port must bind");
+        let taken = held.local_addr().unwrap().port();
+        let found = free_port_from(taken).expect("the range must hold a free port");
+        assert!(found > taken, "{found} must be above {taken}");
+        // It really is free, and it is inside the bounded range.
+        assert!(std::net::TcpListener::bind(("127.0.0.1", found)).is_ok());
+        assert!(found <= taken.saturating_add(PORT_SEARCH_RANGE));
+    }
+
+    /// The override is per launch: a configured port that something else owns stays configured, so
+    /// the next start asks again instead of migrating a port the session cookie is bound to.
+    #[test]
+    fn a_port_override_lasts_for_one_launch_only() {
+        // Nothing stored: the configured port wins.
+        assert_eq!(runtime_port(3080), 3080);
+        PORT_OVERRIDE.store(3091, Ordering::SeqCst);
+        assert_eq!(runtime_port(3080), 3091);
+        PORT_OVERRIDE.store(0, Ordering::SeqCst);
+        assert_eq!(runtime_port(3080), 3080);
     }
 
     /// The question has to name what the user is about to end: a pid alone does not tell them

@@ -13,6 +13,14 @@
 第 2 种情形是审查里唯一还带安全语义的缺口：用户打开一个配置文件开关，就授权壳在之后每次启动时
 无提示地结束别人的终端会话 / agent 任务。目标是把这一条变成运行时询问，且**不引入新的 Tauri 依赖**。
 
+> **2026-09-16 修正（第一版把询问也交给了配置项）**：第一版让 `foreign_instance_action()` 在
+> `take_over_existing: false` 时直接返回 `UseBrowser`，只有 `true` 才返回 `Ask`。测试与文档都按这个
+> 行为写了，但它意味着**默认用户永远看不到面板** —— 选择权被前置成了一道配置题，而审查要求的是
+> 检测到外部实例「让用户选择」。实机确认：默认配置下启动桌面端，直接以浏览器形式打开并停在错误页。
+>
+> 现在询问是**无条件**的：两道身份校验通过就问，`take_over_existing` 只是**没人答复时**的答案。
+> 同一处错误也存在于更新前的停止判据（`may_stop_before_update`），已一并改掉。
+
 ## 2. 关键约束
 
 | 约束 | 影响 |
@@ -53,27 +61,46 @@ Rust 侧（`src-tauri/src/window.rs`）：
 
 ### 3.2 决策与四条 kill 路径
 
-`foreign_instance_action()` 新增一个分支 `Ask { pid }`：**两道身份校验都通过**（401 认证栅栏 +
-命令行像 `dsh web`）且 `take_over_existing: true` 时，返回 `Ask` 而不是直接 `TakeOver`。
+`foreign_instance_action(owner, command)` 只看两个身份信号：**都通过**（401 认证栅栏 + 命令行像
+`dsh web`）就返回 `Ask { pid }`，否则 `Refuse`。它**不再接收** `take_over_existing`：配置项不参与
+「是否询问」，只参与「没答复怎么办」。
 
 `resolve_foreign_action()` 把 `Ask` 变成真正的问题：
 
 1. 拼出问题文案：pid、**完整命令行**、端口、以及**本壳将要使用的 workspace**；
-2. 三个选项：接管 / 保留并用浏览器打开 / 什么都不做退出本应用；
-3. 等待答案，并按 id 映射回 `TakeOver` / `UseBrowser` / `Refuse`；
-4. 没答复（超时、窗口缺失、页面没加载）→ 回落到 `config.take_over_existing` 的语义。
+2. 选项（第 3 个只在找到空闲端口时出现）：接管 / 保留并用浏览器打开 / **保留并换端口** /
+   什么都不做退出本应用；
+3. 等待答案，并按 id 映射回 `TakeOver` / `UseBrowser` / `UseOtherPort` / `Refuse`；
+4. 没答复（超时、窗口缺失、页面没加载）→ `unanswered_choice(config.take_over_existing, pid)`。
 
-四条会对外部进程发信号的路径全部接上：
+四条会对外部进程发信号的路径全部接上，且**都以身份为闸门、以答复为准**：
 
 | 路径 | 位置 | 询问方式 |
 | --- | --- | --- |
-| 启动时检测到外部实例 | `start()` 3c 检测分支 | `resolve_foreign_action()` |
-| 交接（插件市场重启）后端口被替代实例占用 | `take_over_handoff_and_start()` | `confirm_takeover()` |
+| 启动时检测到外部实例 | `start()` 3c 检测分支 | `foreign_instance_action()` → `resolve_foreign_action()` |
+| 交接（插件市场重启）后端口被替代实例占用 | `take_over_handoff_and_start()` | 不在此处询问，交回启动流程统一问（避免同一次重启问两遍） |
 | 自启失败后重试前的接管 | 同上，第二个 `match` 分支 | `confirm_takeover()` |
-| 更新前停止正在服务该 CLI 树的实例 | `stop_instance_before_update()` | `confirm_takeover()`，拒绝即跳过本次更新 |
+| 更新前停止正在服务该 CLI 树的实例 | `stop_instance_before_update()` | `confirm_takeover()`，不给接管即跳过本次更新 |
 
-`confirm_takeover()` 在 `take_over_existing: false` 时不询问直接返回 false —— 那种配置下用户
-已经明确要求保留该实例。
+`confirm_takeover()` 只有拿到 `TakeOver` 才返回 true：`UseOtherPort` 明确表示「那个实例留着」，
+**不是**发信号的许可。
+
+### 3.2.1 「保留并换端口」与重试循环
+
+`UseOtherPort` 在配置端口之上的**第一个空闲端口**启动本壳的 Harness（`free_port_from()`，向上搜
+20 个）。它只记在 `PORT_OVERRIDE`（本次启动有效）、**不写回 `config.json`**：会话 cookie 与固定端口
+绑定，静默永久迁移比下次再问一次更糟。
+
+`UseBrowser` 与 `UseOtherPort` 都必须**绕开「接管等待端口释放」那段循环**：那段代码的前提是本壳刚刚
+信号过一个进程，而这两种答复恰恰是「不碰对方」。为此引入 `took_over` 标志，只有 `TakeOver` 才置位。
+
+### 3.2.2 终态页面：不能让用户点一个必然失败的按钮
+
+`UseBrowser` 走的是 `window::show_notice`（无重启按钮），不是 `show_failure`。`show_failure` 会
+`RETRY_OFFERED.store(true)`，而那同时打开了状态页按钮、single-instance 回调与 macOS `RunEvent::Reopen`
+三个入口；外部实例还活着、本壳又不会接管它，所以每一次点击都只会重跑一遍注定失败的 `start()`、
+**再开一个浏览器标签页**，然后回到同一个页面。实机日志里能看到这个循环（6 次 `restart requested from
+the status page`）。判断抽成 `terminal_page(&ForeignAction)` 以便单测。
 
 ### 3.3 文案
 
@@ -81,14 +108,24 @@ Rust 侧（`src-tauri/src/window.rs`）：
 用户最难预料的一点，因此写在详情里而不是日志里。读不到命令行时写 `<读不到命令行>`，让用户知道
 壳不知道什么，而不是留空。
 
+浏览器回退页额外写明两条用户下一句一定会问的：**没有可重启的 Harness**（所以也没有重启按钮），
+以及浏览器需要已有该 authority 的登录 cookie —— 否则会看到 `authentication required`（实测无 cookie
+访问根路径就是 401 栅栏）。
+
 ## 4. 验证
 
-新增单测 4 项（`lib.rs` 2 项 + `window.rs` 2 项；另把 `a_foreign_instance_is_only_taken_over_when_it_is_identified`
-改名为 `a_foreign_instance_is_only_asked_about_when_it_is_identified`），集成测试 5 → 6 项。
-库内单测合计 116 → 134，其中 14 项属于更新事务（见另一文档）：
+新增单测 8 项（`lib.rs` 6 项 + `window.rs` 2 项），集成测试 5 → 6 项。库内单测合计 116 → 138，
+其中 14 项属于更新事务（见另一文档）：
 
-- `a_foreign_instance_is_only_asked_about_when_it_is_identified`：身份矩阵，`Ask` 取代原先的
-  直接 `TakeOver`；未识别 / 无命令行仍然 `Refuse`；
+- `an_identified_foreign_instance_is_always_asked_about`：身份矩阵，识别出来就问、**与配置项无关**；
+  未识别 / 无命令行仍然 `Refuse`。**负向验证**：把配置闸门加回去，测试立刻以
+  `left: UseBrowser, right: Ask { pid: 4242 }` 失败。这正是第一版放行的缺陷；
+- `an_unanswered_question_follows_the_config`：没答复 → `true` 接管 / `false` 浏览器；
+- `another_port_is_offered_only_when_one_is_actually_free`：先占住一个端口，再向上搜，
+  断言结果跳过被占的那个、落在范围之内且真的能 bind；
+- `a_port_override_lasts_for_one_launch_only`：`PORT_OVERRIDE` 置位生效、清零后回到配置端口；
+- `leaving_the_instance_alone_does_not_offer_a_restart`：`UseBrowser` → `Notice`（无按钮），
+  `Refuse` / `TakeOver` → `Failure`（有按钮）；
 - `the_takeover_question_names_the_process_and_this_shells_workspace`：文案含端口、pid、命令行、
   workspace；命令行缺失时有明确占位；
 - `an_unanswered_takeover_question_follows_the_config_default`：超时返回 `None`；问题号不匹配的
@@ -99,29 +136,43 @@ Rust 侧（`src-tauri/src/window.rs`）：
 - `the_takeover_panel_renders_its_options_and_reports_the_click`（`tests/webkit_compat_shim.rs`，**在真实 JS 引擎里跑整张页面**）：
   把 `src/index.html` 的全部 `<script>` 块按文档顺序喂给一个最小 DOM，断言面板可见、重启按钮被隐藏、
   按钮数等于选项数、点击后发出的是 `{question, id}`、所有按钮随即禁用、清空问题后面板收起。
+  选项列表用**四项**的那一版（含换端口），并点击第 3 个按钮 —— 索引与 id 的对应关系因此也被覆盖。
 
   **这一项抓出了上面 4 项都漏掉的真实缺陷**：`__applyChoice` 里选项取自 `pending[2]`（其实是 detail 文本），
   于是面板永远不渲染 —— 而所有字符串断言照样通过，因为字符串确实都在文件里。经**负向验证**确认：把该索引
   改回去，新测试立刻以「the question must show the panel」失败；改回来即绿。这印证了「断言字符串出现在文件里」
   与「页面真的这么工作」是两回事。
 
-门禁：`cargo test` 134 passed / 0 failed、`cargo fmt --check` 通过、`cargo clippy --all-targets`
-0 warning。
+门禁：`cargo test` **138 passed / 0 failed**、`cargo fmt --check` 通过、`cargo clippy --all-targets`
+0 warning。产物冒烟：`make bundle` 后确认 `.app` 里含换端口选项与新的浏览器回退文案。
 
-**未做实机验证**：询问面板需要真实的外部 Harness 占住 3080 才能触发。本机验证方式（未执行，留给
-发布前冒烟）：
+**实机复现（2026-09-16，用户报告 → 已确认）**：默认配置下，端口上有别人启动的 `dsh web` 时启动桌面端，
+会直接以浏览器形式打开并停在错误页。根因是 3.2 修正的那处配置闸门，日志里的 6 次
+`restart requested from the status page` 则对应 3.2.2 的重试循环。
 
-1. 终端里用另一个 workspace 起 `dsh web --port 3080`；
-2. `config.json` 设 `take_over_existing: true` 后启动应用；
-3. 确认弹出三选项面板、详情里是那个终端的命令行与本壳的 workspace；
-4. 分别验证「接管」「浏览器」「什么都不做」，以及不点任何按钮等满 120 秒的行为。
+**未做完整实机验证**：面板本身需要真实的外部 Harness 占住端口才能弹出，而当前沙箱不允许 `ps` /
+`lsof`（身份校验的第二道信号读不到），因此无法在这里跑 GUI 冒烟。已能验证的部分：
+
+1. 起一个真实的 `dsh web --port 3199`（隔离 `DSH_HOME`），确认它对无 cookie 请求回 401 认证栅栏；
+2. 用它的真实命令行跑 `looks_like_dsh_web` → `true`，`plugin add` 形态 → `false`；
+3. 确认清理后 3199 已关闭、用户的 3080 实例不受影响。
+
+留给发布前冒烟：`config.json` 保持默认（不写 `take_over_existing`），在有外部实例的端口上启动，
+确认弹出**四**选项面板，并分别验证四个选项与「不点任何按钮等满 120 秒」。
 
 ## 5. 影响范围
 
 - `src-tauri/src/window.rs`：`CHOICE_EVENT`、`ChoiceOption`、`Choice`、`ask_choice`、
   `wait_for_choice`、`record_choice`、`choice_script`；
-- `src-tauri/src/lib.rs`：`ForeignAction::Ask`、`resolve_foreign_action`、`confirm_takeover`、
-  `takeover_question`、四条 kill 路径、`CHOICE_EVENT` 监听器；
+- `src-tauri/src/lib.rs`：`ForeignAction::{Ask, UseOtherPort}`、`resolve_foreign_action`、
+  `unanswered_choice`、`confirm_takeover`、`terminal_page`、`takeover_question`、`may_stop_before_update`、
+  `runtime_port` / `free_port_from` / `PORT_OVERRIDE`、四条 kill 路径、`CHOICE_EVENT` 监听器；
 - `src/index.html`：询问面板（样式、DOM 容器、渲染与回答脚本）；
-- 无新依赖、无新 capability、无配置项变更（`take_over_existing` 的语义从「是否接管」细化为
-  「没答复时是否接管」）。
+- 无新依赖、无新 capability、无新配置项。`take_over_existing` 的语义从「**是否**接管」收敛为
+  「**没答复时**是否接管」，默认值不变。
+
+## 6. 一处行为变更需要知会用户
+
+默认用户从「什么都不问、直接开浏览器」变成「**先问一次，不答才开浏览器**」。这会多一个最多 120 秒的
+阻塞点，但只在真的检测到外部 Harness（且身份确认）时出现 —— 正是需要人来决策的时刻。README 的配置表
+与行为表已同步。
