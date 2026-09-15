@@ -612,7 +612,7 @@ Dock 里就只剩一个没有窗口的进程。
 
 > **2026-09-15 修正**：这一步不再直接停在报错页 —— 退出先走自动恢复（交接 → 接管 → 自启），只有自动
 > 重试用完或失败才弹终态页。状态页也拆成了三面：`show_progress`（进行中）、`show_failure`（终态，
-> 带「重新启动 Harness」按钮）、`show_notice`（终态无按钮，旧 WebView 的浏览器回退用）。见 §13.12。
+> 带「重新启动 Harness」按钮）、`show_notice`（终态无按钮，旧 WebView 的浏览器回退用）。见 §13.14。
 
 **P2-2 config.json 是 0644**
 
@@ -635,7 +635,7 @@ Dock 里就只剩一个没有窗口的进程。
 - 崩溃提示路径（P2-1）已实机验证：启动后 `kill -9 <harness pid>`，日志记
   `Harness pid 94329 exited unexpectedly (code None)`，状态页重新弹出报错、
   `state.json` 被清除、应用自身保持运行。（该轮的"停在报错页"行为已于 2026-09-15 改为自动恢复，
-  见 §13.12。）
+  见 §13.14。）
 
 ### 13.11 收尾：安装结果校验与公开仓库前的检查（2026-09-13）
 
@@ -726,7 +726,7 @@ sleep 0.4 && rm -rf /tmp/tree-demo            # 模拟"树被换走"
 允许接管的外部实例 / 不允许接管的外部实例），`cargo test` **29 passed**、`make clippy` 0 warning。
 真实更新路径需要 registry 有新版本才能触发，本轮只做策略级验证。
 
-### 13.12 Harness 意外退出后的自动恢复（2026-09-15）
+### 13.14 Harness 意外退出后的自动恢复（2026-09-15）
 
 **触发**：用户反馈"插件更新后要求重启 dsh，dsh 重启后桌面端停在错误页、无法恢复"。
 
@@ -761,3 +761,44 @@ harness 的代码路径（`FAILURE_SHOWN` 是一次性闩锁，也没有线程�
 
 **同轮后续**：紧接着落地的旧 WebView 兼容层复用了这套状态页拆分，见
 [`design-task-feat-legacy-webkit-compat-layer.md`](./design-task-feat-legacy-webkit-compat-layer.md)。
+
+### 13.15 页面存活看护：渲染进程被杀与主线程卡死（2026-09-15）
+
+**触发**：用户反馈"模型工作时偶尔页面无法继续渲染，提问也发不出去，只能重启应用"。
+
+**排查（本机证据）**：
+
+- 壳日志只有 harness 子进程的记录：整份 323 行里 `panic|crash|unresponsive|timeout` **0 命中** ——
+  页面挂掉时日志完全静默，事后无从判断；
+- `/Library/Logs/DiagnosticReports/JetsamEvent-2026-09-15-115235.ips`：11:52 有过一次内存压力事件
+  （`idea` 11.4 GB、`com.apple.WebKit.WebContent` 627 MB、free 约 97 MB），说明这台机器上
+  WebContent 被系统回收是现实风险（该次被杀的是 `milod`，不是我们的进程）；
+- wry 0.55 在 macOS 上**本来就提供** `web_content_process_did_terminate`
+  （`wkwebview/navigation.rs:109`），Tauri 2.11 把它暴露成 `Builder::on_web_content_process_terminate`
+  （仅 macOS/iOS）—— 我们一处都没用（`grep on_web_content_process_terminate src-tauri/src` 为空）。
+
+**为什么页面自己回不来**：UI 的实时通道是 WebSocket（`dsh-api-gateway`），宿主侧是"两个心跳没回
+就 `terminate()`"（`MAX_MISSED_HEARTBEATS = 2`），客户端也有指数退避重连（`dsh-client-connection`）。
+但这些重连代码**跑在同一个渲染进程里**：进程被杀、或主线程被插件卡死时，它们与页面一起停摆 ——
+只有壳还活着，能发现问题。
+
+**修复**：
+
+- `lib.rs::run` 接上 `on_web_content_process_terminate`（`#[cfg(macos|ios)]`）：渲染进程一结束就记
+  日志（`WebView 渲染进程被系统结束（多为内存压力）`）并重新导航到窗口当前 URL；
+- `window.rs::watch_page_liveness`：每 15s 用 `eval_with_callback` 求值一次 `"dsh-desktop-alive"`，
+  5s 内没有回调即记一次 miss。WebKit 的回调走 UI 进程，所以"能答"同时证明两侧都在工作；
+- 纯策略 `liveness_action(answer, misses, reloads)`：连续 **2** 次 miss 才重载（一次抖动不丢页面状态），
+  重载最多 **3** 次，用尽后停在"页面无响应，请重启应用"并记日志 —— 不刷屏、不无限重载；
+- 标题承载状态：崩溃/无响应时写 `（页面已崩溃，正在重新加载…）`/`（页面无响应，正在重新加载…）`，
+  `PageLoadEvent::Finished` 到达即恢复默认标题，窗口不会一直挂着过期提示；
+- `GENERATION` 计数：窗口重建（插件更新后重启、Harness 退出恢复）时旧看护线程立即退出，
+  不与新线程抢同一个窗口。
+
+**验证**：单测 98 → 100（策略矩阵：一次 miss 只观察、连续两次才重载、重载预算用尽即报告、
+任何应答清零；探针是无副作用的单表达式；超时 < 间隔）。**真机触发待做**：需要一次真实的
+WebContent 被杀或主线程卡死，观察日志与自动重载。
+
+**仍在上游/插件侧的部分**：主线程被第三方 client 插件卡死（`dsh-better-sidebar`、
+`dsh-dream-skin`、`dsh-router-*` 都渲染进主 React 树）时，重载只是恢复手段；要根治得靠插件自身的
+性能问题，或把重负载面板移出主线程。

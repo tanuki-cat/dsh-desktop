@@ -378,7 +378,14 @@ fn shutdown() {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // WebKit kills the WebContent process under memory pressure, and the window it leaves behind
+    // looks alive while answering nothing — not even the UI's own reconnection logic, which lived
+    // in that process. A shell that only watched its child process would sit there until the user
+    // restarted the app (field report 2026-09-15). macOS-only: the other platforms never call it.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let builder = builder.on_web_content_process_terminate(window::recover_terminated_webview);
+    builder
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             for label in [window::HARNESS, window::SPLASH] {
                 if let Some(existing) = app.get_webview_window(label) {

@@ -4,11 +4,12 @@ use crate::harness;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::webview::{DownloadEvent, NewWindowResponse, PageLoadEvent};
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, Webview, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use url::Url;
 
 pub const SPLASH: &str = "splash";
@@ -738,6 +739,59 @@ fn status_script(function: &str, status: &str, detail: &str) -> String {
 /// Wait this long for the first load to report "finished". The port already answered a probe
 /// before the window was built, so a healthy load completes well inside it.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How often the shell asks the Harness page whether it is still there.
+///
+/// The page's own WebSocket is the thing the user notices dying, but the page cannot report a
+/// dead *renderer*: when WebKit's WebContent process is killed (memory pressure) or its main
+/// thread is wedged by a plugin, nothing inside that process runs — including every reconnection
+/// path the UI has. The shell is the only party still alive to notice.
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How long one liveness answer may take before it counts as a miss.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Consecutive misses that mean "this page is gone", not "this machine hiccuped".
+const LIVENESS_MISSES: u32 = 2;
+
+/// Reloads allowed before the shell stops trying and says so.
+const LIVENESS_RELOADS: u32 = 3;
+
+/// What the shell does about one liveness probe result.
+#[derive(Debug, PartialEq, Eq)]
+enum LivenessAction {
+    /// The page answered: it is alive, whatever its connection state.
+    Alive,
+    /// Nothing answered yet: wait for the next probe.
+    Wait { misses: u32 },
+    /// The page is gone or wedged: load the URL again.
+    Reload { attempt: u32 },
+    /// Reloads did not bring it back: stop, and tell the user.
+    Report { attempts: u32 },
+}
+
+/// Pure liveness policy: a miss count and the reloads already spent decide what happens next.
+///
+/// Reloading is not free — it throws away whatever the page had in memory — so it is reserved for
+/// a page that has missed [`LIVENESS_MISSES`] probes in a row, and it gives up after
+/// [`LIVENESS_RELOADS`] of them instead of looping for ever.
+fn liveness_action(answer: bool, misses: u32, reloads: u32) -> LivenessAction {
+    if answer {
+        return LivenessAction::Alive;
+    }
+    let misses = misses.saturating_add(1);
+    if misses < LIVENESS_MISSES {
+        return LivenessAction::Wait { misses };
+    }
+    let attempt = reloads.saturating_add(1);
+    if attempt > LIVENESS_RELOADS {
+        return LivenessAction::Report { attempts: reloads };
+    }
+    LivenessAction::Reload { attempt }
+}
+
+/// The answer a live page sends back: the shell only needs "something ran".
+const LIVENESS_PROBE: &str = "\"dsh-desktop-alive\"";
 /// Navigations of the same startup URL, including the first one.
 const LOAD_ATTEMPTS: u32 = 3;
 
@@ -774,7 +828,7 @@ pub fn create_harness(
     let signals = Arc::new(LoadSignals::default());
     let load_signals = signals.clone();
     let mut builder = WebviewWindowBuilder::new(app, HARNESS, WebviewUrl::External(url.clone()))
-        .title("DeepSeek Harness")
+        .title(DEFAULT_TITLE)
         .inner_size(1440.0, 960.0)
         .min_inner_size(900.0, 600.0)
         .on_navigation(move |target| {
@@ -795,13 +849,18 @@ pub fn create_harness(
         })
         // The only evidence of what the first navigation did. `PageLoadEvent` is
         // non-exhaustive, so each variant is matched on its own.
-        .on_page_load(move |_window, payload| {
+        .on_page_load(move |window, payload| {
             let event = payload.event();
             if matches!(event, PageLoadEvent::Started) {
                 load_signals.started.store(true, Ordering::SeqCst);
             }
             if matches!(event, PageLoadEvent::Finished) {
                 load_signals.finished.store(true, Ordering::SeqCst);
+                // A load that finished is the proof the page is back: undo the "unresponsive"
+                // title a recovery put there, so the window never lies about its own state.
+                if !title_is_default(&window) {
+                    let _ = window.set_title(DEFAULT_TITLE);
+                }
             }
         })
         // Downloads land in the user's Downloads folder instead of vanishing.
@@ -838,6 +897,14 @@ pub fn create_harness(
     let target = url.clone();
     std::thread::spawn(move || watch_first_load(watcher_app, watcher, target, port, signals));
 
+    // From here on the page is on its own: a WebContent process killed under memory pressure, or
+    // a main thread wedged by a plugin, leaves a window that looks alive and answers nothing —
+    // including the UI's own reconnection logic, which lives in that very process.
+    let alive_app = window.app_handle().clone();
+    let alive_url = url.clone();
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::spawn(move || watch_page_liveness(alive_app, alive_url, generation));
+
     // Closing the Harness window quits the app, which stops the supervised process.
     let handle = window.app_handle().clone();
     window.on_window_event(move |event| {
@@ -852,6 +919,155 @@ pub fn create_harness(
     }
     Ok(())
 }
+
+/// The WebView's render process died: WebKit has already torn the page down, so the only thing
+/// left to do is put it back.
+///
+/// The window itself survives, which is exactly why this needs handling: it keeps showing the last
+/// frame, accepts clicks, and answers nothing. A webview the shell did not create (the status page)
+/// is left alone; the Harness window is reloaded to the URL it was showing, and the liveness
+/// watchdog takes over from there if even that does not come back.
+pub fn recover_terminated_webview(webview: &Webview) {
+    let label = webview.label().to_string();
+    if label != HARNESS {
+        harness::app_log(&format!(
+            "WebView 渲染进程结束（{label}）：不是 harness 窗口，忽略"
+        ));
+        return;
+    }
+    harness::app_log("WebView 渲染进程被系统结束（多为内存压力），正在重新加载页面");
+    let Some(window) = webview.app_handle().get_webview_window(HARNESS) else {
+        harness::app_log("崩溃恢复：harness 窗口已不在，交给存活检查处理");
+        return;
+    };
+    let target = current_url(&window);
+    set_title(&window, "DeepSeek Harness（页面已崩溃，正在重新加载…）");
+    if let Err(error) = window.navigate(target.clone()) {
+        harness::app_log(&format!("崩溃后重新加载 {target} 失败: {error}"));
+    }
+}
+
+/// The URL a window is showing, falling back to the loopback root when WebKit cannot say.
+fn current_url(window: &WebviewWindow) -> Url {
+    match window.url() {
+        Ok(url) if url.scheme() == "http" => url,
+        Ok(url) => {
+            harness::app_log(&format!("窗口当前地址不是 http（{url}），回到根路径"));
+            Url::parse("http://127.0.0.1/").expect("a literal URL parses")
+        }
+        Err(error) => {
+            harness::app_log(&format!("读取窗口地址失败（{error}），回到根路径"));
+            Url::parse("http://127.0.0.1/").expect("a literal URL parses")
+        }
+    }
+}
+
+/// Watch the Harness page for as long as the window exists.
+///
+/// One probe per [`LIVENESS_INTERVAL`]: evaluate a tiny expression and wait (bounded by
+/// [`LIVENESS_TIMEOUT`]) for the answer. WebKit evaluates JavaScript through the *UI* process, so
+/// an answer means both halves are working; no answer across [`LIVENESS_MISSES`] probes means the
+/// page is gone, and the shell loads the URL again — the same thing a user would do by hand, and
+/// the only recovery available for a process the shell cannot restart in place.
+///
+/// The loop ends with the window: a gone window, a window that is no longer the Harness, or a
+/// page that survived [`LIVENESS_RELOADS`] attempts and needs the user to decide.
+fn watch_page_liveness(app: AppHandle, url: Url, generation: u64) {
+    let mut misses = 0;
+    let mut reloads = 0;
+    loop {
+        std::thread::sleep(LIVENESS_INTERVAL);
+        if crate::EXITING.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(window) = app.get_webview_window(HARNESS) else {
+            // The window was closed or replaced: nothing left to watch.
+            harness::app_log("页面存活检查结束：harness 窗口已不在");
+            return;
+        };
+        let answered = probe_page(&window);
+        match liveness_action(answered, misses, reloads) {
+            LivenessAction::Alive => {
+                if misses > 0 || reloads > 0 {
+                    harness::app_log(&format!(
+                        "WebView 页面恢复响应（此前 {misses} 次未响应、{reloads} 次重载）"
+                    ));
+                }
+                misses = 0;
+                reloads = 0;
+            }
+            LivenessAction::Wait { misses: now } => {
+                misses = now;
+                if misses == 1 {
+                    harness::app_log("WebView 页面没有响应存活检查，继续观察");
+                }
+            }
+            LivenessAction::Reload { attempt } => {
+                misses = 0;
+                reloads = attempt;
+                harness::app_log(&format!(
+                    "WebView 页面连续 {LIVENESS_MISSES} 次没有响应，第 {attempt}/{LIVENESS_RELOADS} 次重新加载 {url}"
+                ));
+                set_title(&window, "DeepSeek Harness（页面无响应，正在重新加载…）");
+                if let Err(error) = window.navigate(url.clone()) {
+                    harness::app_log(&format!("重新加载页面失败: {error}"));
+                }
+            }
+            LivenessAction::Report { attempts } => {
+                harness::app_log(&format!(
+                    "WebView 页面在 {attempts} 次重新加载后仍无响应，交给用户处理"
+                ));
+                set_title(&window, "DeepSeek Harness（页面无响应，请重启应用）");
+                return;
+            }
+        }
+        // A window that was replaced while a probe was in flight belongs to another watchdog:
+        // reloading it from here would fight the newer one over the same label.
+        if generation != GENERATION.load(Ordering::SeqCst) {
+            harness::app_log("页面存活检查结束：harness 窗口已被重建");
+            return;
+        }
+    }
+}
+
+/// The title a healthy window carries.
+const DEFAULT_TITLE: &str = "DeepSeek Harness";
+
+/// Put a sentence in the window title, so a page that stopped answering is visible without the
+/// log. Best effort: a window that refuses the title is not a reason to stop watching it.
+fn set_title(window: &WebviewWindow, title: &str) {
+    if let Err(error) = window.set_title(title) {
+        harness::app_log(&format!("设置窗口标题失败: {error}"));
+    }
+}
+
+/// Whether the window is already showing the plain title (no recovery message to undo).
+fn title_is_default(window: &WebviewWindow) -> bool {
+    window
+        .title()
+        .map(|title| title == DEFAULT_TITLE)
+        .unwrap_or(true)
+}
+
+/// Ask the page to evaluate something trivial, and wait a bounded time for the answer.
+///
+/// `eval_with_callback` answers from WebKit's completion handler, so a wedged or dead renderer
+/// never calls it — that silence is the signal this whole path exists for.
+fn probe_page(window: &WebviewWindow) -> bool {
+    let (tx, rx) = mpsc::channel();
+    if window
+        .eval_with_callback(LIVENESS_PROBE, move |_answer| {
+            let _ = tx.send(());
+        })
+        .is_err()
+    {
+        return false;
+    }
+    rx.recv_timeout(LIVENESS_TIMEOUT).is_ok()
+}
+
+/// Bumped every time the window is rebuilt, so an old watchdog can tell it lost its subject.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// What to do after the page missed its load deadline.
 #[derive(Debug, PartialEq, Eq)]
@@ -1272,6 +1488,63 @@ mod tests {
                 "the compat layer must stay ES5, found {syntax:?}"
             );
         }
+    }
+
+    /// The page cannot report its own death: a killed renderer, or a main thread wedged by a
+    /// plugin, stops the UI's own reconnection logic too. This is the shell-side policy.
+    #[test]
+    fn a_page_that_stops_answering_is_reloaded_and_then_reported() {
+        // One miss is a hiccup: the shell waits for the next probe instead of throwing away the
+        // page's state.
+        assert_eq!(
+            liveness_action(false, 0, 0),
+            LivenessAction::Wait { misses: 1 }
+        );
+        // The second miss in a row is a page that is gone.
+        assert_eq!(
+            liveness_action(false, 1, 0),
+            LivenessAction::Reload { attempt: 1 }
+        );
+        // Anything that answers clears the streak, whatever the reload count was.
+        assert_eq!(liveness_action(true, 5, 2), LivenessAction::Alive);
+        // Reloads are budgeted: the shell stops instead of looping over a page that never returns.
+        assert_eq!(
+            liveness_action(false, 1, 1),
+            LivenessAction::Reload { attempt: 2 }
+        );
+        assert_eq!(
+            liveness_action(false, 1, 2),
+            LivenessAction::Reload { attempt: 3 }
+        );
+        assert_eq!(
+            liveness_action(false, 1, 3),
+            LivenessAction::Report { attempts: 3 }
+        );
+        // A missed probe mid-recovery does not reset the reload budget.
+        assert_eq!(
+            liveness_action(false, 0, 3),
+            LivenessAction::Wait { misses: 1 }
+        );
+        assert_eq!(
+            liveness_action(false, 1, u32::MAX),
+            LivenessAction::Report { attempts: u32::MAX }
+        );
+    }
+
+    #[test]
+    fn the_liveness_probe_is_a_single_expression() {
+        // The answer is only "something ran in the page": the callback is what the shell waits
+        // for, so the expression must not depend on anything the page has to provide.
+        assert_eq!(LIVENESS_PROBE, "\"dsh-desktop-alive\"");
+        assert!(
+            !LIVENESS_PROBE.contains(';'),
+            "一次求值，不要有副作用: {LIVENESS_PROBE}"
+        );
+        // The watchdog has to outlast a slow but healthy page, and give up before a user would.
+        assert!(LIVENESS_TIMEOUT < LIVENESS_INTERVAL);
+        // The budgets are compile-time facts (clippy refuses asserting on constants), so the
+        // policy matrix above is what pins their behaviour.
+        assert_eq!((LIVENESS_MISSES, LIVENESS_RELOADS), (2, 3));
     }
 
     #[test]
