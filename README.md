@@ -34,7 +34,7 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 - 生命周期：退出即 SIGTERM 进程组（5s 后 SIGKILL）并删除 state.json —— 关闭窗口（`RunEvent::ExitRequested`）
   与 ⌘Q / Dock 退出（`RunEvent::Exit`）两条事件链都处理；复用的上次实例也登记，退出时一并停掉
 - 启动失败即收尾：等待 URL 超时或窗口创建失败时，先停掉刚起的进程再报错，不留"假失败 + 端口被占"
-- 看护线程：启动成功后继续 `wait` 子进程，Harness 意外退出会清掉 state.json、销毁已无意义的 Harness 窗口并弹回状态页报错（应用不静默变死页面）；状态页是终点，关闭它即退出应用
+- 看护线程：启动成功后继续 `wait` 子进程，Harness 意外退出会清掉 state.json 并**自动把它拉起来**：先给 8s（崩溃/被杀只给 2s）等一次"交接"——插件市场的「立即重启」就是宿主干净退出、由 detached helper 在同一端口拉起替代进程；端口重新服务时先停掉那个替代进程（它的 cwd 是 CLI 目录、不是本壳配置的 workspace），再按本壳的 runtime/workspace/凭据启动自己的实例，成功后直接把窗口切到新的 token URL。连续 3 次短命重启都没稳定下来才弹终态状态页；运行满 60s 记一次健康、计数归零。状态页带「重新启动 Harness」按钮（同一进程内重跑启动流程），此时另起一个实例（single-instance 回调）或点 Dock 图标（macOS 的 `RunEvent::Reopen`）也等价于按这个按钮；浏览器回退页没有按钮、也不响应这两个入口
 - 残留自愈：只有强杀/崩溃这类拿不到回调的场景才靠下次启动清理；state.json 0600。记录的 pid 仍监听记录的端口时才发信号；仍服务**本次端口**的记录会保留，让启动流程直接复用而不是重启；pid 已不拥有该端口时，只有"命令行含 `--profile web`/`dsh`，且父进程已消失或由 launchd / `systemd --user` 接管"的残留才会被清理（pid 复用、以及别人正在跑的会话都不动）
 - 安全：Harness 窗口零 capability、导航限定当次 authority、外链与 `window.open` 只把 `http`/`https` 交系统浏览器（`file:`、自定义 scheme 记 `external scheme blocked` 后丢弃）
 - 下载：`on_download` 落盘到 `~/Downloads`，同名文件自动加 `-1`/`-2` 后缀（不静默覆盖）；
@@ -48,9 +48,15 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
 
 - 实机（2026-09-13，macOS）：接管外部 Harness → 自启并拿到 token URL → WebView 内 token→cookie 成功，
   会话列表/文件卡片/输入框正常渲染；`state.json` 与端口监听者一致；日志 0 行明文 token。
-- 崩溃提示实机复现（2026-09-13，macOS）：启动后 `kill -9` 掉 harness 进程，日志记
-  `Harness pid 94329 exited unexpectedly (code None)`，状态页重新弹出报错、`state.json` 被清除，
-  应用自身保持运行（不再是一张死页面）。
+- Harness 意外退出的自动恢复（2026-09-15 实现；证据来自 2026-09-14 的真实日志，**实机演练待做**）：
+  日志里插件市场的 `{"event":"restart","detail":"scheduled pid=99772 helper=1726"}` 正对上壳的
+  `Harness pid 99772 exited unexpectedly (code Some(0))` —— 用户在市场点「立即重启」后，壳把这次
+  干净退出当成崩溃：销毁窗口、弹终态报错页，而替代实例随后已在 3080 上服务，用户只能退出应用重开
+  （重开还会 SIGTERM 掉那个替代实例）。现在改成自动恢复：干净退出先等 8s 交接，端口回来就停掉替代实例
+  并按本壳的 workspace 重启；崩溃/被杀 2s 后直接自启。历史上那条 `kill -9` 记录
+  （`Harness pid 94329 exited unexpectedly (code None)`）同样落在"2s 后自启"这一支。
+  实测本地 `dsh web` 从 spawn 到打印 URL 约 4s、SIGTERM 退出码为 0（`node lib/bin.js --profile web
+  --no-open --port 3099`，临时 `DSH_HOME`）；策略分支由 `exit_action` / `exit_reason` 单测覆盖。
 - 退出路径实机复现（2026-09-13，macOS）：⌘Q 等价的 Apple Event 退出后，日志出现
   `stopping Harness pid 92619` / `Harness stopped`，3080 端口释放、`state.json` 删除；
   修复前只处理红点关闭（`ExitRequested`），⌘Q 走的是 `RunEvent::Exit`，清理从未执行。
@@ -58,7 +64,7 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
   `plugin update available: dshmarket 1.45.1 -> 1.46.1, installing`、`plugin updated: dshmarket 1.45.1 -> 1.46.1`，
   随后 harness 重启并正常服务；profile 的依赖范围被改写为 `^1.46.1`、`node_modules` 内实装 1.46.1，
   且 `plugin-check.json` 与核心的 `update-check.json` 各自独立（时间戳与内容互不影响）。
-- 离线测试：`cargo test` **77 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
+- 离线测试：`cargo test` **88 passed**（URL 解析含 LAN 后缀、token 脱敏、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
   缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口与跨窗口都不重复安装"、npm PATH 前缀、沉默对端探针超时、
   package.json 版本解析、部分/损坏 config.json 处理、workspace / dsh_path 回退不改文件、HOME 缺失不回落 `/`、
@@ -66,7 +72,10 @@ DeepSeek Harness 的 Tauri 桌面壳：启动 `dsh web`、捕获启动 URL、用
   "Keep ⇒ 进程组终止"的组合断言、孤儿残留的 `ps` 判定与父进程分类（launchd / `systemd --user` / 父进程已消失 / 活着的会话）、
   更新前停止模式、
   日志运行中轮转与备份份数、日志句柄共享、计数器不提前轮转、spawn 路径校验点名、
-  下载重名避让、URL 解析兜底、CLI 版本区间判定；合并自带运行时后另有：运行时决策矩阵与能力门槛、
+  下载重名避让、URL 解析兜底、CLI 版本区间判定、Harness 退出后的恢复策略矩阵
+  （干净退出给长交接等待 / 崩溃给短等待、连续自动重启预算与"健康运行后计数归零"、退出码与信号的人话文案、
+  状态页按钮与壳监听的事件名一致）；
+  合并自带运行时后另有：运行时决策矩阵与能力门槛、
   影子前缀与版本仲裁、`Origin::Env` 不算自带、播种与首启超时、更新后切树回读、
   插件市场 profile 判定与插件缓存隔离）。
 - 权限：`config.json`（`env` 字段可能放 API Key）与 `state.json` 均为 0600；旧版本留下的 0644 文件会在下次启动时被就地收紧（实机已确认）。
@@ -259,12 +268,15 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | 复用上次实例后退出 | 该实例已登记，退出时照样 SIGTERM（旧行为不登记 → 留孤儿） |
 | 强杀（SIGKILL）/ 崩溃 | 拿不到任何回调；下次启动先自愈：仍在服务本次端口的记录保留下来交给复用分支，其余情况清掉残留与记录 |
 | 启动等待 URL 超时 / 窗口创建失败 | 停掉刚起的子进程 → 状态页报错（不会留下占着端口的半启动实例） |
-| 启动成功后 Harness 意外退出 | 看护线程发现退出 → 清 state.json → 销毁 Harness 窗口 → 状态页显示退出码与最近输出（关闭状态页即退出应用） |
+| 启动成功后 Harness 意外退出 | 看护线程发现退出 → 清 state.json → 销毁 Harness 窗口、状态页显示"正在重新启动…" → **自动重启**：干净退出（退出码 0，插件市场「立即重启」就是这一种）先等 8s，端口被替代实例接管时先停掉它再按本壳的 workspace 启自己的；崩溃/被杀 2s 后直接自启。成功后切到新的 token URL；连续 3 次短命重启未稳定才停在终态报错页（带「重新启动 Harness」按钮） |
 | 窗口首次加载失败 | 20 s 内没有收到"加载开始"事件（导航根本没起来，无论端口是否健康）→ 退避重试同一 token URL，最多 3 次；已经开始加载则一律不打扰。次数用尽且端口也不再服务才弹状态页；端口仍健康时只记日志，不在事件不投递的环境里给正常应用弹错误页 |
 | 页面里的非 http/https 链接（`file:`、自定义 scheme…） | 不交给系统：日志记 `external scheme blocked: <scheme> (...)` 后丢弃 |
 | 有新版 dsh 但端口上是外部实例且不允许接管 | 跳过本次更新（不重写别人正在用的树），实例继续服务，日志记 `update deferred` |
 | 下载同名文件 | 自动改名 `name-1.ext`，不覆盖已有文件 |
 | 关闭状态页（启动失败时） | 直接退出应用（此时没有 Harness 窗口，不会留下无窗口进程）；应用自己移除该窗口走 `destroy`，不触发这条 |
+| 终态状态页上点「重新启动 Harness」 | 同一进程内复位失败标志并重跑启动流程：占端口的外部 Harness 会被接管，成功即销毁状态页、开新窗口；再失败则原地更新报错页 |
+| 终态状态页在屏幕上时又启动一个实例 | single-instance 回调只 show/focus 那个窗口会让人以为"重开也没用"，因此它等价于点「重新启动 Harness」 |
+| 终态状态页在屏幕上时点 Dock 图标 / Finder 里再打开一次 | macOS 只会激活已有进程（single-instance 不会触发），所以走 `RunEvent::Reopen`：同样等价于点「重新启动 Harness」。浏览器回退页（Harness 还活着）不在此列，它没有重启按钮也不响应这两个入口 |
 | 壳被强杀后再次启动 | 读取 state.json：残留进程仍在服务本次端口 → 复用它（保留会话）；否则自愈清理后再自启 |
 
 > 并发边界：壳只保证**自己这个端口**上不会同时跑两个实例（接管 + single-instance 插件）。`dsh_home` 为 `null` 时

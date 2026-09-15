@@ -17,15 +17,33 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Listener, Manager, RunEvent};
 
 /// First run may initialise a profile; later runs are fast (measured ~4s on macOS).
 const STARTUP_TIMEOUT_FIRST: Duration = Duration::from_secs(90);
 const STARTUP_TIMEOUT_NEXT: Duration = Duration::from_secs(30);
 const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+
+/// How long the shell waits for someone else to bring the port back before it starts its own
+/// Harness.
+///
+/// A self-restart hands off: the plugin market SIGTERMs the host, which shuts down cleanly, and
+/// a detached helper boots a replacement a few seconds later (measured: a warm `dsh web` binds
+/// ~4s after spawn). A clean exit earns the wait; a late replacement is still handled, because
+/// the restart takes the port back and retries when our own launch loses it.
+const HANDOFF_GRACE: Duration = Duration::from_secs(8);
+/// The same wait for an exit that looks like a crash. Nothing is expected to come back, so the
+/// full grace would only delay the restart the user is waiting for.
+const HANDOFF_GRACE_QUICK: Duration = Duration::from_secs(2);
+/// Poll interval inside both waits.
+const HANDOFF_POLL: Duration = Duration::from_millis(400);
+/// A run that lasted this long is not a crash loop: the next exit starts the restart count over.
+const HEALTHY_RUN: Duration = Duration::from_secs(60);
+/// Consecutive short runs the shell restarts on its own before it stops and reports.
+const MAX_AUTO_RESTARTS: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -318,6 +336,14 @@ static LIVE: Mutex<Option<Live>> = Mutex::new(None);
 /// stopped by the startup thread instead of outliving the app.
 static EXITING: AtomicBool = AtomicBool::new(false);
 
+/// Automatic restarts spent on the current crash streak. A run that lasts proves the streak is
+/// over, so the next exit starts the count again (see [`exit_action`]).
+static AUTO_RESTARTS: AtomicU32 = AtomicU32::new(0);
+
+/// One attempt at a time: the watchdog and the status page's button both lead here, and two
+/// Harnesses racing for one port is exactly the failure this guards against.
+static RESTARTING: AtomicBool = AtomicBool::new(false);
+
 /// Remember the supervised Harness so every exit path can stop it.
 fn adopt(pid: u32, data_dir: &Path) {
     *LIVE.lock().unwrap() = Some(Live {
@@ -347,6 +373,12 @@ pub fn run() {
                 if let Some(existing) = app.get_webview_window(label) {
                     let _ = existing.show();
                     let _ = existing.set_focus();
+                    // A second launch while the status page reports a failure is the user
+                    // asking for the Harness to be started: the app is alive but has no window
+                    // onto one, so only re-focusing the page would look like being ignored.
+                    if label == window::SPLASH && window::retry_offered() {
+                        request_restart(app);
+                    }
                     return;
                 }
             }
@@ -357,6 +389,12 @@ pub fn run() {
             app.listen(window::PROBE_EVENT, |event| {
                 window::record_report(event.payload());
             });
+            // The status page's restart button reports through the same window's core
+            // capability, for the same reason: no other IPC surface is granted.
+            let restart_handle = app.handle().clone();
+            app.listen(window::RESTART_EVENT, move |_event| {
+                request_restart(&restart_handle);
+            });
             let handle = app.handle().clone();
             window::create_splash(&handle)?;
             std::thread::spawn(move || startup(handle));
@@ -364,10 +402,18 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("failed to build dsh-desktop")
-        .run(|_app, event| {
-            if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
-                shutdown();
+        .run(|app, event| match event {
+            RunEvent::ExitRequested { .. } | RunEvent::Exit => shutdown(),
+            // macOS activates a running app instead of starting a second one, so the Dock icon
+            // (or Finder) is how "open it again" reaches a shell parked on a failure page. It
+            // means the same thing there as the restart button does.
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. }
+                if window::retry_offered() && app.get_webview_window(window::HARNESS).is_none() =>
+            {
+                request_restart(app);
             }
+            _ => {}
         });
 }
 
@@ -827,8 +873,205 @@ fn abort_start(pid: u32, reason: String) -> Result<(), String> {
     Err(reason)
 }
 
-/// Wait for the Harness to end. An unexpected exit leaves the window on a page that can never
-/// connect again, so report it instead of letting the app look alive.
+/// What the watchdog does about one unexpected exit.
+#[derive(Debug, PartialEq, Eq)]
+enum ExitAction {
+    /// Start another Harness, after waiting `grace` in case something else is booting one.
+    Recover { attempt: u32, grace: Duration },
+    /// The automatic budget is spent: report it and let the user decide.
+    Report,
+}
+
+/// Pure watchdog policy: is this exit answered with another attempt, and how long may a handoff
+/// take first?
+///
+/// `uptime` is how long the dead Harness had been running, `previous` the consecutive automatic
+/// restarts behind it, and `clean` whether it exited with code 0 — the shape of a deliberate
+/// handoff, because the plugin market SIGTERMs the host and it shuts down with that code. A run
+/// that lasted [`HEALTHY_RUN`] is not a crash loop, so the count starts over rather than
+/// eventually refusing to start at all.
+fn exit_action(uptime: Duration, previous: u32, clean: bool) -> ExitAction {
+    let attempt = if uptime >= HEALTHY_RUN {
+        1
+    } else {
+        previous.saturating_add(1)
+    };
+    if attempt > MAX_AUTO_RESTARTS {
+        return ExitAction::Report;
+    }
+    ExitAction::Recover {
+        attempt,
+        grace: if clean {
+            HANDOFF_GRACE
+        } else {
+            HANDOFF_GRACE_QUICK
+        },
+    }
+}
+
+/// How a finished child reads to a person: an exit code, or the signal that killed it.
+fn exit_reason(status: &std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("被信号 {signal} 终止");
+        }
+    }
+    match status.code() {
+        Some(0) => "退出码 0".to_string(),
+        Some(code) => format!("退出码 {code}"),
+        None => "结束状态未知".to_string(),
+    }
+}
+
+/// The user asked for another attempt: the status page's button, or a second launch while that
+/// page was in front. Runs off the caller's thread, because starting a Harness blocks.
+fn request_restart(app: &AppHandle) {
+    if EXITING.load(Ordering::SeqCst) {
+        return;
+    }
+    if RESTARTING.load(Ordering::SeqCst) {
+        harness::app_log("已有一次恢复/重启在进行中，忽略重复的重启请求");
+        return;
+    }
+    let Ok(data_dir) = app.path().app_data_dir() else {
+        harness::app_log("无法获取应用数据目录，忽略重启请求");
+        return;
+    };
+    // A person's explicit request outranks the crash-loop budget.
+    AUTO_RESTARTS.store(0, Ordering::SeqCst);
+    harness::app_log("restart requested from the status page");
+    window::show_progress(app, "正在重新启动 Harness…", "");
+    let handle = app.clone();
+    std::thread::spawn(
+        move || match restart_harness(&handle, &data_dir, HANDOFF_GRACE_QUICK) {
+            Ok(()) => harness::app_log("Harness restarted on request"),
+            Err(reason) => window::show_failure(
+                &handle,
+                "重新启动 Harness 失败",
+                &format!("{reason}\n\n关闭本窗口即退出应用，再次打开会重新尝试。"),
+            ),
+        },
+    );
+}
+
+/// Bring the Harness back with the runtime, workspace and credentials this shell owns.
+///
+/// `Ok` means a Harness is up, including when another attempt was already running; `Err` carries
+/// the reason the user has to see.
+fn restart_harness(app: &AppHandle, data_dir: &Path, grace: Duration) -> Result<(), String> {
+    if RESTARTING.swap(true, Ordering::SeqCst) {
+        harness::app_log("已有一次恢复/重启在进行中，忽略本次触发");
+        return Ok(());
+    }
+    // The page that is about to be replaced may be the failure page; a retry that fails again
+    // must be able to say so.
+    window::allow_next_failure();
+    let outcome = take_over_handoff_and_start(app, data_dir, grace);
+    RESTARTING.store(false, Ordering::SeqCst);
+    outcome
+}
+
+/// Wait out a handoff, take the port back, and start this shell's own Harness.
+///
+/// A replacement booted by the plugin market must not be adopted: it replayed the CLI's own
+/// argv, so its working directory — and therefore the workspace dsh uses — is the CLI directory
+/// instead of the one configured here.
+fn take_over_handoff_and_start(
+    app: &AppHandle,
+    data_dir: &Path,
+    grace: Duration,
+) -> Result<(), String> {
+    let config = Config::load(data_dir);
+    let port = config.port;
+    if let Some(pid) = wait_for_handoff(port, grace) {
+        if !config.take_over_existing {
+            // The user turned takeover off: leave that instance alone and let the normal
+            // startup path decide — it opens the system browser and reports why.
+            harness::app_log(&format!(
+                "端口 {port} 已由 pid {pid} 服务，但 take_over_existing=false：交给启动流程处理"
+            ));
+        } else {
+            harness::app_log(&format!(
+                "端口 {port} 上出现了外部重启的 Harness pid {pid}：停掉它，用本壳的 workspace 重新启动"
+            ));
+            window::set_status(app, "正在接管重新启动的 Harness…", &format!("pid {pid}"));
+            process::terminate_pid(pid, TERMINATE_GRACE);
+            if !wait_for_port_free(port, TERMINATE_GRACE) {
+                return Err(format!("停止 pid {pid} 后端口 {port} 仍被占用"));
+            }
+        }
+    }
+    match start(app, data_dir) {
+        Ok(()) => Ok(()),
+        // A handoff slower than the grace can still take the port while our own launch boots.
+        // Reporting a failure there would be wrong — the port is serving a Harness — so stop it
+        // and make the one remaining attempt. Only when takeover is allowed: with
+        // take_over_existing=false that instance is exactly what the user asked us to keep.
+        Err(reason) if config.take_over_existing => match harness_listener(port) {
+            None => Err(reason),
+            Some(pid) => {
+                harness::app_log(&format!(
+                    "本次启动失败（{reason}），但端口 {port} 已由 pid {pid} 服务：接管后重试一次"
+                ));
+                window::set_status(app, "正在接管重新启动的 Harness…", &format!("pid {pid}"));
+                process::terminate_pid(pid, TERMINATE_GRACE);
+                let _ = wait_for_port_free(port, TERMINATE_GRACE);
+                start(app, data_dir)
+            }
+        },
+        Err(reason) => Err(reason),
+    }
+}
+
+/// The pid serving `port` as a Harness, when one is.
+fn harness_listener(port: u16) -> Option<u32> {
+    if matches!(
+        harness::probe(port),
+        harness::Probe::HarnessWithSession | harness::Probe::HarnessNoSession
+    ) {
+        harness::listener_pid(port)
+    } else {
+        None
+    }
+}
+
+/// Wait out a handoff: another process may be booting a replacement on our port.
+fn wait_for_handoff(port: u16, grace: Duration) -> Option<u32> {
+    let deadline = Instant::now() + grace;
+    loop {
+        if let Some(pid) = harness_listener(port) {
+            return Some(pid);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(HANDOFF_POLL);
+    }
+}
+
+/// Wait for `port` to stop answering, so the next launch can bind it.
+fn wait_for_port_free(port: u16, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        if matches!(harness::probe(port), harness::Probe::Closed) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Wait for the Harness to end, and put it back when it does.
+///
+/// An unexpected exit used to leave the window on a page that could never connect again. Two
+/// shapes have to be told apart instead: a deliberate self-restart (the plugin market stops the
+/// host and a detached helper boots a replacement on the same port) and a crash or a kill. Both
+/// end with the shell starting its own Harness again — the handoff wait only decides whether
+/// someone else is about to serve the port, so the shell can take it over instead of racing it.
 fn watch_harness(
     app: AppHandle,
     data_dir: PathBuf,
@@ -836,24 +1079,48 @@ fn watch_harness(
     ring: harness::Ring,
     mut child: Child,
 ) {
+    let started = Instant::now();
     let status = child.wait();
     if EXITING.load(Ordering::SeqCst) {
         return;
     }
-    let code = status.as_ref().ok().and_then(|status| status.code());
-    harness::app_log(&format!(
-        "Harness pid {pid} exited unexpectedly (code {code:?})"
-    ));
+    let reason = status
+        .as_ref()
+        .map(exit_reason)
+        .unwrap_or_else(|error| format!("无法等待进程结束: {error}"));
+    harness::app_log(&format!("Harness pid {pid} exited unexpectedly ({reason})"));
     disown(pid);
     process::clear_state(&data_dir);
-    window::show_failure(
-        &app,
-        "Harness 已退出",
-        &format!(
-            "dsh web 进程已结束（退出码 {code:?}）。关闭本窗口即退出应用，重新启动即可恢复。\n\n最近输出:\n{}",
-            ring.tail()
+    let output = ring.tail();
+    let clean = status.as_ref().is_ok_and(|status| status.code() == Some(0));
+
+    match exit_action(started.elapsed(), AUTO_RESTARTS.load(Ordering::SeqCst), clean) {
+        ExitAction::Report => window::show_failure(
+            &app,
+            "Harness 已退出",
+            &format!(
+                "dsh web 进程已结束（{reason}），连续 {MAX_AUTO_RESTARTS} 次自动重启都没有稳定下来，已停止自动重试。\n\n最近输出:\n{output}"
+            ),
         ),
-    );
+        ExitAction::Recover { attempt, grace } => {
+            AUTO_RESTARTS.store(attempt, Ordering::SeqCst);
+            window::show_progress(
+                &app,
+                "Harness 已退出，正在重新启动…",
+                &format!("pid {pid} 已结束（{reason}）；第 {attempt}/{MAX_AUTO_RESTARTS} 次自动恢复"),
+            );
+            match restart_harness(&app, &data_dir, grace) {
+                Ok(()) => harness::app_log(&format!(
+                    "Harness pid {pid} exited and was recovered (automatic restart {attempt})"
+                )),
+                Err(failure) => window::show_failure(
+                    &app,
+                    "Harness 已退出",
+                    &format!("dsh web 进程已结束（{reason}），自动重启失败：{failure}\n\n最近输出:\n{output}"),
+                ),
+            }
+        }
+    }
 }
 
 /// What step 1 does with the record a crashed shell may have left behind.
@@ -1756,8 +2023,10 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A startup failure is terminal for this attempt, but not for the app: the page it lands on
+/// carries the restart button, and a second launch means the same thing.
 fn fail(app: &AppHandle, status: &str, detail: &str) {
-    window::set_status(app, status, detail);
+    window::show_failure(app, status, detail);
 }
 
 /// Hand the UI to the system browser when this WebView cannot run it.
@@ -1779,7 +2048,8 @@ fn hand_the_gui_to_the_browser(app: &AppHandle, url: &url::Url, version: &str) -
         report.missing.join("、")
     ));
     window::open_external(url.as_str());
-    window::show_failure(
+    // Notice, not failure: the Harness is alive and stays supervised here, so no restart button.
+    window::show_notice(
         app,
         "系统 WebView 太旧，界面已改在浏览器中打开",
         &report.browser_fallback_detail(version, url.as_str()),
@@ -2394,5 +2664,74 @@ mod tests {
         assert!(!again.seeded);
         assert!(again.note.is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_self_restart_gets_the_long_handoff_wait_and_a_crash_does_not() {
+        // The plugin market's restart: the host is SIGTERMed, shuts down with code 0, and a
+        // detached helper boots the replacement a few seconds later — waiting is the point.
+        assert_eq!(
+            exit_action(Duration::from_secs(5), 0, true),
+            ExitAction::Recover {
+                attempt: 1,
+                grace: HANDOFF_GRACE
+            }
+        );
+        // A crash or a kill has nothing behind it: the restart must not be delayed by the full
+        // grace (this is the case the old code answered instantly with a failure page).
+        assert_eq!(
+            exit_action(Duration::from_secs(5), 0, false),
+            ExitAction::Recover {
+                attempt: 1,
+                grace: HANDOFF_GRACE_QUICK
+            }
+        );
+        assert!(HANDOFF_GRACE_QUICK < HANDOFF_GRACE);
+    }
+
+    #[test]
+    fn automatic_restarts_are_budgeted_and_reset_by_a_healthy_run() {
+        let quick = |attempt| ExitAction::Recover {
+            attempt,
+            grace: HANDOFF_GRACE_QUICK,
+        };
+        // A crash loop counts up to the budget, then stops instead of looping for ever.
+        assert_eq!(exit_action(Duration::from_secs(1), 0, false), quick(1));
+        assert_eq!(exit_action(Duration::from_secs(1), 1, false), quick(2));
+        assert_eq!(exit_action(Duration::from_secs(1), 2, false), quick(3));
+        assert_eq!(
+            exit_action(Duration::from_secs(1), 3, false),
+            ExitAction::Report
+        );
+        // One run that lasted is proof the loop is over: the count starts again from one, so a
+        // Harness that works for hours and then dies is never refused a restart.
+        assert_eq!(exit_action(HEALTHY_RUN, 3, false), quick(1));
+        assert_eq!(
+            exit_action(Duration::from_secs(3600), MAX_AUTO_RESTARTS, true),
+            ExitAction::Recover {
+                attempt: 1,
+                grace: HANDOFF_GRACE
+            }
+        );
+    }
+
+    /// The page used to print Rust's Option debug form ("Some(0)", "None") at the user.
+    #[cfg(unix)]
+    #[test]
+    fn the_exit_reason_reaches_the_user_as_words() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            exit_reason(&std::process::ExitStatus::from_raw(0)),
+            "退出码 0"
+        );
+        assert_eq!(
+            exit_reason(&std::process::ExitStatus::from_raw(3 << 8)),
+            "退出码 3"
+        );
+        // Killed by a signal: no exit code at all, which is how a "kill -9" reads here.
+        assert_eq!(
+            exit_reason(&std::process::ExitStatus::from_raw(9)),
+            "被信号 9 终止"
+        );
     }
 }

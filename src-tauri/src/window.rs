@@ -17,6 +17,9 @@ pub const HARNESS: &str = "harness";
 /// The event the splash page uses to report what this WebView can actually run.
 pub const PROBE_EVENT: &str = "dsh-desktop:webview-probe";
 
+/// The event the status page uses to ask for another attempt at starting the Harness.
+pub const RESTART_EVENT: &str = "dsh-desktop:restart-harness";
+
 /// APIs whose absence kills the dsh front end while it loads.
 ///
 /// `Iterator` is the one that actually happened (2026-09-14, an Intel Mac): the bundled
@@ -200,12 +203,34 @@ pub fn create_splash(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Set by the first terminal failure page. A second one (the load watcher giving up after the
-/// watchdog already reported the exit) must not replace the explanation the user is reading.
+/// Set by the first terminal page. A second one (the load watcher giving up after the watchdog
+/// already reported the exit) must not replace the explanation the user is reading.
+///
+/// Cleared by [`allow_next_failure`] whenever the shell starts another attempt, so a retry that
+/// fails again can replace the page that asked for it.
 static FAILURE_SHOWN: AtomicBool = AtomicBool::new(false);
 
+/// True while the page on screen is the failure page — the one that offers a restart.
+///
+/// Distinct from [`FAILURE_SHOWN`] on purpose: the browser fallback ([show_notice]) is terminal
+/// for the same reason (nothing may overwrite its explanation) but must not be answered with a
+/// restart, since its Harness is alive and supervised.
+static RETRY_OFFERED: AtomicBool = AtomicBool::new(false);
+
+/// True when "start the Harness again" is what the user is asking for by reopening the app.
+pub fn retry_offered() -> bool {
+    RETRY_OFFERED.load(Ordering::SeqCst)
+}
+
+/// Let the next terminal page replace whatever is on screen. Called when the shell starts a
+/// recovery, or a restart the user asked for.
+pub fn allow_next_failure() {
+    FAILURE_SHOWN.store(false, Ordering::SeqCst);
+}
+
 /// Put a status page in front of the user for something they must see, such as a Harness that
-/// died after a successful start. Rebuilds the splash when it was already closed.
+/// died after a successful start. Rebuilds the splash when it was already closed, and offers the
+/// restart button: the shell can start another Harness in this very process.
 pub fn show_failure(app: &AppHandle, status: &str, detail: &str) {
     if FAILURE_SHOWN.swap(true, Ordering::SeqCst) {
         harness::app_log(&format!(
@@ -213,32 +238,97 @@ pub fn show_failure(app: &AppHandle, status: &str, detail: &str) {
         ));
         return;
     }
-    // Every caller reaches this with a Harness window that is dead or unusable, and the status
-    // page tells the user that closing it quits the app. Destroy (not close: that would look
-    // like a user quit) the Harness window so that sentence is true — the splash only exits the
-    // app while no Harness window is left.
+    if present_status_page(app) {
+        RETRY_OFFERED.store(true, Ordering::SeqCst);
+        eval_status(app, "__setFailure", status, detail);
+    }
+}
+
+/// The same page without the restart offer.
+///
+/// Used where another Harness must not be started: the old-WebView fallback keeps supervising
+/// the running instance and hands only the rendering to the browser, so a restart button there
+/// would kill a working Harness and open a second browser tab.
+pub fn show_notice(app: &AppHandle, status: &str, detail: &str) {
+    if FAILURE_SHOWN.swap(true, Ordering::SeqCst) {
+        harness::app_log(&format!(
+            "failure page already shown; keeping it instead of: {status}"
+        ));
+        return;
+    }
+    if present_status_page(app) {
+        RETRY_OFFERED.store(false, Ordering::SeqCst);
+        eval_status(app, "__setStatus", status, detail);
+    }
+}
+
+/// Bring the status page back while the shell itself is still working on the Harness.
+///
+/// Not latched, and without the restart button: this is the "an attempt is running" face of the
+/// same page. A success removes it again through `create_harness`; a failure replaces it through
+/// [`show_failure`].
+pub fn show_progress(app: &AppHandle, status: &str, detail: &str) {
+    if present_status_page(app) {
+        RETRY_OFFERED.store(false, Ordering::SeqCst);
+        eval_status(app, "__setStatus", status, detail);
+    }
+}
+
+/// Rebuild the splash when it was already closed, with no Harness window left in front of it.
+///
+/// Every caller reaches this with a Harness window that is dead or unusable, and the status page
+/// tells the user that closing it quits the app. Destroy (not close: that would look like a user
+/// quit) the Harness window so that sentence is true — the splash only exits the app while no
+/// Harness window is left.
+fn present_status_page(app: &AppHandle) -> bool {
     if let Some(harness_window) = app.get_webview_window(HARNESS) {
         let _ = harness_window.destroy();
     }
     if app.get_webview_window(SPLASH).is_none() {
         if let Err(error) = create_splash(app) {
             harness::app_log(&format!("could not reopen the status window: {error}"));
-            return;
+            return false;
         }
     }
-    set_status(app, status, detail);
+    true
 }
 
 /// Update the splash without granting the page any Tauri permission (Rust-side eval).
 pub fn set_status(app: &AppHandle, status: &str, detail: &str) {
+    eval_status(app, "__setStatus", status, detail);
+}
+
+/// Call one of the page's two status entry points: `__setStatus` for progress, `__setFailure`
+/// for the terminal page that carries the restart button.
+///
+/// A page this call just created may not have parsed its `<head>` yet, and that is where both
+/// entry points are defined — an eval landing before them would simply be lost. The retry costs
+/// nothing when the page is ready (the first call succeeds) and is the difference between the
+/// user seeing the page and it staying on "正在启动…".
+fn eval_status(app: &AppHandle, function: &str, status: &str, detail: &str) {
     if let Some(window) = app.get_webview_window(SPLASH) {
-        let script = format!(
-            "window.__setStatus && window.__setStatus({}, {})",
-            json!(status),
-            json!(detail)
-        );
-        let _ = window.eval(&script);
+        let _ = window.eval(status_script(function, status, detail));
     }
+}
+
+/// The script `eval_status` sends, kept out of the window call so the escaping is testable.
+fn status_script(function: &str, status: &str, detail: &str) -> String {
+    let status = json!(status);
+    let detail = json!(detail);
+    format!(
+        "(function () {{\n\
+         var apply = function () {{\n\
+         if (!window.{function}) return false;\n\
+         window.{function}({status}, {detail});\n\
+         return true;\n\
+         }};\n\
+         if (apply()) return;\n\
+         var attempts = 0;\n\
+         var timer = setInterval(function () {{\n\
+         if (apply() || ++attempts > 40) clearInterval(timer);\n\
+         }}, 25);\n\
+         }})()"
+    )
 }
 
 /// Wait this long for the first load to report "finished". The port already answered a probe
@@ -656,6 +746,38 @@ mod tests {
         assert!(!script.contains("=>"), "the probe must stay ES5");
         assert!(!script.contains('`'), "the probe must stay ES5");
         assert!(!script.contains("??"), "the probe must stay ES5");
+    }
+
+    #[test]
+    fn the_status_script_applies_now_or_waits_for_the_page() {
+        let script = status_script("__setFailure", "Harness 已退出", "退出码 0\n第二行");
+        // The page defines its entry points in <head>; a freshly created window may not have
+        // parsed them yet, so the script must retry rather than drop the message.
+        assert!(script.contains("window.__setFailure"), "{script}");
+        assert!(script.contains("setInterval"), "{script}");
+        // The text is embedded as a JS string literal, newlines and all.
+        assert!(script.contains(r#""退出码 0\n第二行""#), "{script}");
+        // Same builder for the progress face: the difference is which entry point it calls.
+        let progress = status_script("__setStatus", "正在启动…", "");
+        assert!(progress.contains("window.__setStatus"), "{progress}");
+        assert!(!progress.contains("__setFailure"));
+    }
+
+    /// The page names the restart event as a string literal; the shell listens for the
+    /// constant. Renaming one without the other would silently drop every click.
+    #[test]
+    fn the_status_page_reports_the_restart_event_the_shell_listens_for() {
+        let page = include_str!("../../src/index.html");
+        assert!(page.contains(RESTART_EVENT), "按钮必须发壳监听的那个事件名");
+        assert!(
+            page.contains("__setFailure"),
+            "页面要有终态入口（带重启按钮的那一面）"
+        );
+        assert!(page.contains("__setStatus"), "页面要有进行中入口");
+        assert!(
+            page.contains("plugin:event|emit"),
+            "只走 splash 窗口已有的 core 事件能力，不新增 capability"
+        );
     }
 
     #[test]
