@@ -189,39 +189,59 @@ fn open_shares_one_logger_per_path() {
 
 #[test]
 fn parses_plain_url() {
-    let url = parse_dsh_url("dsh web: http://127.0.0.1:59753/?token=abc").unwrap();
+    let url = parse_dsh_url("dsh web: http://127.0.0.1:59753/?token=abc", 59753).unwrap();
     assert_eq!(url.port(), Some(59753));
 }
 
 #[test]
 fn ignores_lan_suffix() {
     let line = "dsh web: http://127.0.0.1:59753/?token=abc (LAN: http://10.0.0.5:59753/?token=abc)";
-    let url = parse_dsh_url(line).unwrap();
+    let url = parse_dsh_url(line, 59753).unwrap();
     assert_eq!(url.host_str(), Some("127.0.0.1"));
     assert_eq!(url.port(), Some(59753));
 }
 
 #[test]
 fn rejects_foreign_hosts_and_plain_lines() {
-    assert!(parse_dsh_url("dsh web: http://example.com/?token=abc").is_none());
-    assert!(parse_dsh_url("dsh web: listening").is_none());
-    assert!(parse_dsh_url("hello").is_none());
-    assert!(parse_dsh_url("open http://10.0.0.5:59753/?token=abc").is_none());
+    assert!(parse_dsh_url("dsh web: http://example.com/?token=abc", 59753).is_none());
+    assert!(parse_dsh_url("dsh web: listening", 59753).is_none());
+    assert!(parse_dsh_url("hello", 59753).is_none());
+    assert!(parse_dsh_url("open http://10.0.0.5:59753/?token=abc", 59753).is_none());
     // No token query: not a startup URL, however loopback it looks.
-    assert!(parse_dsh_url("health http://127.0.0.1:59753/").is_none());
+    assert!(parse_dsh_url("health http://127.0.0.1:59753/", 59753).is_none());
 }
 
 /// Upstream may reword or drop the `dsh web:` prefix; the parser must survive it.
 #[test]
 fn accepts_a_url_without_the_documented_prefix() {
-    let url = parse_dsh_url("harness listening on http://127.0.0.1:59753/?token=abc").unwrap();
+    let url = parse_dsh_url(
+        "harness listening on http://127.0.0.1:59753/?token=abc",
+        59753,
+    )
+    .unwrap();
     assert_eq!(url.port(), Some(59753));
     // A reworded prefix with a LAN suffix still prefers the loopback URL.
     let line = "web ui: http://127.0.0.1:3080/?token=abc (LAN: http://10.0.0.5:3080/?token=abc)";
-    assert_eq!(parse_dsh_url(line).unwrap().port(), Some(3080));
+    assert_eq!(parse_dsh_url(line, 3080).unwrap().port(), Some(3080));
     // And a broken prefixed token must not stop the scan.
     let mixed = "dsh web: not-a-url | http://127.0.0.1:4123/?token=abc";
-    assert_eq!(parse_dsh_url(mixed).unwrap().port(), Some(4123));
+    assert_eq!(parse_dsh_url(mixed, 4123).unwrap().port(), Some(4123));
+}
+
+/// Without the prefix, only this launch's own port counts: a plugin or MCP server printing its
+/// local address during startup used to be adopted as the Harness, and its port recorded in
+/// `state.json`.
+#[test]
+fn the_prefixless_fallback_only_accepts_this_launchs_port() {
+    let line = "sidecar listening on http://127.0.0.1:9999/?token=abc";
+    assert!(
+        parse_dsh_url(line, 3080).is_none(),
+        "another port is another server"
+    );
+    assert_eq!(parse_dsh_url(line, 9999).unwrap().port(), Some(9999));
+    // The prefixed form is the CLI speaking about itself: taken as printed.
+    let prefixed = "dsh web: http://127.0.0.1:59753/?token=abc";
+    assert_eq!(parse_dsh_url(prefixed, 3080).unwrap().port(), Some(59753));
 }
 
 #[test]
@@ -230,6 +250,35 @@ fn parses_ss_listener_pid() {
     assert_eq!(parse_ss_pid(line), Some(73596));
     assert_eq!(parse_ss_pid("LISTEN 0 511 127.0.0.1:3080 0.0.0.0:*"), None);
     assert_eq!(parse_ss_pid("users:((\"node\",pid=,fd=1))"), None);
+}
+
+/// `netstat -ano` in the shapes that matter: the state word is localized, and an outbound
+/// connection to a remote server on the same port sorts before the loopback listener.
+#[test]
+fn parses_the_netstat_listener_and_nothing_else() {
+    let outbound_first = "\
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1000
+  TCP    10.0.0.5:50123         93.184.216.34:3080     ESTABLISHED     4242
+  TCP    127.0.0.1:3080         0.0.0.0:0              LISTENING       7777
+  TCP    127.0.0.1:3080         127.0.0.1:50200        ESTABLISHED     7777
+";
+    assert_eq!(parse_netstat_listener(outbound_first, 3080), Some(7777));
+
+    // German Windows, IPv6-only listener, with a UDP socket and a longer port number around it.
+    let localized = "\
+  Proto  Lokale Adresse         Remoteadresse          Status           PID
+  TCP    127.0.0.1:13080        0.0.0.0:0              ABHÖREN          1111
+  TCP    [::1]:3080             [::]:0                 ABHÖREN          7777
+  UDP    0.0.0.0:3080           *:*                                     5555
+";
+    assert_eq!(parse_netstat_listener(localized, 3080), Some(7777));
+
+    // Only connections, no listener: nothing to report.
+    let connections =
+        "  TCP    10.0.0.5:50123         93.184.216.34:3080     ESTABLISHED     4242\n";
+    assert_eq!(parse_netstat_listener(connections, 3080), None);
+    assert_eq!(parse_netstat_listener("", 3080), None);
 }
 
 #[test]
@@ -316,6 +365,73 @@ fn redacts_token() {
     assert!(!out.contains("abcdef"));
 }
 
+/// Every credential on the line must go, not just the first. The scan used to compare against the
+/// wrong offset from the second match on, so an env dump or an echoed header kept every secret
+/// after the first one.
+#[test]
+fn redacts_every_credential_on_the_line() {
+    let cases = [
+        ("token=aaa token=bbb", "aaa", "bbb"),
+        (
+            "DEEPSEEK_API_KEY=sk-first OPENAI_API_KEY=sk-second",
+            "sk-first",
+            "sk-second",
+        ),
+        ("x Bearer aaa, y Bearer bbb", "aaa", "bbb"),
+        ("中文 token=a token=b token=c", "a", "b"),
+    ];
+    for (line, first, second) in cases {
+        let out = redact(line);
+        assert!(!out.contains(first), "first credential survived: {out}");
+        assert!(!out.contains(second), "second credential survived: {out}");
+    }
+}
+
+/// The offset bug also panicked: `line[..at]` is not a char boundary once a multi-byte character
+/// precedes a match, and the panic landed in the reader thread or under the `APP_LOGGER` lock.
+#[test]
+fn redaction_survives_multi_byte_text_before_a_match() {
+    for line in [
+        "错误：token 无效，请检查 token=xxx",
+        "中tokenXYtoken=1",
+        "emoji ✨ api_key=1 api_key=2",
+        "中文 Authorization: Bearer sk-1",
+    ] {
+        let out = redact(line);
+        assert!(
+            !out.contains("xxx") && !out.contains("sk-1"),
+            "not redacted: {out}"
+        );
+    }
+}
+
+/// Redaction must not rewrite ordinary prose: the scheme names are common English words.
+#[test]
+fn redaction_leaves_prose_and_identifiers_alone() {
+    for line in [
+        "the token is expired",
+        "tokenizer ready, tokens=5",
+        "a basic example",
+    ] {
+        assert_eq!(redact(line), line, "prose was rewritten");
+    }
+}
+
+/// `Basic`/`Digest` carry a credential in the same place as `Bearer`, and used to be left whole.
+#[test]
+fn redacts_the_other_authorization_schemes() {
+    for line in [
+        "Authorization: Basic dXNlcjpwYXNz",
+        "Authorization: Digest user=1",
+        "authorization: bearer sk-live-1",
+    ] {
+        let out = redact(line);
+        for secret in ["dXNlcjpwYXNz", "user=1", "sk-live-1"] {
+            assert!(!out.contains(secret), "{secret} survived: {out}");
+        }
+    }
+}
+
 /// The launch token was only the first credential the log could receive: a provider error
 /// echoes request headers, and an env dump carries the API key.
 #[test]
@@ -348,6 +464,82 @@ fn redaction_keeps_the_rest_of_the_line() {
     // A word that merely contains a key name is left alone.
     assert_eq!(redact("tokenizer loaded"), "tokenizer loaded");
     assert_eq!(redact("tokens=3"), "tokens=3");
+}
+
+/// A provider error echoes the request as JSON (or as an escaped JSON string, or a Python dict),
+/// and the key is followed by its closing quote rather than by `=` or `:`.
+#[test]
+fn redacts_quoted_and_structured_fields() {
+    let cases = [
+        (
+            r#"{"api_key":"sk-json","token":"t-json"}"#,
+            &["sk-json", "t-json"][..],
+        ),
+        (
+            r#"{"api_key": "sk json with spaces"}"#,
+            &["sk json with spaces"][..],
+        ),
+        (
+            r#"error: {\"api_key\":\"sk-escaped\"}"#,
+            &["sk-escaped"][..],
+        ),
+        ("{'password': 'hunter2', 'user': 'me'}", &["hunter2"][..]),
+        (r#"token: "quoted-value""#, &["quoted-value"][..]),
+        ("password='single'", &["single"][..]),
+        (
+            r#"{"authorization": "Basic dXNlcjpwYXNz"}"#,
+            &["dXNlcjpwYXNz"][..],
+        ),
+        (r#"{"secret": 12345}"#, &["12345"][..]),
+        ("password = hunter2", &["hunter2"][..]),
+        // A line cut inside a quoted value, or a quote that is never closed.
+        (r#"{"api_key":"sk-cut-mid-valu"#, &["sk-cut-mid-valu"][..]),
+        (r#"token: " sk-unterminated"#, &["sk-unterminated"][..]),
+    ];
+    for (line, secrets) in cases {
+        let out = redact(line);
+        for secret in secrets {
+            assert!(!out.contains(secret), "{line} leaked {secret}: {out}");
+        }
+    }
+}
+
+/// The structure around a redacted value survives, so the log stays readable and parseable.
+#[test]
+fn quoted_redaction_keeps_the_structure() {
+    assert_eq!(
+        redact(r#"{"api_key":"sk-json","model":"deepseek"}"#),
+        r#"{"api_key":"***","model":"deepseek"}"#
+    );
+    assert_eq!(
+        redact(r#"{"password":"a\"b","n":1}"#),
+        r#"{"password":"***","n":1}"#
+    );
+    // A quoted word that is not followed by a separator is prose, and a plural or longer key is
+    // not the field. (`token = x` IS treated as a field: a config dump prints exactly that.)
+    for line in [
+        r#"the "token" was refused"#,
+        r#"{"tokens": 5, "max_tokens": 10}"#,
+        "user's token's value",
+    ] {
+        assert_eq!(redact(line), line, "prose or a count was rewritten");
+    }
+}
+
+/// The scheme check used to lowercase the whole rest of the line once per match, which made a
+/// line packed with fields quadratic. The bound is generous; the quadratic version needed several
+/// seconds for this input even in a release build.
+#[test]
+fn redaction_stays_linear_on_a_line_full_of_fields() {
+    let line = "token=a ".repeat(1024 * 1024 / 8);
+    let started = std::time::Instant::now();
+    let out = redact(&line);
+    assert!(!out.contains("token=a"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "took {:?}",
+        started.elapsed()
+    );
 }
 
 /// The regression this probe exists for: an unrelated server that answers 200 must never be
@@ -489,7 +681,7 @@ fn an_invalid_utf8_byte_does_not_end_the_stream() {
     assert!(read_line(&mut reader).unwrap().contains("plugin says"));
     let url_line = read_line(&mut reader).unwrap();
     assert!(
-        parse_dsh_url(&url_line).is_some(),
+        parse_dsh_url(&url_line, 59753).is_some(),
         "the URL line after a malformed one must still arrive: {url_line:?}"
     );
 }

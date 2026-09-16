@@ -127,93 +127,225 @@ pub fn redact(line: &str) -> String {
     out
 }
 
-/// `Bearer <credential>` -> `***`, whatever key introduced it.
+/// Authentication schemes whose credential sits in the token after the scheme name.
+///
+/// Consulted only where a field name already proved the text is a credential (`Authorization:`),
+/// never on free prose: `token`, `basic` and `digest` are ordinary English words, and scanning for
+/// them anywhere would rewrite "the token is expired" into "the *** expired". `Bearer` is the one
+/// exception — it is not an English word, so [`redact_bearer`] scans for it standalone too.
+const AUTH_SCHEMES: &[&str] = &["bearer", "basic", "digest", "token"];
+
+/// `Bearer <credential>` -> `***`.
 ///
 /// Runs before the field scan because the credential does not sit directly behind a `=` or `:`:
 /// `Authorization: Bearer sk-…` would otherwise have its value read as the word `Bearer` and the
 /// secret left behind. The scheme word goes too, so the later field pass over `authorization`
 /// finds nothing left to replace and cannot leave a stray `*** ***` behind.
+///
+/// Only `Bearer`, and only here: the other scheme names are ordinary words, so scanning free text
+/// for them would rewrite prose. They are handled in [`redact_field`], where a field name has
+/// already established that what follows is a credential.
 fn redact_bearer(line: &str) -> String {
     let lower = line.to_ascii_lowercase();
     let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    let mut search = lower.as_str();
-    while let Some(at) = search.find("bearer") {
-        let after = at + "bearer".len();
+    // Byte offsets into the ORIGINAL line. `rest` is a suffix of `line`, so a match found at `at`
+    // inside `search` (= `rest` lowercased, same byte layout) sits at `line.len() - rest.len() + at`.
+    // Looking backwards from `at` instead reads the wrong character from the second match on, and
+    // `line[..at]` panics outright when `at` is not a char boundary — which any multi-byte
+    // character earlier in the line makes it.
+    let mut start = 0;
+    loop {
+        let rest = &line[start..];
+        let search = &lower[start..];
+        let Some(at) = search.find("bearer") else {
+            out.push_str(rest);
+            return out;
+        };
+        let absolute = start + at;
+        let after = absolute + "bearer".len();
         // Only a standalone word: `bearer` inside a longer identifier is not a scheme.
-        let boundary = at == 0
-            || !line[..at]
+        let boundary = absolute == 0
+            || !line[..absolute]
                 .chars()
                 .next_back()
                 .is_some_and(|c| c.is_alphanumeric());
         if !boundary {
-            out.push_str(&rest[..after]);
-            rest = &rest[after..];
-            search = &search[after..];
+            out.push_str(&line[start..after]);
+            start = after;
             continue;
         }
-        out.push_str(&rest[..at]);
-        rest = &rest[after..];
-        search = &search[after..];
+        out.push_str(&line[start..absolute]);
         // Drop the whitespace between the scheme and the credential with it.
-        let spaces = rest.len() - rest.trim_start().len();
-        rest = &rest[spaces..];
-        search = &search[spaces..];
-        let end = rest
+        let credential = line[after..].trim_start();
+        let end = credential
             .find(|c: char| c.is_whitespace() || VALUE_END.contains(&c))
-            .unwrap_or(rest.len());
+            .unwrap_or(credential.len());
         out.push_str("***");
-        rest = &rest[end..];
-        search = &search[end..];
+        start = line.len() - credential.len() + end;
     }
-    out.push_str(rest);
-    out
+}
+
+/// Bytes of a leading authentication scheme in `value`, whitespace included, or 0.
+///
+/// Only called once a field name has proved `value` is a credential, so matching an ordinary
+/// word here is safe: in `Authorization: Digest …` the word really is a scheme.
+///
+/// Compares the leading bytes in place. Lowercasing `value` instead would copy the whole rest of
+/// the line once per match, which turned a 256 KiB line packed with `token=…` pairs into a
+/// quadratic scan (measured: 180 ms for one line).
+fn scheme_prefix_len(value: &str) -> usize {
+    let bytes = value.as_bytes();
+    for scheme in AUTH_SCHEMES {
+        let len = scheme.len();
+        if bytes.len() <= len || !bytes[..len].eq_ignore_ascii_case(scheme.as_bytes()) {
+            continue;
+        }
+        // An ASCII match ends on a char boundary, so the slice is valid.
+        let rest = &value[len..];
+        // The scheme is a whole token: `Bearerish` is not `Bearer`.
+        if rest.starts_with(char::is_whitespace) {
+            return len + (rest.len() - rest.trim_start().len());
+        }
+    }
+    0
+}
+
+/// How a located value is delimited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delimiter {
+    /// Unquoted: the value runs to whitespace or one of [`VALUE_END`].
+    Bare,
+    /// Quoted: the value runs to the matching closing quote.
+    Quoted(&'static str),
+}
+
+/// Quote tokens a key or a value can be wrapped in. `\"` comes first: a JSON document embedded in
+/// a log string (`{\"api_key\":\"sk-…\"}`) escapes its quotes, and the bare `"` would otherwise be
+/// matched one byte too late.
+const QUOTES: &[&str] = &["\\\"", "\"", "'"];
+
+fn quote_at(line: &str, at: usize) -> Option<&'static str> {
+    let rest = &line[at..];
+    QUOTES.iter().copied().find(|quote| rest.starts_with(quote))
+}
+
+fn skip_whitespace(line: &str, at: usize) -> usize {
+    let rest = &line[at..];
+    at + (rest.len() - rest.trim_start().len())
+}
+
+/// Where the value behind a key match starts, when the text after the key is a field separator.
+///
+/// Three shapes are fields:
+///
+/// - `KEY=value` and `key: value` — an env dump, a header, a query string;
+/// - `key = value` — a config dump; whitespace is only allowed before `=`, because `word :` is
+///   not how anything prints a field while `word = x` is;
+/// - `"key": "value"` — JSON, a JS object, or a Python dict (`'key': 'value'`), which is the form
+///   a provider error echoes a request in. The key's closing quote comes first.
+///
+/// Whitespace after the separator is skipped: `key: value` must not read as an empty value, which
+/// would leave the real one in place.
+fn locate_value(line: &str, after: usize) -> Option<(usize, Delimiter)> {
+    let mut at = after;
+    if let Some(quote) = quote_at(line, at) {
+        at = skip_whitespace(line, at + quote.len());
+        if !line[at..].starts_with(':') {
+            return None;
+        }
+        at += 1;
+    } else if line[at..].starts_with(['=', ':']) {
+        at += 1;
+    } else {
+        let spaced = skip_whitespace(line, at);
+        if spaced == at || !line[spaced..].starts_with('=') {
+            return None;
+        }
+        at = spaced + 1;
+    }
+    at = skip_whitespace(line, at);
+    match quote_at(line, at) {
+        Some(quote) => Some((at + quote.len(), Delimiter::Quoted(quote))),
+        None => Some((at, Delimiter::Bare)),
+    }
+}
+
+/// Bytes of `value` up to where it ends.
+fn value_len(value: &str, delimiter: Delimiter) -> usize {
+    // Leading whitespace is skipped first. A bare value never has any (the separator scan skipped
+    // it), but an unterminated quote falls back to these rules from just inside the quote, and
+    // `" sk-…` would otherwise end at that space and leave the credential in place.
+    let bare = || {
+        let trimmed = value.trim_start();
+        let skipped = value.len() - trimmed.len();
+        skipped
+            + trimmed
+                .find(|c: char| c.is_whitespace() || VALUE_END.contains(&c))
+                .unwrap_or(trimmed.len())
+    };
+    match delimiter {
+        Delimiter::Bare => bare(),
+        // A plain `"` escaped with a backslash is part of the value, not its end.
+        Delimiter::Quoted("\"") => value
+            .match_indices('"')
+            .map(|(at, _)| at)
+            .find(|at| !value[..*at].ends_with('\\'))
+            .unwrap_or_else(bare),
+        // No closing quote on this line: fall back to the bare rules rather than redact the rest
+        // of the line, which would take unrelated text with it.
+        Delimiter::Quoted(quote) => value.find(quote).unwrap_or_else(bare),
+    }
 }
 
 /// `key<separator>value` -> `key<separator>***` for one field name.
+///
+/// Every match is scanned for, not just the first: an environment dump or a provider error that
+/// echoes the request can carry several credentials on one line, and stopping at the first would
+/// leave the rest in the log.
 fn redact_field(line: &str, key: &str) -> String {
     let lower = line.to_ascii_lowercase();
     let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    let mut search = lower.as_str();
+    // Byte offsets into the ORIGINAL line; see `redact_bearer` for why the offset must be
+    // absolute rather than relative to the remaining suffix.
+    let mut start = 0;
     loop {
+        let rest = &line[start..];
+        let search = &lower[start..];
         let Some(at) = search.find(key) else {
             out.push_str(rest);
             return out;
         };
-        let after = at + key.len();
+        let absolute = start + at;
+        let after = absolute + key.len();
         // The key must stand alone: `tokens` and `tokenizer` are not the field.
-        let starts_a_word = at == 0
-            || !line[..at]
+        let starts_a_word = absolute == 0
+            || !line[..absolute]
                 .chars()
                 .next_back()
                 .is_some_and(|c| c.is_alphanumeric());
-        let separator = rest[after..].chars().next();
-        let Some(separator) = separator.filter(|c| matches!(c, '=' | ':')) else {
-            out.push_str(&rest[..after]);
-            rest = &rest[after..];
-            search = &search[after..];
+        let located = if starts_a_word {
+            locate_value(line, after)
+        } else {
+            None
+        };
+        let Some((value_at, delimiter)) = located else {
+            out.push_str(&line[start..after]);
+            start = after;
             continue;
         };
-        if !starts_a_word {
-            out.push_str(&rest[..after]);
-            rest = &rest[after..];
-            search = &search[after..];
-            continue;
-        }
-        // A header (`key: value`) or an env dump (`KEY=value`) separates the name from the value,
-        // and often puts a space after the separator; that space must not be read as an empty
-        // value, which would leave the real one in place.
-        let mut value_at = after + separator.len_utf8();
-        let after_separator = &rest[value_at..];
-        value_at += after_separator.len() - after_separator.trim_start().len();
-        let end = rest[value_at..]
-            .find(|c: char| c.is_whitespace() || VALUE_END.contains(&c))
-            .unwrap_or(rest.len() - value_at);
-        out.push_str(&rest[..value_at]);
+        // `Authorization: Basic <base64>` puts the credential one token further along. The field
+        // name has already established that this is a credential, so the scan skips the scheme
+        // word and replaces what follows it — otherwise it would replace `Basic` and leave the
+        // secret in place. The scheme word itself stays in the log. A quoted value is replaced
+        // whole, scheme and all.
+        let value_at = match delimiter {
+            Delimiter::Bare => value_at + scheme_prefix_len(&line[value_at..]),
+            Delimiter::Quoted(_) => value_at,
+        };
+        let end = value_len(&line[value_at..], delimiter);
+        out.push_str(&line[start..value_at]);
         out.push_str("***");
-        rest = &rest[value_at + end..];
-        search = &search[value_at + end..];
+        start = value_at + end;
     }
 }
 
@@ -224,14 +356,26 @@ fn redact_field(line: &str, key: &str) -> String {
 /// when it is missing, any token on the line that looks like a loopback startup URL is accepted.
 /// Everything else (scheme, host, the token query) is still validated, and the LAN URL upstream
 /// appends is rejected on purpose because its host is not loopback.
-pub fn parse_dsh_url(line: &str) -> Option<Url> {
+///
+/// `expected_port` guards the prefix-less fallback. Without it any loopback URL with a query
+/// would do — a plugin or MCP server printing its own local address during startup would be
+/// mistaken for the Harness, and `state.json` would record the wrong port. The prefixed form
+/// is the CLI speaking about itself, so it is taken as printed.
+pub fn parse_dsh_url(line: &str, expected_port: u16) -> Option<Url> {
     if let Some((_, rest)) = line.split_once(URL_PREFIX) {
         // Only the first whitespace-delimited token: a LAN suffix may follow.
         if let Some(url) = rest.split_whitespace().next().and_then(startup_url) {
             return Some(url);
         }
     }
-    line.split_whitespace().find_map(startup_url)
+    line.split_whitespace().find_map(|raw| {
+        let url = startup_url(raw)?;
+        match url.port() {
+            Some(port) if port == expected_port => Some(url),
+            // A loopback URL on another port is somebody else's server, not this launch.
+            _ => None,
+        }
+    })
 }
 
 /// A startup URL is loopback http carrying the launch token as a query parameter.
@@ -270,6 +414,10 @@ const PROBE_RESPONSE_LIMIT: usize = 64 * 1024;
 /// Same reasoning as the probe budget: this runs while the user is looking at the splash page,
 /// and a `ps` that never returns must not be able to park the takeover path.
 const PS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bytes kept from `netstat -ano`, which lists every connection on the machine.
+#[cfg(windows)]
+const NETSTAT_LIMIT: usize = 4 * 1024 * 1024;
 
 /// The sentence only the CLI auth fence carries: the one thing that identifies a Harness.
 const AUTH_FENCE: &str = "dsh web authentication required";
@@ -423,46 +571,74 @@ pub fn listener_pid(port: u16) -> Option<u32> {
     }
     #[cfg(windows)]
     {
-        let out = std::process::Command::new("netstat")
-            .args(["-ano"])
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let needle = format!(":{port} ");
-        for line in text.lines() {
-            if line.contains("LISTENING") && line.contains(&needle) {
-                if let Some(pid) = line.split_whitespace().last() {
-                    return pid.parse().ok();
-                }
-            }
-        }
-        None
+        // Bounded like every other helper call: `netstat -ano` walks the whole connection
+        // table, and the caller is on the startup or takeover path.
+        let out = crate::process::output_within(
+            std::process::Command::new("netstat").args(["-ano"]),
+            PS_TIMEOUT,
+            NETSTAT_LIMIT,
+        )?;
+        parse_netstat_listener(&out.text, port)
     }
 }
 
 #[cfg(unix)]
 fn listener_pid_lsof(port: u16) -> Option<u32> {
-    let out = std::process::Command::new("lsof")
-        .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+    // `-b` keeps lsof from blocking on a stat it cannot finish (an unresponsive network mount);
+    // the budget covers the rest, since this walks every process's descriptors.
+    let out = crate::process::stdout_within(
+        std::process::Command::new("lsof").args([
+            "-b",
+            "-nP",
+            "-t",
+            &format!("-iTCP:{port}"),
+            "-sTCP:LISTEN",
+        ]),
+        PS_TIMEOUT,
+    )?;
+    out.trim().parse().ok()
 }
 
 /// `ss -ltnpH 'sport = :PORT'` line, e.g.
 /// `LISTEN 0 511 127.0.0.1:3080 0.0.0.0:* users:(("node",pid=73596,fd=17))`.
 #[cfg(target_os = "linux")]
 fn listener_pid_ss(port: u16) -> Option<u32> {
-    let out = std::process::Command::new("ss")
-        .args(["-ltnpH", &format!("sport = :{port}")])
-        .output()
-        .ok()?;
-    parse_ss_pid(&String::from_utf8_lossy(&out.stdout))
+    let out = crate::process::stdout_within(
+        std::process::Command::new("ss").args(["-ltnpH", &format!("sport = :{port}")]),
+        PS_TIMEOUT,
+    )?;
+    parse_ss_pid(&out)
+}
+
+/// The pid listening on `port` in `netstat -ano` output. Compiled everywhere so tests cover it on
+/// macOS too.
+///
+/// Columns are `Proto  Local Address  Foreign Address  State  PID`, and the state word is
+/// **localized** (a German Windows prints `ABHÖREN`), so it is not consulted. What identifies a
+/// listening socket without it is language-independent: the protocol is TCP, the *local* address
+/// ends in `:port`, and the foreign address has port 0 (`0.0.0.0:0`, `[::]:0`). Matching `:port `
+/// anywhere on the line also matched outbound connections to a remote server on the same port —
+/// and `netstat` sorts by local address, so a `10.x` client socket came before the `127.0.0.1`
+/// listener and its pid was returned.
+#[allow(dead_code)]
+pub fn parse_netstat_listener(output: &str, port: u16) -> Option<u32> {
+    let local_suffix = format!(":{port}");
+    output.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (proto, local, foreign, pid) = match fields.as_slice() {
+            // Four or more fields; the state column, when present, sits between these.
+            [proto, local, foreign, .., pid] => (proto, local, foreign, pid),
+            _ => return None,
+        };
+        let listening = proto.eq_ignore_ascii_case("tcp")
+            && local.ends_with(&local_suffix)
+            && foreign.ends_with(":0");
+        if listening {
+            pid.parse().ok()
+        } else {
+            None
+        }
+    })
 }
 
 /// First `pid=<digits>` in `ss` output. Compiled everywhere so tests cover it on macOS too.
@@ -552,10 +728,10 @@ pub fn spawn(node: &Path, dsh_js: &Path, opts: &SpawnOptions<'_>) -> std::io::Re
     let ring = Ring::new();
     let log = Logger::open(opts.log_path);
     if let Some(stdout) = child.stdout.take() {
-        forward_lines(stdout, tx.clone(), ring.clone(), log.clone());
+        forward_lines(stdout, tx.clone(), ring.clone(), log.clone(), opts.port);
     }
     if let Some(stderr) = child.stderr.take() {
-        forward_lines(stderr, tx, ring.clone(), log);
+        forward_lines(stderr, tx, ring.clone(), log, opts.port);
     }
     Ok(Spawned {
         child,
@@ -631,6 +807,8 @@ fn forward_lines<R: Read + Send + 'static>(
     tx: mpsc::Sender<Url>,
     ring: Ring,
     log: Logger,
+    // The port this launch asked for: the prefix-less URL fallback only accepts this one.
+    port: u16,
 ) {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(reader);
@@ -645,7 +823,7 @@ fn forward_lines<R: Read + Send + 'static>(
             log.write(&safe);
             // The URL is parsed from the line as the CLI printed it, never from the redacted
             // copy: redaction rewrites `token=…`, which is exactly the query the parser needs.
-            if let Some(url) = parse_dsh_url(&line) {
+            if let Some(url) = parse_dsh_url(&line, port) {
                 let _ = tx.send(url);
             }
         }
@@ -717,9 +895,24 @@ pub fn init_app_log(path: &Path) {
 }
 
 /// Append a shell-side line (navigation blocks, downloads) to the same log, redacted.
+///
+/// Redaction happens before the lock is taken: it is the one step here that can panic on hostile
+/// input, and a panic while holding `APP_LOGGER` would poison the mutex so that *every* later
+/// `app_log` — including the two in `shutdown` — panicked as well. The lock is also taken
+/// poison-tolerantly for the same reason: a poisoned logger must still be writable, because the
+/// lines it carries are how a failed exit becomes visible at all.
 pub fn app_log(line: &str) {
-    if let Some(logger) = APP_LOGGER.lock().unwrap().as_ref() {
-        logger.write(&format!("[dsh-desktop] {}", redact(line)));
+    let safe = format!("[dsh-desktop] {}", redact(line));
+    if let Some(logger) = lock_logger() {
+        logger.write(&safe);
+    }
+}
+
+/// The shared app logger, ignoring a poisoned lock rather than propagating the panic.
+fn lock_logger() -> Option<Logger> {
+    match APP_LOGGER.lock() {
+        Ok(logger) => logger.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
     }
 }
 
