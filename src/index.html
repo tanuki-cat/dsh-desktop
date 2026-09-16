@@ -76,7 +76,8 @@
       old. A script element is the honest test instead: an engine that cannot parse this block
       discards it and runs the rest of the page, which is how the flag stays unset.
 
-      REQUIRED_SYNTAX in src-tauri/src/window.rs names the same feature; a test binds the two.
+      REQUIRED_SYNTAX in src-tauri/src/window/tests.rs names the same feature; that test binds
+      the two.
     -->
     <script>
       window.__dshSyntaxMissing = [];

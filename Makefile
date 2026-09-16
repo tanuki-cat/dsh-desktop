@@ -3,8 +3,9 @@
 #   make            显示帮助（默认目标）
 #   make doctor     检查工具链与平台依赖
 #   make check      cargo check --all-targets
-#   make test       离线单元测试
+#   make test       离线单元测试（含 scripts/ 自检）
 #   make test-live  联网集成测试（查询 npm registry）
+#   make test-scripts  只跑 scripts/ 的自检
 #   make dev        运行 debug 版
 #   make build      编译 release 可执行文件
 #   make bundle     打包安装包（macOS: .app；Linux: .deb）
@@ -45,15 +46,16 @@ PNPM_STORE ?=
 CARGO_ENV         := $(if $(CARGO_HOME),CARGO_HOME=$(CARGO_HOME),)
 PNPM_INSTALL_ARGS := $(if $(PNPM_STORE),--store-dir=$(PNPM_STORE),)
 
-.PHONY: help doctor check fmt fmt-check clippy test test-live dev build bundle node-deps run icons clean distclean
+.PHONY: help doctor check fmt fmt-check clippy test test-live test-scripts dev build bundle node-deps run icons clean distclean
 
 help:
 	@echo "dsh-desktop 构建入口（平台: $(PLATFORM)，打包目标: $(BUNDLE_TARGETS)）"
 	@echo ''
 	@echo "  make doctor      检查工具链与平台依赖"
 	@echo "  make check       cargo check --all-targets"
-	@echo "  make test        离线单元测试"
+	@echo "  make test        离线单元测试（含 scripts/ 自检）"
 	@echo "  make test-live   联网集成测试（查询 npm registry）"
+	@echo "  make test-scripts  只跑 scripts/ 的自检"
 	@echo "  make fmt / fmt-check / clippy"
 	@echo "  make dev         运行 debug 版"
 	@echo "  make build       编译 release 可执行文件"
@@ -96,7 +98,11 @@ fmt-check:
 clippy:
 	$(CARGO_ENV) $(CARGO) clippy --manifest-path $(MANIFEST) --all-targets -- -D warnings
 
-test:
+# scripts/ 下的自检：闸门失效是无声的，单独跑一遍比藏在 runtime-stage 里更早暴露问题
+test-scripts:
+	@sh scripts/tests/check-runtime-stage-test.sh
+
+test: test-scripts
 	$(CARGO_ENV) $(CARGO) test --manifest-path $(MANIFEST)
 
 test-live:
@@ -241,7 +247,7 @@ runtime-fetch:
 	@echo "已校验 $(NODE_TARBALL)（对照 $(RUNTIME_LOCK)）"
 
 runtime-stage: runtime-fetch
-	@sh scripts/check-runtime-stage.sh --self-test
+	@sh scripts/tests/check-runtime-stage-test.sh
 	@echo "组装 $(RUNTIME_DIR) …"
 	@# 整体清空（只留 README.md 这个非空 marker）：只删四个已知子目录时，别的平台/上一次的残留
 	@# 会被 bundle.resources 静默打进包（review P1-8）。

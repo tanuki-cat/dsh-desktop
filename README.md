@@ -85,7 +85,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   `plugin update available: dshmarket 1.45.1 -> 1.46.1, installing`、`plugin updated: dshmarket 1.45.1 -> 1.46.1`，
   随后 harness 重启并正常服务；profile 的依赖范围被改写为 `^1.46.1`、`node_modules` 内实装 1.46.1，
   且 `plugin-check.json` 与核心的 `update-check.json` 各自独立（时间戳与内容互不影响）。
-- 离线测试：`cargo test` **116 passed**，另有 **5 个集成用例**（在真实 node 引擎里跑兼容层与探测脚本）。单测覆盖：URL 解析含 LAN 后缀、凭据脱敏（`Bearer`/`api_key`/`Cookie` 等）、状态文件往返、locator 软链解析与
+- 离线测试：`cargo test` **142 passed**，另有 **6 个集成用例**（在真实 node 引擎里跑兼容层与探测脚本）。单测覆盖：URL 解析含 LAN 后缀、凭据脱敏（`Bearer`/`api_key`/`Cookie` 等）、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
   缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口与跨窗口都不重复安装"、npm PATH 前缀、沉默对端探针超时、
   package.json 版本解析、部分/损坏 config.json 处理、workspace / dsh_path 回退不改文件、HOME 缺失不回落 `/`、
@@ -140,7 +140,8 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 | `make doctor` | 检查工具链与平台依赖 | Linux 用 `pkg-config` 查 `webkit2gtk-4.1` / `gtk+-3.0` / `libsoup-3.0` 并给出 Debian/Fedora/Arch 安装命令；macOS 提示装 Xcode CLT |
 | `make check` | `cargo check --all-targets` | 与 CI 口径一致 |
 | `make fmt` / `make fmt-check` / `make clippy` | 格式化 / 只检查格式（CI 门禁用，不改工作区）/ lint（`clippy -D warnings`） | |
-| `make test` | 离线单元测试（当前 **102** 个）＋ 在真实 JS 引擎里跑兼容层的集成测试 | 不联网；只有兼容层那个集成测试需要 PATH 上有 `node`（没有就跳过） |
+| `make test` | `make test-scripts` ＋ 离线单元测试（当前 **142** 个）＋ 在真实 JS 引擎里跑兼容层的集成测试 | 不联网；只有兼容层那个集成测试需要 PATH 上有 `node`（没有就跳过） |
+| `make test-scripts` | `scripts/` 自检：用假目录验证 staging 闸门本身仍然会失败 | 纯 shell，不依赖构建产物；`make test` 会先跑它 |
 | `make test-live` | 联网集成测试（全部） | 自动设 `DSH_DESKTOP_LIVE_TESTS=1`：查真实 registry、对比冷/热缓存耗时，并在「PATH 里没有 node」的模拟 GUI 环境下验证 npm 仍可运行 |
 | `make dev` | 运行 debug 版 | 等价 `cargo run --manifest-path src-tauri/Cargo.toml` |
 | `make build` | 编译 release 可执行文件 | 产物 `src-tauri/target/release/dsh-desktop` |
@@ -157,6 +158,25 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 
 可覆盖变量：`CARGO=`、`PNPM=`、`BUNDLE_TARGETS=`（如 `make bundle BUNDLE_TARGETS=appimage`）、
 `CARGO_HOME=`、`PNPM_STORE=`——后两个留空即用工具自身默认，便于沙箱/CI 把缓存重定向到工作区。
+
+### 源码与测试布局
+
+`src-tauri/src/` 里每个模块的单元测试都放在它自己的 `tests.rs`，模块文件只留一行声明：
+
+```
+src-tauri/src/lib.rs            -> src-tauri/src/tests.rs
+src-tauri/src/window.rs         -> src-tauri/src/window/tests.rs
+src-tauri/src/harness.rs        -> src-tauri/src/harness/tests.rs
+```
+
+`tests.rs` 是模块的子模块（`#[cfg(test)] mod tests;`），因此仍能用 `use super::*;` 够到私有项，
+只编译进测试目标。测试跟着它断言的那个模块走：判断"哪个进程才是自家 Harness"的用例在
+`identity/tests.rs`，接管其它 Harness 的问答在 `takeover/tests.rs`，更新事务的编排在
+`update_flow/tests.rs`。跨模块的组合断言（例如"Keep ⇒ 进程组终止"）留在 `src/tests.rs`，
+因为只有那里两个模块都在作用域里。
+
+集成测试另放 `src-tauri/tests/`（`make test-live` 才联网），`scripts/` 的自检放在
+`scripts/tests/`。
 
 ### 已知坑
 
@@ -194,7 +214,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 已完成并可实机复现，并已**并入 `main`**（2026-09-13 合并 `feat/bundled-runtime`）：
 
 - `make runtime-fetch / runtime-stage / runtime-clean / bundle-bundled` 四个目标全部跑通；
-- staging 自带校验（`scripts/check-runtime-stage.sh`，`--self-test` 会先用假目录验证闸门本身有效）：必需文件、**悬空符号链接**（会让 `tauri build` 失败）、**绝对符号链接**（会被解引用，把宿主机文件复制进包）、**quarantine 属性**（会带进 .app）、**文件数/体积闸门**（多放 2 万个文件这类残留以前会被静默打包）；
+- staging 自带校验（`scripts/check-runtime-stage.sh`；`scripts/tests/check-runtime-stage-test.sh` 会先用假目录验证闸门本身有效）：必需文件、**悬空符号链接**（会让 `tauri build` 失败）、**绝对符号链接**（会被解引用，把宿主机文件复制进包）、**quarantine 属性**（会带进 .app）、**文件数/体积闸门**（多放 2 万个文件这类残留以前会被静默打包）；
 - profile 模板由真 pnpm 生成（含插件市场 dshmarket，见方案 §2.5）；
 - 实测：`env -i PATH=/usr/bin:/bin` 下自带 node 跑自带 dsh → `0.1.5-rc.2`；
   全新 DSH_HOME + 模板播种 → `dsh web` **6 秒**出 URL、stderr 干净、`.dsh-market` 出现；

@@ -2,7 +2,8 @@
 # staging 校验：实测会让发布失败 / 被 Gatekeeper 拦下 / 把宿主内容带进包的问题都在这里拦住。
 #
 # 用法: check-runtime-stage.sh <runtime 目录>
-#       check-runtime-stage.sh --self-test    用假目录自检本脚本的闸门（staging 之前跑）
+#
+# 闸门自身的自检在 scripts/tests/check-runtime-stage-test.sh（用假目录验证本脚本仍然会失败）。
 #
 # 同时接受 Unix 与 Windows 的布局：
 #   node  : node/bin/node        | node/node.exe（Windows 官方发行版是扁平布局）
@@ -20,54 +21,6 @@ set -eu
 min_files=${DSH_RUNTIME_MIN_FILES:-20000}
 max_files=${DSH_RUNTIME_MAX_FILES:-55000}
 max_mb=${DSH_RUNTIME_MAX_MB:-700}
-
-if [ "${1:-}" = "--self-test" ]; then
-  # 两条实测过的失效路径各造一个反例，避免闸门再被无声地绕过（review P0-1 / P1-9）。
-  tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' EXIT
-  loose="DSH_RUNTIME_MIN_FILES=0 DSH_RUNTIME_MAX_FILES=99999999 DSH_RUNTIME_MAX_MB=99999"
-
-  mkdir -p "$tmp/missing/node/bin"
-  printf '#!/bin/sh\necho v0.0.0\n' > "$tmp/missing/node/bin/node"
-  chmod +x "$tmp/missing/node/bin/node"
-  status=0
-  env $loose sh "$0" "$tmp/missing" >/dev/null 2>&1 || status=$?
-  if [ "$status" = "0" ]; then
-    echo "自检失败：缺少必需内容的目录没有让校验失败" >&2
-    exit 1
-  fi
-
-  full="$tmp/full"
-  mkdir -p "$full/node/bin" "$full/node/lib/node_modules/npm/bin" \
-    "$full/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/lib" \
-    "$full/tools/bin" "$full/profile-template/node_modules/dshmarket"
-  printf '#!/bin/sh\necho v0.0.0\n' > "$full/node/bin/node"
-  chmod +x "$full/node/bin/node"
-  : > "$full/node/lib/node_modules/npm/bin/npm-cli.js"
-  : > "$full/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/package.json"
-  printf '#!/bin/sh\n' > "$full/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"
-  : > "$full/tools/bin/pnpm"
-  : > "$full/profile-template/package.json"
-  : > "$full/profile-template/node_modules/dshmarket/package.json"
-  : > "$full/profile-template/pnpm-lock.yaml"
-  : > "$full/THIRD-PARTY-NOTICES.md"
-
-  ln -s /usr/bin/true "$full/node/bin/absolute-link"
-  status=0
-  env $loose sh "$0" "$full" >/dev/null 2>&1 || status=$?
-  if [ "$status" = "0" ]; then
-    echo "自检失败：绝对符号链接没有让校验失败" >&2
-    exit 1
-  fi
-
-  rm -f "$full/node/bin/absolute-link"
-  env $loose sh "$0" "$full" >/dev/null 2>&1 || {
-    echo "自检失败：干净的假目录没有通过校验" >&2
-    exit 1
-  }
-  echo "check-runtime-stage.sh 自检通过"
-  exit 0
-fi
 
 root=$1
 [ -n "$root" ] || { echo "缺少 runtime 目录" >&2; exit 2; }
