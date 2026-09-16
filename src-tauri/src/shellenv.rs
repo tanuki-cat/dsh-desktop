@@ -131,7 +131,10 @@ fn capture(shell: &Path, flag: &str) -> Option<String> {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = reader.join();
+                // Dropped, not joined: a grandchild the shell left behind still holds the write
+                // end of the pipe, and joining would wait on it for ever — the unbounded wait
+                // this budget exists to remove.
+                drop(reader);
                 return None;
             }
         }

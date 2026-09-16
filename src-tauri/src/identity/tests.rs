@@ -58,3 +58,23 @@ fn session_supervisors_are_recognized_on_both_platforms() {
     // No userspace parent left at all: treated as gone without asking `ps`.
     assert_eq!(classify_parent(0), Parent::Gone);
 }
+
+/// The three answers `ps` can give must not be collapsed into two.
+#[test]
+fn a_parent_is_classified_from_what_ps_answered() {
+    // `ps` could not run or ran out of budget: unknown, so keep the process.
+    assert_eq!(parent_from_ps(None), Parent::Live);
+    // `ps` ran and printed nothing: no such process, which is how a crashed shell's
+    // leftover reads. Treating this as Live would stop every orphan from being cleaned up.
+    assert_eq!(parent_from_ps(Some(String::new())), Parent::Gone);
+    // A real parent, in both shapes.
+    assert_eq!(
+        parent_from_ps(Some("/sbin/launchd".into())),
+        Parent::Supervisor
+    );
+    assert_eq!(
+        parent_from_ps(Some("/usr/lib/systemd/systemd --user".into())),
+        Parent::Supervisor
+    );
+    assert_eq!(parent_from_ps(Some("/bin/zsh -l".into())), Parent::Live);
+}

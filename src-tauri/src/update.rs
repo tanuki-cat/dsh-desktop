@@ -32,11 +32,53 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// unbounded wait after the first one was already cut short.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
+/// Bytes kept from the command's stdout.
+///
+/// The only reader is `npm view … --json`, whose document is a few hundred bytes; the cap exists
+/// so that a package manager which prints for its whole budget cannot turn that budget into
+/// resident memory. Nothing here needs the whole stream, so an over-cap stdout is reported as a
+/// failure to parse rather than being buffered.
+const STDOUT_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Bytes kept from the command's stderr.
+///
+/// Only a handful of lines ever reach the user (`Output::summary`), so this is generous: it is
+/// the difference between a diagnostic that names the failure and one that does not.
+const STDERR_LIMIT: usize = 1024 * 1024;
+
+/// A bounded slice of one child pipe.
+struct Captured {
+    /// The newest bytes read, at most the pipe's limit.
+    bytes: Vec<u8>,
+    /// True when the pipe produced more than `bytes` holds.
+    truncated: bool,
+}
+
+impl Captured {
+    fn empty() -> Self {
+        Captured {
+            bytes: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    /// The first `lines` lines of what was kept, joined, marked when it is not the whole story.
+    fn summary(&self, lines: usize) -> String {
+        let text = String::from_utf8_lossy(&self.bytes);
+        let head: String = text.lines().take(lines).collect::<Vec<_>>().join(" | ");
+        if self.truncated {
+            format!("{head} | …（输出过长，已截断）")
+        } else {
+            head
+        }
+    }
+}
+
 /// What one finished command produced.
 struct Output {
     status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    stdout: Captured,
+    stderr: Captured,
 }
 
 /// Run a command with a whole-process timeout, killing it and its children on expiry.
@@ -69,8 +111,8 @@ fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<Output, S
 
     // Drain both pipes on their own threads: a child that fills a pipe buffer blocks for ever,
     // and the timeout below would then fire on a process that was only waiting to be read.
-    let stdout = child.stdout.take().map(drain);
-    let stderr = child.stderr.take().map(drain);
+    let stdout = child.stdout.take().map(|pipe| drain(pipe, STDOUT_LIMIT));
+    let stderr = child.stderr.take().map(|pipe| drain(pipe, STDERR_LIMIT));
 
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -101,20 +143,37 @@ fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<Output, S
 /// A channel rather than a `JoinHandle`: the reader ends when the last writer closes the pipe, and
 /// a grandchild that survived the kill would hold it open for ever. Waiting on a join there would
 /// reintroduce exactly the unbounded wait the timeout exists to remove, so the caller bounds it.
-fn drain<R: Read + Send + 'static>(mut pipe: R) -> mpsc::Receiver<Vec<u8>> {
+///
+/// The pipe is still read to the end — a reader that stopped early would leave the child blocked
+/// on a full pipe for the rest of its budget — but only `limit` bytes are kept.
+fn drain<R: Read + Send + 'static>(mut pipe: R, limit: usize) -> mpsc::Receiver<Captured> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = pipe.read_to_end(&mut buffer);
-        let _ = tx.send(buffer);
+        let mut captured = Captured::empty();
+        let mut chunk = [0u8; 8 * 1024];
+        loop {
+            let read = match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            let room = limit.saturating_sub(captured.bytes.len());
+            let take = room.min(read);
+            captured.bytes.extend_from_slice(&chunk[..take]);
+            if take < read {
+                captured.truncated = true;
+            }
+        }
+        let _ = tx.send(captured);
     });
     rx
 }
 
 /// Whatever a drain thread managed to read before its budget ran out.
-fn collected(rx: Option<mpsc::Receiver<Vec<u8>>>) -> Vec<u8> {
+fn collected(rx: Option<mpsc::Receiver<Captured>>) -> Captured {
     rx.and_then(|rx| rx.recv_timeout(DRAIN_GRACE).ok())
-        .unwrap_or_default()
+        .unwrap_or_else(Captured::empty)
 }
 
 /// The CLI this shell supervises.
@@ -376,14 +435,17 @@ pub fn fetch_dist_tags(npm: &Path, package: &str) -> Result<Vec<(String, String)
     let output =
         run_with_timeout(command, QUERY_TIMEOUT).map_err(|error| format!("npm view: {error}"))?;
     if !output.status.success() {
-        let tail: String = String::from_utf8_lossy(&output.stderr)
-            .lines()
-            .take(3)
-            .collect::<Vec<_>>()
-            .join(" | ");
-        return Err(format!("npm view 失败: {tail}"));
+        return Err(format!("npm view 失败: {}", output.stderr.summary(3)));
     }
-    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
+    // An over-cap stdout was cut, so parsing it would report a syntax error instead of the
+    // real problem: the command printed far more than a dist-tags document.
+    if output.stdout.truncated {
+        return Err(format!(
+            "npm view 输出超过 {} MiB，已截断，无法解析 dist-tags",
+            STDOUT_LIMIT / (1024 * 1024)
+        ));
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout.bytes)
         .map_err(|error| format!("dist-tags 解析失败: {error}"))?;
     let mut tags = Vec::new();
     if let Some(object) = parsed.as_object() {
@@ -478,11 +540,12 @@ fn login_shell_npm() -> Option<PathBuf> {
     #[cfg(not(windows))]
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let output = Command::new(shell)
-            .args(["-lc", "command -v npm"])
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // A login shell sources the user's rc files, so it can hang on anything they can; the
+        // budget is the same one a registry query gets.
+        let text = crate::process::stdout_within(
+            Command::new(shell).args(["-lc", "command -v npm"]),
+            QUERY_TIMEOUT,
+        )?;
         let candidate = PathBuf::from(text);
         candidate.is_file().then_some(candidate)
     }
@@ -498,8 +561,10 @@ pub fn install_prefix(dsh_js: &Path) -> Option<PathBuf> {
 }
 
 fn global_prefix(npm: &Path) -> Option<String> {
-    let output = npm_command(npm).args(["prefix", "-g"]).output().ok()?;
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // `npm prefix` is local, but npm still starts a node process that can stall on a lock or a
+    // proxy the way the install does, and this runs while the user waits on the splash page.
+    let text =
+        crate::process::stdout_within(npm_command(npm).args(["prefix", "-g"]), QUERY_TIMEOUT)?;
     if text.is_empty() {
         None
     } else {
@@ -542,12 +607,7 @@ pub fn install(
     if output.status.success() {
         return Ok(());
     }
-    let tail: String = String::from_utf8_lossy(&output.stderr)
-        .lines()
-        .take(5)
-        .collect::<Vec<_>>()
-        .join(" | ");
-    Err(format!("npm install 失败: {tail}"))
+    Err(format!("npm install 失败: {}", output.stderr.summary(5)))
 }
 
 /// The plugin market this shell keeps current alongside the CLI.
@@ -621,12 +681,7 @@ pub fn install_plugin(
     if output.status.success() {
         return Ok(());
     }
-    let tail: String = String::from_utf8_lossy(&output.stderr)
-        .lines()
-        .take(5)
-        .collect::<Vec<_>>()
-        .join(" | ");
-    Err(format!("dsh plugin add 失败: {tail}"))
+    Err(format!("dsh plugin add 失败: {}", output.stderr.summary(5)))
 }
 
 /// Cached outcome of one registry query, so most launches skip the ~1.9s network round trip.

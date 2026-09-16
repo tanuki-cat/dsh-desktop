@@ -1,6 +1,7 @@
 //! Child-process lifetime, the on-disk state file, and stale-instance recovery.
 
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,66 @@ pub fn clear_state(data_dir: &Path) {
 
 pub fn is_alive(pid: u32) -> bool {
     kill_signal(pid, None)
+}
+
+/// Run a short-lived helper and return the first non-empty line of its stdout.
+///
+/// `None` means the command **could not be run to completion** — it failed to spawn, or it ran
+/// past `timeout` and was killed. `Some("")` means it ran and printed nothing, which callers must
+/// be able to tell apart: "no such process" is an answer, while "`ps` never ran" is not.
+///
+/// `Command::output()` waits for ever. Three of the callers here run a **login shell**
+/// (`$SHELL -lc …`), which sources arbitrary user rc files: one that waits on a network mount, a
+/// password prompt, or stdin parks whichever thread asked — the startup path in every case — with
+/// no way out for the user. The others run `npm`, which stalls on exactly the proxies and locks
+/// that `update::INSTALL_TIMEOUT` already exists for.
+///
+/// Only stdout is collected, and only its first non-empty line: every caller is looking for one
+/// path or one version on one line, so stderr and the rest of the stream are dropped rather than
+/// buffered. The exit status is deliberately not folded in — callers validate the content they
+/// need (`is_file`, a version parse), and one of them treats empty output as a real answer.
+pub fn stdout_within(command: &mut std::process::Command, timeout: Duration) -> Option<String> {
+    command.stdin(std::process::Stdio::null());
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    // Read on another thread so a chatty child cannot fill the pipe and block against the wait
+    // below; the thread ends when the pipe closes, and the timeout decides whether we wait.
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut pipe = stdout;
+        let _ = pipe.read_to_end(&mut bytes);
+        // Lossy: a path with a non-UTF-8 byte must not turn into "no output at all".
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            // Any exit status: a non-zero `ps` that printed nothing is still an answer.
+            Ok(Some(_)) => return Some(first_line(&reader.join().unwrap_or_default())),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// First non-empty line, trimmed — the shape every [`stdout_within`] caller parses.
+///
+/// Empty when the command printed nothing at all, which callers rely on (see the doc above).
+fn first_line(text: &str) -> String {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// SIGTERM the process group, wait for the grace period, then SIGKILL.

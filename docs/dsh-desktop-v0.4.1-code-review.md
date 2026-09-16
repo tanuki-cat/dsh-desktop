@@ -26,6 +26,9 @@
 当前库内单测 **142 passed / 0 failed**（v0.4.1 轮为 116），集成用例 5 → 6 项，`cargo fmt --check` 通过，
 `cargo clippy --all-targets` 0 warning。
 
+> 后续：`44a347e` 补端口探针回归测试后为 **143**；最新一轮审查（
+> [`dsh-desktop-latest-code-review.md`](./dsh-desktop-latest-code-review.md)）修复外部输出的内存边界后为 **154**。
+
 独立验证：`cargo test` **116 passed / 0 failed**（单测；另有 5 个集成用例在真实 node 引擎里跑。原 102）、
 `cargo fmt --check` 通过、`cargo clippy` 在 host 与 `x86_64-pc-windows-gnu` 两个目标上均 0 warning。
 

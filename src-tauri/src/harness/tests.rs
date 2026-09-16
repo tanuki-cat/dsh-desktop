@@ -117,6 +117,54 @@ fn an_oversized_file_rotates_before_the_next_line() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A single line larger than the limit used to be appended to a file that was still under it,
+/// leaving the log far above its target until the *next* line arrived.
+#[test]
+fn one_oversized_line_does_not_overshoot_the_limit() {
+    let dir = std::env::temp_dir().join("dsh-desktop-log-overshoot-test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("harness.log");
+    let logger = Logger::with_limit(&path, 200);
+
+    logger.write("small line");
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 11);
+    logger.write(&"z".repeat(5_000));
+
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        5_001,
+        "the oversized line belongs in a fresh file, not appended to the small one"
+    );
+    assert_eq!(
+        std::fs::metadata(dir.join("harness.log.1")).unwrap().len(),
+        11,
+        "what was there before must be rotated out, not left in place"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Rotating an empty file would only shuffle the backups: the line still has to be written.
+#[test]
+fn an_empty_log_is_not_rotated_for_one_oversized_line() {
+    let dir = std::env::temp_dir().join("dsh-desktop-log-empty-rotate-test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("harness.log");
+    let logger = Logger::with_limit(&path, 200);
+
+    logger.write(&"z".repeat(5_000));
+
+    assert!(path.is_file(), "the line must still be written somewhere");
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 5_001);
+    assert!(
+        !dir.join("harness.log.1").exists(),
+        "there was nothing to rotate"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
 /// Two writers with their own handles would keep appending to a renamed file after the other
 /// one rotates it, which loses the shell's own log lines.
 #[test]
@@ -406,4 +454,86 @@ fn assert_drained(drained: &AtomicBool) {
         "the probe request must be drained before the socket closes, or the peer sees an RST\n\
          and Windows then discards the response"
     );
+}
+
+/// The cap has to be applied to what is read, not to what is kept: `BufRead::lines()` grows one
+/// `String` until a newline arrives, so a single line with no newline in it is unbounded.
+#[test]
+fn an_oversized_line_is_capped_and_the_stream_keeps_going() {
+    let mut input: Vec<u8> = vec![b'x'; LINE_LIMIT_BYTES * 3];
+    input.extend_from_slice(b"\ntail line\n");
+    let mut reader = BufReader::new(&input[..]);
+
+    let first = read_line(&mut reader).unwrap();
+    assert!(
+        first.len() <= LINE_LIMIT_BYTES + TRUNCATION_NOTE.len(),
+        "one line must not exceed the cap: {} bytes",
+        first.len()
+    );
+    assert!(first.ends_with(TRUNCATION_NOTE), "a cut line must say so");
+    // The rest of the oversized line is drained, not read as lines of its own.
+    assert_eq!(read_line(&mut reader).as_deref(), Some("tail line"));
+    assert_eq!(read_line(&mut reader), None);
+}
+
+/// Invalid UTF-8 used to end the stream silently: `lines().map_while(Result::ok)` stops at the
+/// first `Err`, so every line after it — including the `dsh web:` line — was dropped.
+#[test]
+fn an_invalid_utf8_byte_does_not_end_the_stream() {
+    let mut input: Vec<u8> = b"plugin says: ".to_vec();
+    input.push(0xFF);
+    input.extend_from_slice(b" oops\n");
+    input.extend_from_slice(b"dsh web: http://127.0.0.1:59753/?token=abc\n");
+    let mut reader = BufReader::new(&input[..]);
+
+    assert!(read_line(&mut reader).unwrap().contains("plugin says"));
+    let url_line = read_line(&mut reader).unwrap();
+    assert!(
+        parse_dsh_url(&url_line).is_some(),
+        "the URL line after a malformed one must still arrive: {url_line:?}"
+    );
+}
+
+/// An empty line is a line: ending the stream on one would drop everything after it.
+#[test]
+fn blank_lines_do_not_end_the_stream() {
+    let mut reader = BufReader::new(&b"first\n\nthird\n"[..]);
+    assert_eq!(read_line(&mut reader).as_deref(), Some("first"));
+    assert_eq!(read_line(&mut reader).as_deref(), Some(""));
+    assert_eq!(read_line(&mut reader).as_deref(), Some("third"));
+    assert_eq!(read_line(&mut reader), None);
+}
+
+/// `BufRead::lines` strips the `\r` of a CRLF stream; the replacement must too.
+#[test]
+fn carriage_returns_are_stripped() {
+    let mut reader = BufReader::new(&b"line\r\nnext\r\n"[..]);
+    assert_eq!(read_line(&mut reader).as_deref(), Some("line"));
+    assert_eq!(read_line(&mut reader).as_deref(), Some("next"));
+    assert_eq!(read_line(&mut reader), None);
+}
+
+/// The failure page shows `Ring::tail()`: an unbounded ring would put an arbitrarily large string
+/// on a page the user is waiting for.
+#[test]
+fn the_ring_is_bounded_by_bytes_as_well_as_lines() {
+    let ring = Ring::new();
+    let line = "y".repeat(LINE_LIMIT_BYTES);
+    for _ in 0..64 {
+        ring.push_redacted(&line);
+    }
+    assert!(
+        ring.tail().len() <= RING_BYTES,
+        "the ring tail must stay within its byte budget: {} bytes",
+        ring.tail().len()
+    );
+}
+
+/// Redaction happens in the reader, so the ring only ever holds redacted text.
+#[test]
+fn the_ring_keeps_what_the_reader_redacted() {
+    let ring = Ring::new();
+    ring.push_redacted(&redact("dsh web: http://127.0.0.1:1/?token=abcdef"));
+    let tail = ring.tail();
+    assert!(tail.contains("token=***") && !tail.contains("abcdef"));
 }

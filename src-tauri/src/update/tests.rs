@@ -5,6 +5,39 @@
 
 use super::*;
 
+/// A package manager that prints for its whole budget must not turn that budget into memory:
+/// the drain keeps a bounded slice while still reading the pipe to the end.
+#[test]
+fn a_chatty_pipe_is_capped_but_still_drained() {
+    // `drain` moves the reader onto its own thread, so it takes ownership of a `'static` one.
+    let rx = drain(std::io::Cursor::new(vec![b'x'; 64 * 1024]), 4 * 1024);
+    let captured = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    assert_eq!(captured.bytes.len(), 4 * 1024, "only the cap is kept");
+    assert!(captured.truncated, "an over-cap pipe must say so");
+    assert!(captured.summary(5).contains("已截断"));
+}
+
+/// The reader ends when the pipe closes, so a stream below the cap is kept whole.
+#[test]
+fn a_short_pipe_is_kept_whole() {
+    let rx = drain(std::io::Cursor::new(b"one\ntwo\nthree\n".to_vec()), 1024);
+    let captured = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    assert_eq!(captured.summary(2), "one | two");
+    assert!(!captured.truncated);
+}
+
+/// A pipe with nothing on it is not a truncation: the message must not claim output was lost.
+#[test]
+fn an_empty_pipe_reports_nothing_lost() {
+    let rx = drain(std::io::Cursor::new(Vec::new()), 1024);
+    let captured = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    assert!(captured.bytes.is_empty() && !captured.truncated);
+    assert_eq!(captured.summary(5), "");
+}
+
 fn parse(raw: &str) -> Version {
     Version::parse(raw).expect("version should parse")
 }

@@ -44,7 +44,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 
 - locator：解析 dsh 启动器、其真实 `lib/bin.js`（穿软链）、以及 node（GUI 启动没有 Homebrew PATH）
 - 启动：launcher flag 顺序、显式 cwd（agent workspace）、`--patch` overlay 强制 `printUrl`、独立进程组
-- 输出：持续读 stdout/stderr、**凭据脱敏**写日志（launch token、`Bearer`、`api_key`、`Cookie`/`Set-Cookie`、`password`、`secret` 等，见下）、5MB × 3 份轮转（写入前判定）、200 行环缓冲用于错误页
+- 输出：持续读 stdout/stderr、**凭据脱敏**写日志（launch token、`Bearer`、`api_key`、`Cookie`/`Set-Cookie`、`password`、`secret` 等，见下）、5MB × 3 份轮转（**计入即将写入的字节**）、环缓冲 200 行 / 1 MiB 用于错误页。每行只脱敏一次；**单行上限 256 KiB**，超限继续排空到换行但不扩张内存；非法 UTF-8 字节不会中断后续行（两者见下）
 - URL：解析首个 token（对 `(LAN: ...)` 后缀健壮）、首启 90s / 常态 30s 超时
 - 实例：固定端口；探测 → 复用自己上次的实例 / 接管外部 Harness / 占用时错误页
 - 生命周期：退出即 SIGTERM 进程组（5s 后 SIGKILL）并删除 state.json —— 关闭窗口（`RunEvent::ExitRequested`）
@@ -85,9 +85,9 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   `plugin update available: dshmarket 1.45.1 -> 1.46.1, installing`、`plugin updated: dshmarket 1.45.1 -> 1.46.1`，
   随后 harness 重启并正常服务；profile 的依赖范围被改写为 `^1.46.1`、`node_modules` 内实装 1.46.1，
   且 `plugin-check.json` 与核心的 `update-check.json` 各自独立（时间戳与内容互不影响）。
-- 离线测试：`cargo test` **142 passed**，另有 **6 个集成用例**（在真实 node 引擎里跑兼容层与探测脚本）。单测覆盖：URL 解析含 LAN 后缀、凭据脱敏（`Bearer`/`api_key`/`Cookie` 等）、状态文件往返、locator 软链解析与
+- 离线测试：`cargo test` **155 passed**，另有 **6 个集成用例**（在真实 node 引擎里跑兼容层与探测脚本）。单测覆盖：URL 解析含 LAN 后缀、凭据脱敏（`Bearer`/`api_key`/`Cookie` 等）、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
-  缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口与跨窗口都不重复安装"、npm PATH 前缀、沉默对端探针超时、
+  缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口与跨窗口都不重复安装"、npm PATH 前缀、端口探针超时（沉默对端与持续发送对端两类）、
   package.json 版本解析、部分/损坏 config.json 处理、workspace / dsh_path 回退不改文件、HOME 缺失不回落 `/`、
   进程组终止与僵尸进程识别、外链 scheme 白名单、页面加载重试判定矩阵、自愈三分支与
   "Keep ⇒ 进程组终止"的组合断言、孤儿残留的 `ps` 判定与父进程分类（launchd / `systemd --user` / 父进程已消失 / 活着的会话）、
@@ -98,7 +98,10 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   状态页按钮与壳监听的事件名一致、兼容层的判定矩阵与逐块选择 / 探针的语法探测 / 兼容层 ES5 纪律、
   候选 dsh 的身份判定与"无法识别只在答出版本时采用"、核心更新闸门、播种四态与插件跳过文案、
   绘制看护策略矩阵（帧计数代数：同值=停帧、变化=在画、变小=新文档、无应答=渲染进程没了；
-  一次坏探测只观察、连续两次才重载、重载预算用尽即报告、后台窗口不算故障、探测脚本保持 ES5 且一次只排一帧））；
+  一次坏探测只观察、连续两次才重载、重载预算用尽即报告、后台窗口不算故障、探测脚本保持 ES5 且一次只排一帧）、
+  外部输出的内存边界（单行超 256 KiB 截断且其后仍继续读、非法 UTF-8 字节不再中断整个流、空行不算流结束、
+  CRLF 剥 `\r`、环缓冲字节预算、环缓冲只存已脱敏内容、单条巨型日志不越轮转上限、空日志不为一条超限行轮转、
+  子进程管道有界且仍被读空、`ps` 三种答复（超时/无输出/有父进程）的分类不混淆））；
 - 兼容层在真实 JS 引擎里跑通（2026-09-15）：`webkit_compat_shim` 集成测试把清单里的 8 个 API 先删掉
   （`Symbol.dispose` 在 node 里不可删、已在测试里注明），注入后用断言跑行为 —— pdf.js 那条
   `Iterator.prototype.join` guard 不再抛、`Iterator.from(...).map(...).filter(...).toArray()` 链式可用、
@@ -140,7 +143,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 | `make doctor` | 检查工具链与平台依赖 | Linux 用 `pkg-config` 查 `webkit2gtk-4.1` / `gtk+-3.0` / `libsoup-3.0` 并给出 Debian/Fedora/Arch 安装命令；macOS 提示装 Xcode CLT |
 | `make check` | `cargo check --all-targets` | 与 CI 口径一致 |
 | `make fmt` / `make fmt-check` / `make clippy` | 格式化 / 只检查格式（CI 门禁用，不改工作区）/ lint（`clippy -D warnings`） | |
-| `make test` | `make test-scripts` ＋ 离线单元测试（当前 **142** 个）＋ 在真实 JS 引擎里跑兼容层的集成测试 | 不联网；只有兼容层那个集成测试需要 PATH 上有 `node`（没有就跳过） |
+| `make test` | `make test-scripts` ＋ 离线单元测试（当前 **155** 个）＋ 在真实 JS 引擎里跑兼容层的集成测试 | 不联网；只有兼容层那个集成测试需要 PATH 上有 `node`（没有就跳过） |
 | `make test-scripts` | `scripts/` 自检：用假目录验证 staging 闸门本身仍然会失败 | 纯 shell，不依赖构建产物；`make test` 会先跑它 |
 | `make test-live` | 联网集成测试（全部） | 自动设 `DSH_DESKTOP_LIVE_TESTS=1`：查真实 registry、对比冷/热缓存耗时，并在「PATH 里没有 node」的模拟 GUI 环境下验证 npm 仍可运行 |
 | `make dev` | 运行 debug 版 | 等价 `cargo run --manifest-path src-tauri/Cargo.toml` |
@@ -305,7 +308,11 @@ src-tauri/src/harness.rs        -> src-tauri/src/harness/tests.rs
 若文件整体无法解析，本次运行使用默认配置并记一条日志，**但不会覆盖你的文件**（只有文件不存在时才会写入）。
 
 状态与日志：`<app-data>/state.json`、`<app-data>/logs/harness.log`（脱敏；写入前判定 5MB × 3 份轮转，
-即 `harness.log` + `.1`/`.2`/`.3`）。两个文件都按「仅当前用户可读」写入：Unix 上是 `0600`，
+即 `harness.log` + `.1`/`.2`/`.3`）。**外部输出都有上界**：Harness 单行超过 256 KiB 即截断（继续排空到
+换行，行尾标注 `…[truncated: line exceeded 256 KiB]`），且一个非法 UTF-8 字节不再像 `lines()` 那样中断
+其后所有行（`dsh web:` URL 行会跟着一起丢，页面上只表现为启动超时）；npm/pnpm 的 stdout/stderr 分别保留
+4 MiB / 1 MiB 并照旧读空管道；`command -v`、`npm prefix -g`、`ps` 这些辅助调用也都有超时 —— 它们跑的是
+`$SHELL -lc`，会 source 用户的 rc 文件。两个文件都按「仅当前用户可读」写入：Unix 上是 `0600`，
 Windows 上用 `icacls` 去掉继承并只授权当前用户 —— `config.json` 的 `env` 可能存着 API Key，
 而用户目录下的文件默认会继承父目录的 ACL（共享/域机器上可能包含其他账户）。
 
@@ -465,11 +472,13 @@ profile 快照（都是**上限**：一次更新只产生一份，两次指向�
 | 版本读取 | **~1 ms** | 读 CLI 所属 `package.json` 的 `version`；读不到才回退 `node dsh.js --version`（约 80 ms） |
 | 更新检查（缓存命中） | **0 ms** | 60 分钟内沿用 `<app-data>/update-check.json`；冷查询约 1.2–1.9 s |
 | 登录 shell 环境抓取 | ~160 ms | 与上面两步并行执行，join 后才组装子进程环境 |
-| 端口探针 | ~12 ms | 建连/读/写各 600 ms 上限，不会挂在沉默的对端上 |
+| 端口探针 | ~12 ms | 整个交换共用一个 600 ms deadline（每次读前按剩余时间重设），沉默与持续发送的对端都不会挂住它 |
 | 启动 harness 到拿到 URL | 1–4 s | 由 `dsh web` 自身决定，首启（初始化 profile）更久，超时 90 s / 30 s |
 
 日志写入是每行一次 `write(2)`（无缓冲）：单次会话通常只有几十行，有意不做缓冲，以免崩溃时丢日志。
 轮转由内存字节计数判定，不额外 `stat`；计数在打开日志时以文件实际大小 seed，所以上次遗留的超大文件仍会在下次写入前轮转。
+判定把**即将写入的这一行**算进去（`written + incoming > limit`），否则一条超限日志会先把文件撑到远超 5 MiB，
+要等下一条日志才轮转；当前文件为空时不轮转 —— 那条日志总得写到某个文件里。
 
 ## 打包成 .app
 ```bash

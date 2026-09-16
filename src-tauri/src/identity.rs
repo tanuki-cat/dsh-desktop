@@ -6,6 +6,14 @@
 
 use crate::harness;
 use crate::process::HarnessState;
+use std::time::Duration;
+
+/// Budget for one `ps` call.
+///
+/// `ps` reads kernel tables and normally answers in milliseconds; this only has to cover a
+/// machine under enough load that the shell would otherwise wait behind it. A call that runs out
+/// is treated as "unknown", which is the branch that keeps the process rather than signalling it.
+const PS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What step 1 does with the record a crashed shell may have left behind.
 #[derive(Debug, PartialEq, Eq)]
@@ -59,19 +67,21 @@ pub(crate) fn self_heal_action(
 pub(crate) fn looks_like_our_orphan(pid: u32) -> bool {
     // `-ww` matters: the flags that identify our spawn sit behind a long node path, and some
     // `ps` builds truncate the command column to the terminal width without it.
-    let output = match std::process::Command::new("ps")
-        .args(["-ww", "-p", &pid.to_string(), "-o", "ppid=,command="])
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) => {
-            harness::app_log(&format!(
-                "ps 不可用，无法确认残留进程 {pid} 的身份，按无关进程处理: {error}"
-            ));
-            return false;
-        }
+    let Some(text) = crate::process::stdout_within(
+        std::process::Command::new("ps").args([
+            "-ww",
+            "-p",
+            &pid.to_string(),
+            "-o",
+            "ppid=,command=",
+        ]),
+        PS_TIMEOUT,
+    ) else {
+        harness::app_log(&format!(
+            "ps 不可用或超时，无法确认残留进程 {pid} 的身份，按无关进程处理"
+        ));
+        return false;
     };
-    let text = String::from_utf8_lossy(&output.stdout);
     let Some((ppid, _)) = parse_ps_identity(&text) else {
         return false;
     };
@@ -109,21 +119,27 @@ fn classify_parent(ppid: u32) -> Parent {
         // The kernel: no userspace parent is left to own it.
         return Parent::Gone;
     }
-    let output = match std::process::Command::new("ps")
-        .args(["-ww", "-p", &ppid.to_string(), "-o", "command="])
-        .output()
-    {
-        Ok(output) => output,
-        Err(_) => return Parent::Live,
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    let Some(command) = text.lines().find(|line| !line.trim().is_empty()) else {
-        return Parent::Gone;
-    };
-    if is_session_supervisor(command) {
-        Parent::Supervisor
-    } else {
-        Parent::Live
+    parent_from_ps(crate::process::stdout_within(
+        std::process::Command::new("ps").args(["-ww", "-p", &ppid.to_string(), "-o", "command="]),
+        PS_TIMEOUT,
+    ))
+}
+
+/// The decision once `ps` has answered, split out so every branch is testable without running it.
+///
+/// The three outcomes are genuinely different answers and must not be collapsed:
+///
+/// - `None` — `ps` could not run or ran out of budget. Unknown, so [`Parent::Live`].
+/// - `Some("")` — `ps` ran and printed nothing, which is how "no such process" reads. This is the
+///   **ordinary** case for a crashed shell's leftover, so it has to stay [`Parent::Gone`]; folding
+///   it into `Live` would stop every orphan from ever being cleaned up.
+/// - `Some(command)` — a real parent: a session supervisor, or somebody still running it.
+fn parent_from_ps(answer: Option<String>) -> Parent {
+    match answer {
+        None => Parent::Live,
+        Some(command) if command.is_empty() => Parent::Gone,
+        Some(command) if is_session_supervisor(&command) => Parent::Supervisor,
+        Some(_) => Parent::Live,
     }
 }
 

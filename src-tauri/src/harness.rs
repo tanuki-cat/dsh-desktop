@@ -14,13 +14,35 @@ use url::Url;
 
 pub const URL_PREFIX: &str = "dsh web:";
 const RING_CAPACITY: usize = 200;
+/// Bytes the ring keeps across all its lines, so its tail stays a page-sized string.
+const RING_BYTES: usize = 1024 * 1024;
+/// Longest single line kept from the Harness output.
+///
+/// A CLI, node, or a plugin can print a line with no newline in it at all: a minified JSON
+/// document, a base64 blob, a provider error with the request body inlined. Reading by line
+/// grows one `String` until that newline arrives, and the finished line then goes on to the
+/// ring, the redactor and the log. 256 KiB is orders of magnitude above a real log line and
+/// still small enough that the whole path stays flat.
+const LINE_LIMIT_BYTES: usize = 256 * 1024;
+/// Appended to a line [`LINE_LIMIT_BYTES`] cut, so a partial line is never read as a whole one.
+const TRUNCATION_NOTE: &str = " …[truncated: line exceeded 256 KiB]";
 const LOG_LIMIT_BYTES: u64 = 5 * 1024 * 1024;
 /// Rotated generations kept beside the live file (design §8: 5 MB x 3).
 const LOG_BACKUPS: usize = 3;
 
-/// Last N lines of Harness output, with the launch token redacted.
+/// Last [`RING_CAPACITY`] lines of Harness output, bounded by [`RING_BYTES`] as well.
+///
+/// The lines arrive already redacted: the reader redacts once and hands the same string to both
+/// the ring and the log, so the scan is not repeated per sink.
 #[derive(Clone)]
-pub struct Ring(Arc<Mutex<VecDeque<String>>>);
+pub struct Ring(Arc<Mutex<Tail>>);
+
+#[derive(Default)]
+struct Tail {
+    lines: VecDeque<String>,
+    /// Sum of `lines` plus their separators, so eviction does not need to re-measure them.
+    bytes: usize,
+}
 
 impl Default for Ring {
     fn default() -> Self {
@@ -30,19 +52,36 @@ impl Default for Ring {
 
 impl Ring {
     pub fn new() -> Self {
-        Ring(Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAPACITY))))
+        Ring(Arc::new(Mutex::new(Tail {
+            lines: VecDeque::with_capacity(RING_CAPACITY),
+            bytes: 0,
+        })))
     }
-    pub fn push(&self, line: &str) {
-        let mut q = self.0.lock().unwrap();
-        if q.len() == RING_CAPACITY {
-            q.pop_front();
+
+    /// Keep one already-redacted line, dropping the oldest until both bounds hold.
+    pub fn push_redacted(&self, line: &str) {
+        let mut tail = self.0.lock().unwrap();
+        // A single line above the byte budget would otherwise evict everything and still be kept
+        // whole; the reader caps lines at `LINE_LIMIT_BYTES`, so this only guards the bound.
+        if line.len() > RING_BYTES {
+            return;
         }
-        q.push_back(redact(line));
+        while tail.lines.len() >= RING_CAPACITY || tail.bytes + line.len() + 1 > RING_BYTES {
+            match tail.lines.pop_front() {
+                Some(old) => tail.bytes -= old.len() + 1,
+                None => break,
+            }
+        }
+        tail.bytes += line.len() + 1;
+        tail.lines.push_back(line.to_string());
     }
+
+    /// The kept lines as one block, for the failure page. Never larger than [`RING_BYTES`].
     pub fn tail(&self) -> String {
         self.0
             .lock()
             .unwrap()
+            .lines
             .iter()
             .cloned()
             .collect::<Vec<_>>()
@@ -226,6 +265,12 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(600);
 /// bounds the memory.
 const PROBE_RESPONSE_LIMIT: usize = 64 * 1024;
 
+/// Budget for the `ps` / PowerShell call that names the process behind a port.
+///
+/// Same reasoning as the probe budget: this runs while the user is looking at the splash page,
+/// and a `ps` that never returns must not be able to park the takeover path.
+const PS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The sentence only the CLI auth fence carries: the one thing that identifies a Harness.
 const AUTH_FENCE: &str = "dsh web authentication required";
 
@@ -334,27 +379,26 @@ pub fn looks_like_dsh_web(command: &str) -> bool {
 /// names *which program* is behind it. Consulted before signalling a process this shell did not
 /// start, so a fence-shaped answer alone is not enough to get an unrelated server killed.
 pub fn process_command(pid: u32) -> Option<String> {
+    // `-ww` matters: the identifying flags sit behind a long node path, and some `ps`
+    // builds truncate the command column to the terminal width without it. Bounded, because this
+    // runs on the takeover path while the user waits on the splash page.
     #[cfg(unix)]
-    let output = std::process::Command::new("ps")
-        // `-ww` matters: the identifying flags sit behind a long node path, and some `ps`
-        // builds truncate the command column to the terminal width without it.
-        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
-        .output()
-        .ok()?;
+    let command = crate::process::stdout_within(
+        std::process::Command::new("ps").args(["-ww", "-p", &pid.to_string(), "-o", "command="]),
+        PS_TIMEOUT,
+    )?;
     // `tasklist` reports only the image name, which cannot tell one node program from another.
     #[cfg(windows)]
-    let output = std::process::Command::new("powershell")
-        .args([
+    let command = crate::process::stdout_within(
+        std::process::Command::new("powershell").args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
             &format!("(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"),
-        ])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let line = text.lines().find(|line| !line.trim().is_empty())?;
-    Some(line.trim().to_string())
+        ]),
+        PS_TIMEOUT,
+    )?;
+    (!command.is_empty()).then_some(command)
 }
 
 /// PID currently listening on `port`, when the platform lets us find it cheaply.
@@ -589,14 +633,80 @@ fn forward_lines<R: Read + Send + 'static>(
     log: Logger,
 ) {
     std::thread::spawn(move || {
-        for line in BufReader::new(reader).lines().map_while(Result::ok) {
-            ring.push(&line);
-            log.write(&redact(&line));
+        let mut reader = BufReader::new(reader);
+        loop {
+            let Some(line) = read_line(&mut reader) else {
+                return;
+            };
+            // One redaction for both sinks: the log and the failure page show the same text, and
+            // the scan walks the whole line once per sensitive field.
+            let safe = redact(&line);
+            ring.push_redacted(&safe);
+            log.write(&safe);
+            // The URL is parsed from the line as the CLI printed it, never from the redacted
+            // copy: redaction rewrites `token=…`, which is exactly the query the parser needs.
             if let Some(url) = parse_dsh_url(&line) {
                 let _ = tx.send(url);
             }
         }
     });
+}
+
+/// One line, capped at [`LINE_LIMIT_BYTES`], or `None` once the stream ends.
+///
+/// Reading by line through `BufRead::lines()` has two failure modes this avoids. It grows one
+/// `String` until a newline arrives, so a single line with no newline in it can be arbitrarily
+/// large; and it returns `Err` on invalid UTF-8, which `map_while(Result::ok)` turns into a
+/// silent, permanent end of the stream — the `dsh web:` line would never be parsed and the shell
+/// would sit on the splash page until its timeout, with nothing in the log to explain it.
+///
+/// The cap is applied to the bytes read, before decoding, so an oversized line costs a fixed
+/// buffer: the rest of it is drained and discarded. `from_utf8_lossy` keeps a partial or malformed
+/// line readable instead of dropping every line that follows it.
+fn read_line<R: BufRead>(reader: &mut R) -> Option<String> {
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    // Distinguishes "the stream ended" from "the line was empty": an empty line is a line, and
+    // ending the stream on one would drop every line after it.
+    let mut saw_line = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok([]) => break,
+            Ok(available) => available,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let end = newline.unwrap_or(available.len());
+        if !truncated {
+            let room = LINE_LIMIT_BYTES.saturating_sub(bytes.len());
+            let take = room.min(end);
+            bytes.extend_from_slice(&available[..take]);
+            if take < end {
+                truncated = true;
+            }
+        }
+        saw_line = true;
+        match newline {
+            Some(at) => {
+                reader.consume(at + 1);
+                break;
+            }
+            None => reader.consume(end),
+        }
+    }
+    if !saw_line {
+        return None;
+    }
+    let mut line = String::from_utf8_lossy(&bytes).into_owned();
+    // `BufRead::lines` strips a trailing `\r`, so a CRLF stream reads the same here.
+    if line.ends_with('\r') {
+        line.pop();
+    }
+    if truncated {
+        line.push_str(TRUNCATION_NOTE);
+    }
+    Some(line)
 }
 
 static APP_LOGGER: Mutex<Option<Logger>> = Mutex::new(None);
@@ -665,7 +775,8 @@ impl Logger {
 
     pub fn write(&self, line: &str) {
         let mut guard = self.file.lock().unwrap();
-        self.rotate_if_oversized(&mut guard);
+        let incoming = line.len() as u64 + 1;
+        self.rotate_before(&mut guard, incoming);
         if guard.is_none() {
             *guard = OpenOptions::new()
                 .create(true)
@@ -675,19 +786,29 @@ impl Logger {
         }
         if let Some(file) = guard.as_mut() {
             if writeln!(file, "{line}").is_ok() {
-                self.written
-                    .fetch_add(line.len() as u64 + 1, Ordering::Relaxed);
+                self.written.fetch_add(incoming, Ordering::Relaxed);
             }
         }
     }
 
-    /// Roll the live file into `.1` once it passes the limit, keeping `LOG_BACKUPS` generations.
+    /// Roll the live file into `.1` when `incoming` bytes would not fit, keeping `LOG_BACKUPS`
+    /// generations.
+    ///
+    /// The check includes the line about to be written, not just what is already on disk: a
+    /// logger that only compared the current size would append a single oversized line to a file
+    /// that is still under the limit and leave it far above it until the *next* line arrived.
     ///
     /// Driven by the byte counter, not by a stat per line: the counter is seeded when the logger
     /// opens, and this single writer per path keeps it exact, so the check still fires for a file
     /// the previous run left oversized.
-    fn rotate_if_oversized(&self, guard: &mut Option<File>) {
-        if self.written.load(Ordering::Relaxed) <= self.limit {
+    fn rotate_before(&self, guard: &mut Option<File>, incoming: u64) {
+        let written = self.written.load(Ordering::Relaxed);
+        if written + incoming <= self.limit {
+            return;
+        }
+        // Rotating an empty file would only shuffle backups: the incoming line has to be written
+        // somewhere, and a fresh file is the one place it fits even when it is oversized itself.
+        if written == 0 {
             return;
         }
         // Drop the handle first: the next write reopens whatever ends up at `path`.

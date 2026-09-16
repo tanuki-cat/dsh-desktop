@@ -45,6 +45,13 @@ pub struct NodeFacts {
 /// with no timeout to fall back on. Measured cost of a successful probe is ~80 ms.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Budget for `$SHELL -lc "command -v …"`.
+///
+/// A fallback consulted only when the app environment and PATH did not resolve the executable.
+/// It gets its own constant rather than sharing [`PROBE_TIMEOUT`] because the two measure
+/// different things and only happen to land on the same number today.
+const SHELL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Probe node once (~80 ms) for the facts above.
 pub fn probe_node(node: &Path) -> Option<NodeFacts> {
     probe_node_within(node, PROBE_TIMEOUT)
@@ -204,12 +211,13 @@ pub fn version(loc: &DshLocation) -> Option<String> {
     if let Some(version) = version_of(&loc.dsh_js) {
         return Some(version);
     }
-    let out = Command::new(&loc.node)
-        .arg(&loc.dsh_js)
-        .arg("--version")
-        .output()
-        .ok()?;
-    parse_version_line(&String::from_utf8_lossy(&out.stdout))
+    // Bounded: this runs node on a user-installed tree, so a launcher that hangs must not park
+    // startup — the same reason `probe_version_line` below has a budget.
+    let line = crate::process::stdout_within(
+        Command::new(&loc.node).arg(&loc.dsh_js).arg("--version"),
+        PROBE_TIMEOUT,
+    )?;
+    parse_version_line(&line)
 }
 
 /// The version a `dsh --version` line carries, or `None` when it is not one.
@@ -489,11 +497,12 @@ fn login_shell_lookup(name: &str) -> Option<PathBuf> {
     #[cfg(not(windows))]
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let out = Command::new(shell)
-            .args(["-lc", &format!("command -v {name}")])
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        // A login shell sources the user's rc files: one that waits on a mount or a prompt
+        // would otherwise park startup here, before any timeout applies.
+        let text = crate::process::stdout_within(
+            Command::new(shell).args(["-lc", &format!("command -v {name}")]),
+            SHELL_LOOKUP_TIMEOUT,
+        )?;
         let p = PathBuf::from(text);
         p.is_file().then_some(p)
     }
