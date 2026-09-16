@@ -607,6 +607,10 @@ const ITERATOR_SHIM: &str = r#"
     });
   });
   defineHelper("reduce", function (reducer) {
+    // The index passed to the reducer counts ELEMENTS CONSUMED, not calls. With no initial
+    // value the first element becomes the accumulator without invoking the reducer, so the
+    // first call is for the second element and the index is 1 — not 0, which is what starting
+    // the counter at zero produced.
     var source = this, index = 0, accumulator, started = arguments.length > 1;
     if (started) accumulator = arguments[1];
     for (;;) {
@@ -615,6 +619,7 @@ const ITERATOR_SHIM: &str = r#"
       if (!started) {
         accumulator = step.value;
         started = true;
+        index = 1;
         continue;
       }
       accumulator = reducer(accumulator, step.value, index);
@@ -717,6 +722,19 @@ const MATH_SUM_PRECISE_SHIM: &str = r#"
       if (step.done) break;
       var value = Number(step.value);
       var next = sum + value;
+      // Compensated summation is only meaningful while the running total stays finite. Once it
+      // is not — an infinity in the input, or a sum that overflows to one — the correction term
+      // is NaN and NaN + anything is NaN, so the spec's Infinity answer came back as NaN. The
+      // remaining values are added plainly instead, which is what the spec's Infinity and NaN
+      // answers both come to.
+      if (!isFinite(next)) {
+        for (;;) {
+          step = iterator.next();
+          if (step.done) break;
+          next = next + Number(step.value);
+        }
+        return next;
+      }
       correction += Math.abs(sum) >= Math.abs(value) ? (sum - next) + value : (value - next) + sum;
       sum = next;
     }
@@ -731,7 +749,7 @@ const UINT8_FROM_BASE64_SHIM: &str = r#"
 (function () {
   if (typeof Uint8Array.fromBase64 === "function") return;
   Uint8Array.fromBase64 = function (value) {
-    var normalized = String(value).replace(/s/g, "").replace(/-/g, "+").replace(/_/g, "/");
+    var normalized = String(value).replace(/\s/g, "").replace(/-/g, "+").replace(/_/g, "/");
     var binary = atob(normalized);
     var bytes = new Uint8Array(binary.length);
     for (var index = 0; index < binary.length; index += 1) {
@@ -912,14 +930,22 @@ pub fn show_progress(app: &AppHandle, status: &str, detail: &str) {
 /// quit) the Harness window so that sentence is true — the splash only exits the app while no
 /// Harness window is left.
 fn present_status_page(app: &AppHandle) -> bool {
-    if let Some(harness_window) = app.get_webview_window(HARNESS) {
-        let _ = harness_window.destroy();
-    }
+    // The splash is created FIRST, and the Harness window destroyed after.
+    //
+    // `destroy` is asynchronous, and tauri-runtime-wry answers the resulting `Destroyed` event by
+    // removing the window from its table — when that table becomes empty it fires
+    // `RunEvent::ExitRequested`, which this shell answers with `shutdown()`. Destroying first
+    // therefore raced the new splash into the table: if the `Destroyed` event won, the app quit
+    // instead of showing the page that was being opened. Creating first keeps the table non-empty
+    // throughout, which is also the order `create_harness` uses.
     if app.get_webview_window(SPLASH).is_none() {
         if let Err(error) = create_splash(app) {
             harness::app_log(&format!("could not reopen the status window: {error}"));
             return false;
         }
+    }
+    if let Some(harness_window) = app.get_webview_window(HARNESS) {
+        let _ = harness_window.destroy();
     }
     true
 }
@@ -1180,6 +1206,9 @@ pub fn create_harness(
     port: u16,
     compat: Option<&str>,
 ) -> tauri::Result<()> {
+    // Remembered before the window exists: the crash-recovery path reloads this URL, and asking
+    // WebKit for the current one is exactly what failed.
+    remember_url(url);
     // `destroy` rather than `close`: close fires the window listeners (and the Harness window
     // ends the app on a user close), which must stay a user-only signal.
     if let Some(existing) = app.get_webview_window(HARNESS) {
@@ -1314,19 +1343,44 @@ pub fn recover_terminated_webview(webview: &Webview) {
     }
 }
 
-/// The URL a window is showing, falling back to the loopback root when WebKit cannot say.
+/// The URL the Harness window was last pointed at, for reloads WebKit cannot source itself.
+///
+/// Without it the fallback was `http://127.0.0.1/` — no port — which the navigation guard then
+/// classified as cross-origin and handed to the system browser, opening port 80 instead of the
+/// Harness. Set by `create_harness` on every successful load.
+static HARNESS_URL: Mutex<Option<Url>> = Mutex::new(None);
+
+/// The URL a window is showing, falling back to the one this shell last loaded.
 fn current_url(window: &WebviewWindow) -> Url {
     match window.url() {
         Ok(url) if url.scheme() == "http" => url,
         Ok(url) => {
-            harness::app_log(&format!("窗口当前地址不是 http（{url}），回到根路径"));
-            Url::parse("http://127.0.0.1/").expect("a literal URL parses")
+            harness::app_log(&format!(
+                "窗口当前地址不是 http（{url}），回到上次加载的地址"
+            ));
+            remembered_url()
         }
         Err(error) => {
-            harness::app_log(&format!("读取窗口地址失败（{error}），回到根路径"));
-            Url::parse("http://127.0.0.1/").expect("a literal URL parses")
+            harness::app_log(&format!("读取窗口地址失败（{error}），回到上次加载的地址"));
+            remembered_url()
         }
     }
+}
+
+/// The last URL this shell loaded, or the bare loopback root if it never loaded one.
+fn remembered_url() -> Url {
+    HARNESS_URL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .unwrap_or_else(|| Url::parse("http://127.0.0.1/").expect("a literal URL parses"))
+}
+
+/// Remember where the Harness is being served, so a later reload does not have to guess.
+fn remember_url(url: &Url) {
+    *HARNESS_URL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(url.clone());
 }
 
 /// Watch the Harness page for as long as the window exists.
@@ -1664,17 +1718,116 @@ pub fn open_external(target: &str) {
         return;
     }
 
-    #[cfg(target_os = "macos")]
-    let program = "open";
+    // Windows goes through `ShellExecuteW` rather than `cmd /C start`. `Command::arg` escapes for
+    // the MSVC convention, which `cmd.exe` does not follow: it parses `&`, `|`, `^` and `%` itself,
+    // and a URL is attacker-controlled text (it comes from model output and from pages the WebView
+    // fetched). WHATWG serialization leaves those characters in the path and query, so
+    // `https://evil.example/a&calc.exe` reached `cmd` as a command separator.
     #[cfg(target_os = "windows")]
-    let program = "cmd";
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let program = "xdg-open";
+    shell_execute(&url);
 
-    let mut command = std::process::Command::new(program);
-    #[cfg(target_os = "windows")]
-    command.args(["/C", "start", ""]);
-    let _ = command.arg(url.as_str()).spawn();
+    #[cfg(target_os = "macos")]
+    spawn_and_reap(std::process::Command::new("open").arg(url.as_str()));
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    spawn_and_reap(std::process::Command::new("xdg-open").arg(url.as_str()));
+}
+
+/// Start the browser helper and reap it, so it does not stay a zombie until the app exits.
+///
+/// `spawn()` alone leaves the child unreaped: the OS keeps its exit status and a process-table
+/// slot until someone waits, and this shell never does. Opening a link is not worth blocking the
+/// caller on, so the wait happens on a detached thread — the browser is already on its way by
+/// then, and the helper exits as soon as it has handed the URL over.
+#[cfg(unix)]
+fn spawn_and_reap(command: &mut std::process::Command) {
+    let Ok(mut child) = command.spawn() else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
+/// Hand a URL to the shell's default handler without a command interpreter in the way.
+///
+/// `ShellExecuteW` takes the URL as one string and never re-parses it, which is what makes it the
+/// safe route: there is no argument-quoting convention to get wrong. The verb is `open` and there
+/// is no working directory or parameter list.
+///
+/// It runs on a thread of its own. The documentation asks for COM to be initialised first — the
+/// handler behind a URL scheme may be a COM shell extension — and callers here include the startup
+/// thread, which never initialised it. A dedicated thread can set up its apartment without
+/// touching the caller's (the UI thread already has one), and a slow handler cannot hold up the
+/// navigation callback that asked.
+#[cfg(target_os = "windows")]
+fn shell_execute(url: &Url) {
+    use std::os::windows::ffi::OsStrExt;
+
+    const SW_SHOWNORMAL: i32 = 1;
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut core::ffi::c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> *mut core::ffi::c_void;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(reserved: *mut core::ffi::c_void, flags: u32) -> i32;
+        fn CoUninitialize();
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let url = url.clone();
+    std::thread::spawn(move || {
+        let operation = wide("open");
+        let file = wide(url.as_str());
+        // SAFETY: a fresh thread; S_OK and S_FALSE both require the matching uninitialise below,
+        // and a failure (negative HRESULT) requires none.
+        let com = unsafe {
+            CoInitializeEx(
+                std::ptr::null_mut(),
+                COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+            )
+        };
+        // SAFETY: both strings are NUL-terminated and outlive the call; the other pointers are
+        // documented as optional.
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if com >= 0 {
+            // SAFETY: paired with the successful `CoInitializeEx` on this thread.
+            unsafe { CoUninitialize() };
+        }
+        // A return value of 32 or less is a failure code; there is nothing to do about it beyond
+        // leaving the log line.
+        if result as isize <= 32 {
+            harness::app_log(&format!(
+                "ShellExecuteW failed ({}) for {url}",
+                result as isize
+            ));
+        }
+    });
 }
 
 #[cfg(test)]

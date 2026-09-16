@@ -213,6 +213,89 @@ fn the_probe_asks_about_every_shimmed_api_and_the_syntax_floor() {
     assert!(!script.contains("??"), "the probe must stay ES5");
 }
 
+/// Run a compat block through a real JS engine, as `tests/webkit_compat_shim.rs` does for the
+/// shipped bundle. Skipped where node is unavailable, like that integration test.
+fn run_shim(block: &str, probe: &str) -> Option<String> {
+    let script = format!("{block}\n{probe}\n");
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return Some(format!(
+            "node failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// `String(value).replace(/s/g, "")` deleted every letter `s` instead of whitespace, so a
+/// base64 document containing one decoded to the wrong bytes or threw outright. The block is run
+/// for real: a string assertion on the regex is what let this ship.
+#[test]
+fn the_base64_shim_decodes_whitespace_and_keeps_every_other_character() {
+    let probe = r#"
+      var out = [];
+      try { out.push(Array.from(Uint8Array.fromBase64("aGVsbG8=")).join(",")); } catch (e) { out.push("THREW"); }
+      try { out.push(Array.from(Uint8Array.fromBase64("aGVs\n bG8=")).join(",")); } catch (e) { out.push("THREW"); }
+      try { out.push(Array.from(Uint8Array.fromBase64("c3lzdGVt")).map(function (b) { return String.fromCharCode(b); }).join("")); } catch (e) { out.push("THREW"); }
+      process.stdout.write(out.join(" | "));
+    "#;
+    let Some(out) = run_shim(UINT8_FROM_BASE64_SHIM, probe) else {
+        return; // no node on this machine
+    };
+    // "hello" twice (once with embedded whitespace), then "system" — whose base64 contains an `s`.
+    assert_eq!(out, "104,101,108,108,111 | 104,101,108,108,111 | system");
+}
+
+/// The compensated sum turned an infinity into NaN: the correction term is NaN for a non-finite
+/// value, and NaN propagates. The spec asks for Infinity.
+#[test]
+fn the_sum_precise_shim_keeps_non_finite_results() {
+    let probe = r#"
+      process.stdout.write([
+        Math.sumPrecise([Infinity]),
+        Math.sumPrecise([1e308, 1e308]),
+        Math.sumPrecise([1, 2, 3]),
+        Math.sumPrecise([Infinity, -Infinity])
+      ].join(" | "));
+    "#;
+    let Some(out) = run_shim(MATH_SUM_PRECISE_SHIM, probe) else {
+        return;
+    };
+    assert_eq!(out, "Infinity | Infinity | 6 | NaN");
+}
+
+/// With no initial value the first element becomes the accumulator, so the reducer's index starts
+/// at 1 — the shim counted from 0 and handed callers a different index than the spec does.
+#[test]
+fn the_iterator_reduce_shim_numbers_the_first_call_one() {
+    let probe = [
+        "var seen = [];",
+        "[10, 20, 30].values().reduce(function (acc, v, i) { seen.push(i); return acc + v; });",
+        "process.stdout.write(seen.join(','));",
+    ]
+    .join("\n");
+    let script = format!(
+        "{}\n{probe}\n",
+        compat_script(&["Iterator.prototype.reduce".to_string()])
+    );
+    let Ok(output) = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        // The engine already ships `Iterator.prototype.reduce`: nothing to shim, nothing to check.
+        return;
+    }
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1,2");
+}
 /// Syntax the client bundles use that no polyfill can add: the module has to parse.
 ///
 /// `class static block` (Safari 16.4, macOS 13.3) is the newest syntax the bundles use, which is
