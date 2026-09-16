@@ -960,3 +960,133 @@ stdout/stderr、登录 shell 的输出）此前都是"读多少留多少"，而�
 **遗留（本轮未做，如实说明）**：`locator::probe_node_within` 与 `probe_version_line` 的读线程仍可能
 因孙进程持有管道而残留（它们已 `drop(reader)` 不阻塞，但线程本身不回收）；这两处只影响进程退出时的
 短暂残留，不影响启动路径的正确性。
+
+### 13.17 第五轮审查：24 项问题（2026-09-16）
+
+触发：[`dsh-desktop-b0d5405-code-review.md`](./dsh-desktop-b0d5405-code-review.md)（针对 `b0d5405`）。
+该文 24 项经核对**全部属实、无一项误报**，本轮全部处理；逐项状态与差异回写在该文 §9，
+这里只记实现与验证。
+
+**三个 P1**
+
+- **日志脱敏下标错位（安全）**。`redact_bearer` / `redact_field` 在循环里把 `rest`/`search` 往后切，
+  却用 `line[..at]` 判断"关键字是否在词首" —— `at` 是相对当前后缀的偏移，从第二次匹配起就错位。
+  两个后果：错位处恰好是字母数字时**第二个凭据不脱敏**；`at` 落在多字节字符中间时 `line[..at]`
+  **直接 panic**（实测 `错误：token 无效，请检查 token=xxx` 即崩）。修复：改用绝对偏移
+  `start + at`。panic 落在 `forward_lines` 读取线程时管道被关闭、落在 `app_log` 时 `APP_LOGGER` 锁被
+  毒化（此后每次 `app_log` 都 panic，退出流程再也停不掉 Harness），所以顺带把 `app_log` 改为**锁外
+  脱敏 + 容忍毒化**。同时补上 `Basic`/`Digest`/`Token` 方案 —— 它们把凭据放在同一个位置，此前整条
+  留在日志里。方案名只在字段名已证明是凭据时匹配，否则 `the token is expired` 会被改成 `the *** expired`。
+- **Windows 打开外链可注入命令（安全）**。原实现 `cmd /C start "" <url>`：`Command::arg` 按 MSVC
+  约定转义，而 `cmd.exe` 自己解析 `&`、`|`、`^`、`%`，WHATWG URL 序列化又不编码它们 ——
+  `https://evil.example/a&calc.exe` 里的 `&` 就是命令分隔符。URL 来自模型输出与抓取页面，属攻击者可控。
+  修复：FFI 调 `shell32!ShellExecuteW`，URL 作为一个字符串交给 shell 处理器，中间没有解释器。
+- **影子前缀首次更新失败后无法回滚**。打包版首更时影子前缀还是空的，`commit` 发现目标不存在
+  （`had_previous = false`）便没有产生备份；新树起不来时 `rollback` 因"回滚目录不存在"失败，记录被保留、
+  坏树留在原地，而 `update-check.json` 已记为最新版 —— **此后每次启动都失败**。修复：`SwapRecord` 增加
+  `had_previous`（`Option`，缺字段的旧记录按"有备份"处理，绝不因此删用户的安装），`rollback_with` 在
+  `Some(false)` 时把失败树移到 `.failed` 并视为回滚成功，种子重新生效。配套 #8 的失败标记，避免下一轮
+  立刻重装同一版本。
+
+**P2 的主要几类**
+
+- **外部进程的时间预算仍漏**。`stdout_within` 在子进程退出后无条件 `join` 读取线程，而管道会被子进程
+  留下的**孙进程**持有（登录 shell 的 rc 里 `cmd &` 起的 agent/daemon 就继承 stdout）—— 实测 1 秒预算
+  实际返回 4.01 秒，换成常驻进程则永久挂住。修复：新增 `process::output_within`，读线程**边读边发布**到
+  共享缓冲，调用方在子进程退出后用**有界** `recv_timeout` 收尾。修复后同一输入 176 ms 返回，且已读内容
+  不丢。`lsof`（并加 `-b`）、`ss`、`netstat`、`shellenv::capture`、两个 node 探测一并改走它，
+  非 UTF-8 输出也不再清空整次环境导入。
+- **更新流程提前停实例**。暂存写的是 `runtime/staging/…`，根本不碰在用的树，但停止步骤排在它前面：
+  一检测到新版本就杀掉本可复用的会话，暂存失败时白停一次，用户在没有 Harness 的状态下等下载。修复：
+  暂存移到停止之前，停止只发生在 3c/3d；3d 增加守卫 —— 外部实例被保留且其 CLI 树正是待替换的那棵时
+  放弃切换（否则 Windows rename 失败、Unix 上运行中的实例会在下次 `require()` 崩）。
+- **复用的旧实例没有看护**。复用分支只 `adopt` 就返回，而 `watch_harness` 需要 `Child::wait`；实例死掉后
+  自动恢复不触发，页面看护只问"帧有没有动"（服务端死了页面照画），窗口停在再也连不上的页面 —— 正是
+  自动恢复要解决的问题。修复：新增 `watch_reused` 轮询 pid，走同一套 `exit_action` 流程（拿不到退出码
+  按 `clean = false`）。
+- **profile 快照/模板复制不支持符号链接**。`DirEntry::file_type()` 不跟随链接，链接于是落进 `fs::copy`，
+  而 `fs::copy` 跟随：指向目录的链接直接报错，指向文件的被复制成普通文件（`node_modules/.bin/*` 因此
+  失效）。本机真实 profile 有 **163 个**这样的链接，所以开启 `auto_update_plugins` 时**每次启动都先停掉
+  实例再更新失败**。修复：新增 `transaction::copy_entry`，链接按链接复制（Windows 无权限时退回复制），
+  `restore_tree` 删旧链接时也不再跟随。实测 349 MB / 163 链接的真实 profile 快照成功。
+- **`-lc` 与 `-lic` 不一致**。`find_launcher` 对**每个**候选都先查一次 node，即使 `judge` 根本不需要；
+  而 `-lc` 不读 `.zshrc`（实测确认），nvm/fnm 用户在那里查不到。修复：node 查找改为惰性。
+- **`stage-runtime.sh` 把 pnpm store 生成进模板**。`cache` 默认是相对路径，而 `make-profile-template.sh`
+  先 `cd "$dest"` 再 `pnpm install --store-dir …`，pnpm 相对**项目目录**解析 —— store 落进
+  `profile-template/.runtime-cache/`，既进便携包又在首启播种时复制进用户 profile（Makefile 用了
+  `abspath` 所以不受影响，Windows 便携构建受影响）。修复：绝对路径 + 传入 tools 目录，
+  `check-runtime-stage.sh` 增加断言。
+- **`present_status_page` 先销毁窗口再重建**。`destroy` 是异步的，tauri-runtime-wry 处理 `Destroyed` 时
+  若窗口表变空会发 `RunEvent::ExitRequested`，而本壳在该事件上直接 `shutdown()`、从不 prevent ——
+  于是新 splash 与旧窗口的 `Destroyed` 抢时序，不利时"显示状态页"变成"直接退出"。修复：调换顺序，
+  先建 splash 再销毁，与 `create_harness` 一致。
+
+**其余（#4、#14–#24）**
+
+`Uint8Array.fromBase64` 的 `/s/g`（删掉所有小写 `s`，导致解码抛错或**静默返回错误字节**）改为 `\s`；
+`Math.sumPrecise` 的非有限值短路（`[Infinity]` 原本返回 `NaN`）、`Iterator#reduce` 无初值时下标从 1 起；
+`plugin_skip_reason` 改为无条件调用（`NotDeclared` 此前永不记录）并修掉文案里填错的两个参数；
+`takeover::Retry` 让"用户已取消"不再被重复追问；`HARNESS_URL` 让崩溃恢复的兜底 URL 带上端口；
+`spawn_and_reap` 收掉外链子进程的僵尸；`output_within` 与 `taskkill` 统一设 `CREATE_NO_WINDOW`；
+`netstat` 不再依赖会被本地化的 `LISTENING`；`parse_dsh_url` 的无前缀兜底只接受本次端口；
+`terminate` 在组长已退出时仍清理整个进程组（实测确认 `kill(-pgid)` 在组长退出后仍可达子进程）；
+`Cache::is_fresh` 的乘法改 `saturating_mul`；`SystemUpdates` 去掉与 `Config` 矛盾的 `#[default]`。
+
+**验证**：`cargo test` **174 passed / 0 failed**（本轮新增 19 项）、`cargo fmt --check` 通过、
+`cargo clippy --all-targets -- -D warnings` 在 **host 与 `x86_64-pc-windows-gnu` 两个目标上均 0 warning**、
+`scripts/check-runtime-stage.sh` 自检通过。三个 JS 兼容块在真实 node 引擎里跑通（此前只有字符串断言，
+这正是 `/s/g` 能发布出去的原因）。
+
+**自查**：本轮改动自身引入的两个问题由新增测试当场抓出并在提交前修正 —— `Math.sumPrecise` 的第一版
+修复只处理"输入非有限"，漏了"求和过程溢出"（`[1e308, 1e308]` 仍返回 `NaN`）。
+
+**遗留（未做实机）**：#13 未在真实窗口连续触发渲染进程崩溃验证（机制已在依赖源码核实，调换顺序无行为
+风险）；#2、#19 的 Windows 行为只经交叉编译与 lint，未实机点击构造过的链接。
+
+### 13.18 第五轮审查的复核与补修（2026-09-16）
+
+触发：对 §13.17 的复核，见 [`dsh-desktop-b0d5405-code-review.md`](./dsh-desktop-b0d5405-code-review.md) §10。
+复核结论推翻了 §13.17 里的三条说法，§13.17 原文保留，以本节为准：
+
+- "`takeover::Retry` 让「用户已取消」不再被重复追问"：**不成立**。当时 `confirm_takeover` 仍会弹出问题，`Retry::Declined` 只是在第二次拒绝后换了一句日志。
+- "3d 增加守卫……放弃切换"：**实际不生效**。守卫检查的是新端口，而唯一会保留外部实例的 `UseOtherPort` 分支已经把 `port` 改成了新端口。
+- "`-lc` 与 `-lic` 不一致……修复：node 查找改为惰性"：**只做了一半**。惰性查找只省下了登录 shell，查找本身仍然看不到 `.zshrc` 里加的 PATH。
+
+**本轮实现**
+
+- **重试不再重复询问。** `start()` 返回 `StartError { reason, declined }`。`take_over_handoff_and_start` 先用 `may_ask_after_failure(error, port, port_now)` 判断：用户在本次尝试里已经选过"取消"（`declined`），或选过"改用其它端口"（`port_now != port`），就直接报告失败。
+- **3d 切换守卫。**
+  - `UseOtherPort` 记下被保留实例的 pid，由 `swap_conflicts(target, target_exists, owned, command)` 判断冲突：
+    - 目标树不存在（打包版首更）：不冲突；
+    - 用户前缀：一律冲突，因为终端里的 `dsh` 经软链启动，命令行里看不出树的路径；
+    - 影子前缀：看命令行是否包含树的路径（插件市场交接重放的正是本壳的命令行），读不到也算冲突。
+  - 3c 之后端口又出现外部 Harness 的竞态也放弃切换。两种情况都**继续启动**，不再像之前那样 `return Ok(())` 后既不启动 Harness 也不给页面。
+- **核心更新失败退避。**
+  - `Cache.failures` 记录连续失败次数；`failure_window_secs` 为 5 × 4^(n−1) 分钟，封顶 24 小时。
+  - `carried_failure` 在重试窗口过后仍保留标记，7 天后遗忘。否则次数永远停在 1，退避不会增长。
+  - 暂存失败、提交失败、启动失败回滚、`recover_pending_swap` 回滚，这四处都写标记。
+  - 刚换上的树首次启动使用 `STARTUP_TIMEOUT_FIRST`。
+- **登录 shell 的 PATH 参与定位。**
+  - 解析运行时之前先汇合 `-lic` 环境采集，导入的 `PATH` 经 `resolve_runtime` 传给 `locator::system_node` / `system_dsh`。
+  - `locator::search` 先查 App 的 PATH，再查导入的 PATH；拿到导入的 PATH 时不再起 `-lc`，没导入时才用它兜底。
+  - `path_lookup_in` 忽略相对条目。
+  - 代价：环境采集（约 160 ms）从"与 npm 查询并行"改为在解析运行时之前汇合；换来的是有 nvm 的机器上省掉若干个 0.3–1 s 的登录 shell。
+- **插件更新先快照再停实例**，快照失败也写失败标记。
+- **修复自身引入的回归。**
+  - `recover_exited` 开头判断 `EXITING`，否则正常退出会被当成崩溃。
+  - `parse_netstat_listener` 按列判断 TCP、本地地址 `:{port}`、远端 `:0`，与语言无关，也不会误认出站连接。
+  - 组长已退出时，`clean_orphaned_group` 只在 Unix 上对 `-pgid` 发信号，不再按 pid 回退，避免 pid 被复用后误杀。
+  - `scheme_prefix_len` 原地比较字节（256 KiB 满字段行从 180 ms 降到约 2–3 ms）。
+  - Windows 上 `copy_entry` 的回退路径，相对链接目标改为按链接所在目录解析。
+  - `output_within` 记录是否读到 EOF；没读到或被截断时，用 `complete_lines` 丢掉残行，宽限改为 500 ms；`stdout_within` 遇到"截断后没有完整行"时返回 `None`。
+  - `ShellExecuteW` 在专用线程里调用，并配对初始化 COM。
+- **补上原审查漏掉的脱敏写法。** `locate_value` / `value_len` 识别 `key = value` 和 `"key": "value"`（含 `\"` 转义与 `'`）；带引号的值以配对的引号为界；没有闭合引号时退回无引号规则，并先跳过开头空白。
+- **`stage-runtime.sh` 生成模板时，把自带 node 放到 PATH 前面**，与 Makefile 一致。
+
+**验证**：
+
+- `cargo test` **185 passed**（新增 11 项），集成 6 项；`cargo fmt --check` 通过；本机与 `x86_64-pc-windows-gnu` 的 `clippy -D warnings` 均为 0 warning；`check-runtime-stage-test.sh` 通过。
+- 脱敏另做了 30 万条随机输入测试，0 次 panic。
+
+**遗留**：Windows 实机验证（#2、#19、N5、N7），以及 #13 的实机验证，与 §13.17 相同。
+

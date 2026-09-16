@@ -44,7 +44,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 
 - locator：解析 dsh 启动器、其真实 `lib/bin.js`（穿软链）、以及 node（GUI 启动没有 Homebrew PATH）
 - 启动：launcher flag 顺序、显式 cwd（agent workspace）、`--patch` overlay 强制 `printUrl`、独立进程组
-- 输出：持续读 stdout/stderr、**凭据脱敏**写日志（launch token、`Bearer`、`api_key`、`Cookie`/`Set-Cookie`、`password`、`secret` 等，见下）、5MB × 3 份轮转（**计入即将写入的字节**）、环缓冲 200 行 / 1 MiB 用于错误页。每行只脱敏一次；**单行上限 256 KiB**，超限继续排空到换行但不扩张内存；非法 UTF-8 字节不会中断后续行（两者见下）
+- 输出：持续读 stdout/stderr、**凭据脱敏**写日志（launch token、`Bearer`、`api_key`、`Cookie`/`Set-Cookie`、`password`、`secret` 等，含 JSON 与带引号的写法，见下）、5MB × 3 份轮转（**计入即将写入的字节**）、环缓冲 200 行 / 1 MiB 用于错误页。每行只脱敏一次；**单行上限 256 KiB**，超限继续排空到换行但不扩张内存；非法 UTF-8 字节不会中断后续行（两者见下）
 - URL：解析首个 token（对 `(LAN: ...)` 后缀健壮）、首启 90s / 常态 30s 超时
 - 实例：固定端口；探测 → 复用自己上次的实例 / 接管外部 Harness / 占用时错误页
 - 生命周期：退出即 SIGTERM 进程组（5s 后 SIGKILL）并删除 state.json —— 关闭窗口（`RunEvent::ExitRequested`）
@@ -85,7 +85,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   `plugin update available: dshmarket 1.45.1 -> 1.46.1, installing`、`plugin updated: dshmarket 1.45.1 -> 1.46.1`，
   随后 harness 重启并正常服务；profile 的依赖范围被改写为 `^1.46.1`、`node_modules` 内实装 1.46.1，
   且 `plugin-check.json` 与核心的 `update-check.json` 各自独立（时间戳与内容互不影响）。
-- 离线测试：`cargo test` **155 passed**，另有 **6 个集成用例**（在真实 node 引擎里跑兼容层与探测脚本）。单测覆盖：URL 解析含 LAN 后缀、凭据脱敏（`Bearer`/`api_key`/`Cookie` 等）、状态文件往返、locator 软链解析与
+- 离线测试：`cargo test` **185 passed**，另有 **6 个集成用例**（在真实 node 引擎里跑兼容层与探测脚本）。单测覆盖：URL 解析含 LAN 后缀、凭据脱敏（`Bearer`/`api_key`/`Cookie` 等）、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
   缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口与跨窗口都不重复安装"、npm PATH 前缀、端口探针超时（沉默对端与持续发送对端两类）、
   package.json 版本解析、部分/损坏 config.json 处理、workspace / dsh_path 回退不改文件、HOME 缺失不回落 `/`、
@@ -101,7 +101,14 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   一次坏探测只观察、连续两次才重载、重载预算用尽即报告、后台窗口不算故障、探测脚本保持 ES5 且一次只排一帧）、
   外部输出的内存边界（单行超 256 KiB 截断且其后仍继续读、非法 UTF-8 字节不再中断整个流、空行不算流结束、
   CRLF 剥 `\r`、环缓冲字节预算、环缓冲只存已脱敏内容、单条巨型日志不越轮转上限、空日志不为一条超限行轮转、
-  子进程管道有界且仍被读空、`ps` 三种答复（超时/无输出/有父进程）的分类不混淆））；
+  子进程管道有界且仍被读空、`ps` 三种答复（超时/无输出/有父进程）的分类不混淆、
+  同一行多个凭据全部脱敏且中文/emoji 前缀不 panic、散文与 `tokenizer` 不被误脱敏、`Basic`/`Digest` 方案、
+  首更无备份仍可回滚且旧记录不误删、组长已退出仍清理进程组、孙进程持有管道时按时返回、
+  符号链接快照与恢复（含真实 profile）、`fromBase64`/`sumPrecise`/`reduce` 在真实 node 引擎里跑通、
+  JSON / 带引号的值 / `key = value` 脱敏且截断行不漏、满字段长行的脱敏保持线性、`netstat` 只认监听行
+  （出站连接与 UDP 不算、状态词本地化无影响）、同一版本连续失败时重试间隔递增、进程被杀后的回滚也记失败、
+  登录 shell 的 PATH 参与定位、重启不重复询问已回答的问题、被保留实例只阻止它可能在用的那棵树的切换、
+  未读完的输出丢掉残行））；
 - 兼容层在真实 JS 引擎里跑通（2026-09-15）：`webkit_compat_shim` 集成测试把清单里的 8 个 API 先删掉
   （`Symbol.dispose` 在 node 里不可删、已在测试里注明），注入后用断言跑行为 —— pdf.js 那条
   `Iterator.prototype.join` guard 不再抛、`Iterator.from(...).map(...).filter(...).toArray()` 链式可用、
@@ -143,7 +150,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 | `make doctor` | 检查工具链与平台依赖 | Linux 用 `pkg-config` 查 `webkit2gtk-4.1` / `gtk+-3.0` / `libsoup-3.0` 并给出 Debian/Fedora/Arch 安装命令；macOS 提示装 Xcode CLT |
 | `make check` | `cargo check --all-targets` | 与 CI 口径一致 |
 | `make fmt` / `make fmt-check` / `make clippy` | 格式化 / 只检查格式（CI 门禁用，不改工作区）/ lint（`clippy -D warnings`） | |
-| `make test` | `make test-scripts` ＋ 离线单元测试（当前 **155** 个）＋ 在真实 JS 引擎里跑兼容层的集成测试 | 不联网；只有兼容层那个集成测试需要 PATH 上有 `node`（没有就跳过） |
+| `make test` | `make test-scripts` ＋ 离线单元测试（当前 **185** 个）＋ 在真实 JS 引擎里跑兼容层的集成测试 | 不联网；只有兼容层那个集成测试需要 PATH 上有 `node`（没有就跳过） |
 | `make test-scripts` | `scripts/` 自检：用假目录验证 staging 闸门本身仍然会失败 | 纯 shell，不依赖构建产物；`make test` 会先跑它 |
 | `make test-live` | 联网集成测试（全部） | 自动设 `DSH_DESKTOP_LIVE_TESTS=1`：查真实 registry、对比冷/热缓存耗时，并在「PATH 里没有 node」的模拟 GUI 环境下验证 npm 仍可运行 |
 | `make dev` | 运行 debug 版 | 等价 `cargo run --manifest-path src-tauri/Cargo.toml` |
@@ -319,7 +326,9 @@ Windows 上用 `icacls` 去掉继承并只授权当前用户 —— `config.json
 **日志脱敏范围**：`token=` 只是第一个。凡是经过日志行的内容都会把下列字段的值替换为 `***` ——
 `token`、`api_key`/`apikey`/`api-key`、`authorization`（含 `Bearer <凭据>`）、`cookie`/`set-cookie`、
 `password`/`passwd`、`secret`、`private_key`、`access_key`、`session_id`。provider 报错常把请求头原样回显，
-这条覆盖的是那种情况。**不含** workspace 路径等隐私信息：日志要能定位问题，路径是其中一部分，
+这条覆盖的是那种情况。识别的写法有 `KEY=value`、`key: value`、`key = value`，以及 JSON / JS 对象 /
+Python dict 里的 `"key": "value"`（含转义成 `\"` 的 JSON 字符串）；带引号的值以配对的引号为界，
+`Authorization: Basic|Digest|Token <凭据>` 保留方案名、替换其后的凭据。**不含** workspace 路径等隐私信息：日志要能定位问题，路径是其中一部分，
 需要更少留存时请自行清理 `<app-data>/logs/`。
 macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.desktop/`。
 
@@ -332,8 +341,11 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 **做法**：启动时执行一次登录 shell 的环境导入（`$SHELL -lic env`，超时 8 s，失败则回退 `-lc` 或跳过），
 把结果合并进 harness 子进程的环境：
 
-- 实测开销 **约 160 ms**（在版本读取/更新检查的同一时间段内并行执行，基本不占启动关键路径），
+- 实测开销 **约 160 ms**（与上次更新的回滚检查并行执行，在解析运行时之前汇合），
   取到约 46 个变量，输出 0 行噪音；
+- 导入的 `PATH` 也用来**定位你自己装的 node / dsh**：nvm、fnm 在 `.zshrc` 里初始化，只有 `-lic`
+  读得到它，单独的 `$SHELL -lc 'command -v …'` 看不见。拿到导入的 PATH 后就不再额外起登录 shell 查找；
+- 输出没读完（后台进程一直占着管道）或超过上限时，**丢掉最后一行不完整的内容**，不导入被截断的值；
 - **它会执行你的 `.zprofile`/`.zshrc`**：这两个文件里若有联网、改文件、拉起后台进程或耗时操作，
   每次启动应用都会连带发生。8 秒超时只能让壳不再等它，**不能撤销已经发生的副作用**。
   不想这样就设 `"import_shell_env": false`，改用下面的 `env` 字段显式给出需要的变量；
@@ -397,34 +409,48 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
    （fetch 超时压到 **8 s**，且整个 npm 子进程有**进程级超时** —— `--fetch-timeout` 只管单次请求，
    代理挂起、锁等待、生命周期脚本都可能让 npm 永远不返回；超时后连同其子进程一起清理）；
 2. 与已安装版本做 semver 比较（`rc.2 > rc.1 > alpha.2`，正式版高于同号预发布版），**从不降级**；
-3. **先把正在使用这棵 CLI 树的实例停掉**：npm 是原地重写依赖树，而 node 按需懒加载模块 ——
-   树被换走后运行中的 harness 下一次 `require()` 会直接 `MODULE_NOT_FOUND`（实测）。所以先 SIGTERM 停实例、
-   等端口释放，再安装；不能停时（用户在面板里选择保留该外部实例、或拿不到 PID）**跳过本次更新**并记日志，
-   实例不受任何影响；
-4. **装进暂存目录，不碰正在用的那棵树**：有新版则
+3. **先装进暂存目录，不碰正在用的那棵树**：有新版则
    `npm install -g --no-fund --no-audit --cache <app-data>/runtime/npm-cache --prefix <app-data>/runtime/staging/staging-<版本>/prefix @deepseek-ai/dsh@<解析出的具体版本>`；
    npm 取自 node 同目录；`runtime/{prefix,tools,npm-cache,staging,rollback,profile-backup}` 在启动时幂等创建。
-   暂存目录每次尝试前清空 —— 上一次留下的半棵树绝不能被当成这一次的成果；
-5. 所有 npm 子进程都在 PATH 最前面插入 npm 所在目录：npm 是 `#!/usr/bin/env node` 脚本，
+   暂存目录每次尝试前清空 —— 上一次留下的半棵树绝不能被当成这一次的成果。
+   **这一步不停止任何实例**：它写的是 `runtime/staging/…`，在用的树原封不动，所以下载的 300 秒里
+   用户仍有一个能用的 Harness，registry 半途失败也不会有任何损失；
+4. 所有 npm 子进程都在 PATH 最前面插入 npm 所在目录：npm 是 `#!/usr/bin/env node` 脚本，
    而 GUI 启动的壳只有 launchd 的 PATH（不含 node），不这样处理会直接 `exit 127`（详见设计文档 §13.8）；
-6. **校验暂存树**：包名必须是 `@deepseek-ai/dsh`、版本必须是请求的那个、入口脚本 `lib/bin.js` 必须存在。
+5. **校验暂存树**：包名必须是 `@deepseek-ai/dsh`、版本必须是请求的那个、入口脚本 `lib/bin.js` 必须存在。
    任一条不满足就放弃本次更新并记日志 —— registry 给了别的版本、下载被截断、npm 忽略了 `--prefix`，
    都在这里变成一条日志，而不是一棵坏掉的树；
-7. **原子切换**：把活动树 `rename` 到 `runtime/rollback/<版本>`（last-known-good，保留 2 代），
+6. **原子切换**：把活动树 `rename` 到 `runtime/rollback/<版本>`（last-known-good，保留 2 代），
    再把暂存树 `rename` 到活动位置。切换**之前**先写 `runtime/update-swap.json` 记录这次切换，
    它要等新版本真的打印出启动 URL 才被删掉；
-8. 切换推迟到**确定要启动**的那一刻：这中间还可能因为端口被占、外部实例不接管、版本超出测试区间而
-   根本不启动 Harness，为一次不会发生的启动做切换只会给下次启动留一条要回滚的记录；
-9. 新版本起不来（等启动 URL 超时）→ **立即回滚**并把原因写进错误页；进程在切换与确认之间被强杀 →
+7. 切换推迟到**确定要启动**的那一刻：这中间还可能因为端口被占、外部实例不接管、版本超出测试区间而
+   根本不启动 Harness，为一次不会发生的启动做切换只会给下次启动留一条要回滚的记录。
+   **停止实例也发生在这里**（不在第 3 步）：npm 是原地重写依赖树，而 node 按需懒加载模块 ——
+   树被换走后运行中的 harness 下一次 `require()` 会直接 `MODULE_NOT_FOUND`（实测），所以切换前先
+   SIGTERM 停实例、等端口释放；不能停时（用户在面板里选择保留该外部实例、或拿不到 PID）**跳过本次
+   切换**并记日志。用户在面板里选「保留它，改用其它端口」时，若被保留的实例可能在用待替换的那棵树，
+   也放弃切换（本次启动照常进行）—— 否则 Windows 上 rename 会失败、Unix 上那个实例会在下次 `require()` 崩。
+   判定：待替换的树还不存在（打包版首更）→ 不冲突；用户自己的安装前缀（`system_updates: install`）→ 一律视为
+   冲突（终端里的 `dsh` 经软链启动，命令行里看不出树的路径）；本壳的影子前缀 → 看该实例的命令行是否含
+   这棵树的路径，读不到按冲突处理。检测之后端口上又冒出外部 Harness 时同样放弃切换，交给后续启动的报错路径；
+8. 新版本起不来（等启动 URL 超时）→ **立即回滚**并把原因写进错误页；进程在切换与确认之间被强杀 →
    下次启动读到 `update-swap.json` 就先把旧树放回，再去解析运行时（否则会挑中同一棵起不来的树、
    以同样的方式再失败一次）。失败的那棵树改名为 `<name>.failed` 留在旁边，作为排查证据；
-10. 只有**确实没变**（npm 装到了别处）才记那条日志，并把这次尝试写进缓存（`attempted`），
+9. 只有**确实没变**（npm 装到了别处）才记那条日志，并把这次尝试写进缓存（`attempted`），
     **同一缓存窗口内不再重复安装**（否则每次启动都会先停掉 Harness 再重建一棵约 289 MB 的依赖树）；
-11. 刚更新过 → 强制重启实例（否则复用旧进程仍跑旧二进制）。
+10. 刚更新过 → 强制重启实例（否则复用旧进程仍跑旧二进制）。
 
 结果写入日志：`dsh is up to date` / `update available: A -> B` / `update staged: A -> B（校验通过，待切换）` /
 `dsh updated: A -> B` / `update staged but not committed, keeping vA` / `update failed, keeping vA` /
-`vB 未能启动，已回滚到上一棵树` / `update A was already attempted and changed nothing; not installing again`。
+`vB 未能启动，已回滚到上一棵树` / `update A was already attempted and changed nothing; not installing again` /
+`update B failed to start last time; not retrying yet (the wait grows with each failure)`（失败标记，见下）。
+
+**失败会被记住**：暂存失败、提交失败、以及"切换后起不来而回滚"（包括进程在切换与确认之间被强杀、下次启动
+才回滚的情况），都会把该版本写进 `update-check.json` 的 `failed` 并累计 `failures`。首次失败后 5 分钟内不再重试，同一版本每再失败一次，
+等待时间乘 4（5 → 20 → 80 → 320 分钟），最长 24 小时；换了新版本就从头计数，标记在最后一次失败 7 天后遗忘。
+没有这一步，一个起不来的版本会变成每次启动都重新下载约 290 MB、切换、等超时、再回滚的循环。
+刚切换上的新树首次启动按**首启的 90 s** 等待启动 URL：新版本第一次启动可能要迁移 profile 或重建缓存，
+按常态的 30 s 判失败会把一次只是慢的更新回滚掉。
 
 **回滚点与磁盘占用**：`runtime/rollback/` 最多保留 2 代 CLI 树，`runtime/profile-backup/` 最多保留 2 份
 profile 快照（都是**上限**：一次更新只产生一份，两次指向同一版本时会覆盖）。常见情况是活动树 + 1 份回滚树
@@ -438,10 +464,10 @@ profile 快照（都是**上限**：一次更新只产生一份，两次指向�
   `<app-data>/plugin-check.json`，与核心的 `update-check.json` 互不干扰；
 - 只在该 profile 的 `package.json` **声明了** `dshmarket` 时才动手（你自己删掉的插件不会被装回来），
   比较的是 `node_modules/dshmarket/package.json` 里的**实际安装版本**，不是范围；
-- 有新版时：**先停实例**（pnpm 原地重写 profile 的 `node_modules`，运行中的 harness 下次 lazy require 会崩）
-  → **先把 profile 快照到 `<app-data>/runtime/profile-backup/<版本>/`**（跳过 `data/`、`.dsh-market/`：
-  凭据、会话状态与市场日志在 Harness 运行期间一直在写，恢复旧值回去是第二个、更糟的故障）
-  → `dsh plugin --profile web add dshmarket@<版本>`（CLI 自己转发 pnpm，属于你的 profile 文件会被改写）
+- 有新版时：**先把 profile 快照到 `<app-data>/runtime/profile-backup/<版本>/`**（只读依赖树，实例照常服务；
+  跳过 `data/`、`.dsh-market/`：凭据、会话状态与市场日志在 Harness 运行期间一直在写，恢复旧值回去是第二个、
+  更糟的故障；符号链接按链接复制）→ **再停实例**（pnpm 原地重写 profile 的 `node_modules`，运行中的 harness
+  下次 lazy require 会崩）→ `dsh plugin --profile web add dshmarket@<版本>`（CLI 自己转发 pnpm，属于你的 profile 文件会被改写）
   → 回读版本 → 本轮重启实例让新插件生效；
 - **安装失败就把快照放回**：pnpm 可能在失败前已经改写了 `node_modules`，而半棵插件树不是下次启动能自愈的。
   恢复只动快照里有的条目，因此安装期间 Harness 写下的实时状态不受影响。拿不到快照时**不做本次安装** ——
@@ -450,8 +476,8 @@ profile 快照（都是**上限**：一次更新只产生一份，两次指向�
   随包的 `<seed>/tools/bin` → 登录 shell 的 PATH），pnpm 就装在随包的 `tools` 前缀里 ——
   Finder 启动的应用继承的是 launchd 的 PATH，本来找不到它；
 - 动手前先解析 pnpm：解析不到就只记一条 `PATH 上没有 pnpm，跳过插件市场更新`，**不会先把实例停掉
-  再失败**；真正安装失败（网络、registry、pnpm 自身出错）只抑制 **5 分钟**，之后自动重试 —— 瞬时故障
-  不该把某个版本钉死；
+  再失败**；快照失败或安装失败（网络、registry、pnpm 自身出错）首次只抑制 **5 分钟**，之后自动重试 ——
+  瞬时故障不该把某个版本钉死；同一版本反复失败时间隔递增（与核心相同，最长 24 小时）；
 - **首启播种 profile 模板的那一轮不查插件市场**：模板已经钉住一个版本，首启不该产生联网下载，
   从下一次启动起照常检查；
 - 装了但版本没变（pnpm 写到了别处）只记日志，并把这次尝试写进缓存，同一版本不重复装；
@@ -460,7 +486,8 @@ profile 快照（都是**上限**：一次更新只产生一份，两次指向�
 **排障**：手工修好 npm 全局前缀（或换安装方式）后，壳在出现更高版本前不会再尝试安装 —— 日志里那句
 `already attempted and changed nothing` 是唯一线索，复位就是删掉对应的缓存文件：核心是
 `<app-data>/update-check.json`，插件市场是 `<app-data>/plugin-check.json`（两者各存各的，互不影响）。
-安装**失败**（`failed to install last time`）则是另一回事：只抑制 5 分钟，之后自动重试，不用手工复位。
+安装**失败**（`failed to install last time`）则是另一回事：先抑制 5 分钟，同一版本再失败则间隔递增（最长
+24 小时），到期自动重试，不用手工复位；想立刻重试就删掉对应的缓存文件。
 
 ## 启动耗时与性能
 
@@ -468,10 +495,10 @@ profile 快照（都是**上限**：一次更新只产生一份，两次指向�
 
 | 环节 | 实测 | 说明 |
 |---|---|---|
-| 定位 dsh/node | < 5 ms | 沿 PATH 逐目录做文件存在性检查（19 个目录的等价 shell 循环实测 4 ms）；只有找不到时才兜底起登录 shell（~160 ms） |
+| 定位 dsh/node | < 5 ms | 沿 App 的 PATH、再沿导入的登录 shell PATH 逐目录做文件存在性检查（19 个目录的等价 shell 循环实测 4 ms）；只有没导入环境时才兜底起登录 shell（~160 ms，装了 nvm 时可达 1 s） |
 | 版本读取 | **~1 ms** | 读 CLI 所属 `package.json` 的 `version`；读不到才回退 `node dsh.js --version`（约 80 ms） |
 | 更新检查（缓存命中） | **0 ms** | 60 分钟内沿用 `<app-data>/update-check.json`；冷查询约 1.2–1.9 s |
-| 登录 shell 环境抓取 | ~160 ms | 与上面两步并行执行，join 后才组装子进程环境 |
+| 登录 shell 环境抓取 | ~160 ms | 与上次更新的回滚检查并行执行，解析运行时之前汇合（定位要用它的 PATH） |
 | 端口探针 | ~12 ms | 整个交换共用一个 600 ms deadline（每次读前按剩余时间重设），沉默与持续发送的对端都不会挂住它 |
 | 启动 harness 到拿到 URL | 1–4 s | 由 `dsh web` 自身决定，首启（初始化 profile）更久，超时 90 s / 30 s |
 
