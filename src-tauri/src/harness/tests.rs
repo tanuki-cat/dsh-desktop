@@ -204,6 +204,63 @@ fn probe_gives_up_on_a_silent_listener() {
     let _ = silent.join();
 }
 
+/// The case the silent-peer test above does not cover, and the one that used to hang for ever.
+///
+/// A socket timeout bounds a single `read` call. A peer that puts a byte inside every window
+/// therefore makes `read` return `Ok` indefinitely: reading to EOF never finishes and the buffer
+/// grows without limit. Any streaming endpoint on the port is enough (SSE, a log tail, a long
+/// poll), and the takeover and update paths *poll* this probe inside a loop they budget in
+/// seconds — so a bound that never fires turns a five-second wait into an unbounded one.
+#[test]
+fn probe_gives_up_on_a_listener_that_keeps_sending() {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let stop_w = stop.clone();
+    let sent_w = sent.clone();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        // A plausible answer that is not the fence, then an endless stream after it.
+        if stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+            .is_err()
+        {
+            return;
+        }
+        while !stop_w.load(Ordering::SeqCst) {
+            if stream.write_all(&[b'x'; 4 * 1024]).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            sent_w.fetch_add(4 * 1024, Ordering::SeqCst);
+            // Comfortably inside PROBE_TIMEOUT, which is exactly what defeats a per-call
+            // timeout and what the budget for the whole exchange is there to survive.
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let verdict = probe(port);
+    let elapsed = started.elapsed();
+    stop.store(true, Ordering::SeqCst);
+
+    assert_eq!(verdict, Probe::Other, "a 200 is not a Harness");
+    // The status line settles the verdict, so there is nothing left to wait for.
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "probe waited on a peer that never stops sending: {elapsed:?}"
+    );
+    assert!(
+        sent.load(Ordering::SeqCst) <= 8 * 1024,
+        "probe kept reading after the verdict was already settled"
+    );
+}
+
 #[test]
 fn redacts_token() {
     let out = redact("dsh web: http://127.0.0.1:1/?token=abcdef (LAN: x)");

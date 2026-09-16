@@ -9,7 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 
 pub const URL_PREFIX: &str = "dsh web:";
@@ -219,6 +219,37 @@ pub enum Probe {
 /// must not be able to park the startup thread forever.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(600);
 
+/// How much of a response the probe keeps before giving up on it.
+///
+/// The real fence is one short status line plus a 68-byte sentence. This cap is for a peer
+/// that answers and then keeps sending: `PROBE_TIMEOUT` bounds the time, this
+/// bounds the memory.
+const PROBE_RESPONSE_LIMIT: usize = 64 * 1024;
+
+/// The sentence only the CLI auth fence carries: the one thing that identifies a Harness.
+const AUTH_FENCE: &str = "dsh web authentication required";
+
+/// Point the stream IO timeouts at whatever is left of `deadline`.
+///
+/// Returns false once the budget is gone, and that is what actually stops a peer which keeps
+/// sending: a socket timeout applies to a single `read` call, so a peer that puts one
+/// byte inside every window makes `read` return `Ok` for ever. Re-arming before each
+/// call turns the per-call timeout into a budget for the whole exchange.
+fn arm_within(stream: &TcpStream, deadline: Instant) -> bool {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return false;
+    }
+    let _ = stream.set_read_timeout(Some(left));
+    let _ = stream.set_write_timeout(Some(left));
+    true
+}
+
+/// Is this status line the 401 both readings of the fence depend on?
+fn is_unauthorized(status: &str) -> bool {
+    status.starts_with("HTTP/1.1 401") || status.starts_with("HTTP/1.0 401")
+}
+
 /// Dependency-free HTTP probe over loopback: the auth fence is the only thing that identifies a
 /// Harness.
 ///
@@ -236,27 +267,47 @@ pub fn probe(port: u16) -> Probe {
         Ok(s) => s,
         Err(_) => return Probe::Closed,
     };
-    // Connect timeouts do not cover the exchange: without these the read below can block
-    // until the peer decides to answer, which it may never do.
-    let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(PROBE_TIMEOUT));
+    // The connect timeout does not cover the exchange, so the exchange gets a deadline of
+    // its own, re-armed before every read (see `arm_within`).
+    let deadline = Instant::now() + PROBE_TIMEOUT;
     let request = format!(
         "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: dsh-desktop\r\nConnection: close\r\n\r\n"
     );
-    if stream.write_all(request.as_bytes()).is_err() {
+    if !arm_within(&stream, deadline) || stream.write_all(request.as_bytes()).is_err() {
         return Probe::Other;
     }
-    let mut body = String::new();
-    let _ = stream.read_to_string(&mut body);
-    if body.starts_with("HTTP/1.1 401") || body.starts_with("HTTP/1.0 401") {
-        if body.contains("dsh web authentication required") {
-            Probe::Harness
-        } else {
-            Probe::Other
+    let mut response: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        if let Some(answer) = read_verdict(&response) {
+            return answer;
         }
-    } else {
-        Probe::Other
+        if response.len() >= PROBE_RESPONSE_LIMIT || !arm_within(&stream, deadline) {
+            break;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
     }
+    read_verdict(&response).unwrap_or(Probe::Other)
+}
+
+/// The verdict the bytes so far already support, or `None` while the fence could still
+/// arrive.
+///
+/// A status line that is not the `401` ends the exchange: `Connection: close` means a
+/// server that answered anything else has said all it is going to, and waiting for it to
+/// hang up only spends the budget it is holding.
+fn read_verdict(response: &[u8]) -> Option<Probe> {
+    let end = response.iter().position(|byte| *byte == b'\n')?;
+    let status = String::from_utf8_lossy(&response[..end]);
+    if !is_unauthorized(&status) {
+        return Some(Probe::Other);
+    }
+    let body = String::from_utf8_lossy(&response[end..]);
+    body.contains(AUTH_FENCE).then_some(Probe::Harness)
 }
 
 /// Does this command line name the `dsh web` server the CLI boots?

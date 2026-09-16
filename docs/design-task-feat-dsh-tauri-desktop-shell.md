@@ -534,6 +534,15 @@ npm registry**。实测各环节：
   会无限等待，而接管循环的 deadline 只在两次 probe 之间检查，启动线程就此卡死且无取消路径。
 - 修复：抽出 `PROBE_TIMEOUT = 600 ms`，建连、读、写都用它；新增回归测试
   `probe_gives_up_on_a_silent_listener`（起一个只 accept 不说话的监听器，断言 1 s 内返回 `Probe::Other`）。
+- **修补（2026-09-16）：上面这版只挡住了沉默的对端，会说话的对端仍能永久挂死。** socket 超时约束的是
+  单次 `read` 调用，不是整个交换；`read_to_string` 会一直循环到 EOF，所以对端只要在每个窗口内送一个字节，
+  `read` 就永远返回 `Ok`，既不返回也不超时，`body` 还无上限增长。端口上是任何流式服务
+  （SSE / 日志跟随 / 长轮询）即可触发，而 `probe()` 正是接管与更新路径在循环里轮询的东西 ——
+  它们以秒计的 deadline 因此永不生效，实测 8 s 后仍未返回。
+  修复：整个交换用一个 wall-clock deadline（每次 `read` 前按剩余时间重设 IO 超时），响应体加上
+  `PROBE_RESPONSE_LIMIT` 上限，并按块读 —— 状态行一到就判定，非 401 立即返回（`Connection: close` 下
+  这一行就是全部答案）。回归测试 `probe_gives_up_on_a_listener_that_keeps_sending` 补上这一类对端：
+  静默对端的用例抓不到它。
 
 **P2：启动路径上的两处开销**
 
