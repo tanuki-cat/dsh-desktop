@@ -23,7 +23,7 @@
 与第 10 项的**更新事务与回滚**（原「未做」）。两者各有独立设计文档：
 [`design-task-feat-takeover-confirmation.md`](./design-task-feat-takeover-confirmation.md)、
 [`design-task-feat-update-transaction.md`](./design-task-feat-update-transaction.md)。
-当前库内单测 **141 passed / 0 failed**（v0.4.1 轮为 116），集成用例 5 → 6 项，`cargo fmt --check` 通过，
+当前库内单测 **142 passed / 0 failed**（v0.4.1 轮为 116），集成用例 5 → 6 项，`cargo fmt --check` 通过，
 `cargo clippy --all-targets` 0 warning。
 
 独立验证：`cargo test` **116 passed / 0 failed**（单测；另有 5 个集成用例在真实 node 引擎里跑。原 102）、
@@ -373,8 +373,8 @@ CLI 自己拥有，无法先在别处装好再切换 —— 因此可逆性靠**
 与第 9 项的关系：进程级超时（已修）保证**不会永久挂起**，但不保证**中途失败后目录仍可用** —— 两者互补，
 不能互相替代。
 
-验证：`cargo test` **141 passed / 0 failed**（库内单测 116 → 141：新增 `transaction.rs` 11 项、更新事务相关
-`lib.rs` 4 项、接管确认 `lib.rs` 6 项与 `window.rs` 2 项，并删掉 1 项被取代的 `installed_cli` 用例；
+验证：`cargo test` **142 passed / 0 failed**（库内单测 116 → 142：新增 `transaction.rs` 11 项、更新事务相关
+`lib.rs` 4 项、接管确认 `lib.rs` 9 项与 `window.rs` 3 项，并删掉 1 项被取代的 `installed_cli` 用例；
 集成用例 5 → 6 项）；
 另用真实的 `npm install -g --prefix` 装 `@deepseek-ai/dsh@0.1.5-rc.2` 确认了暂存布局与校验函数的前提
 （`OK: staged @deepseek-ai/dsh 0.1.5-rc.2`，298 MB，冷缓存 3m18s）。**未做**：真实切换 + 启动失败回滚的

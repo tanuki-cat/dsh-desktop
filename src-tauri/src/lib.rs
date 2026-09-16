@@ -1642,6 +1642,13 @@ fn elide_command(command: &str) -> String {
 /// would *do* — end that session and restart under this shell's workspace — and only then shows
 /// the process as evidence. The order matters on a small window, where the bottom of this text is
 /// the part that scrolls out of sight.
+///
+/// The line about old tabs is measured, not assumed (2026-09-16): after a kill and a restart on
+/// the same port, the cookie the *previous* instance issued is still accepted, because the
+/// signing key is stable per `DSH_HOME` and the authority did not change. A tampered cookie is
+/// rejected, so that acceptance is real verification and not a permissive fence. Change the
+/// `DSH_HOME` and the same cookie is answered `401` — hence the second half of that line, which
+/// says what to do instead of promising that every tab keeps working.
 fn takeover_question(
     port: u16,
     pid: u32,
@@ -1652,6 +1659,9 @@ fn takeover_question(
         "端口 127.0.0.1:{port} 上已有一个不是本应用启动的 Harness。\n\n\
          接管会先终止该进程 —— 它当前的会话、正在执行的 agent 任务、浏览器里已打开的页面都会断开 ——\
          然后用本应用的 workspace 重新启动：\n{}\n\n\
+         浏览器里指向这个端口的旧标签页不用手动关：刷新就会连到重启后的实例。\
+         若显示 authentication required，说明那个实例用的是另一个 dsh_home，\
+         需要在启动它的终端里重新打开它打印的 URL。\n\n\
          要接管的进程: pid {pid}\n\
          命令行: {}\n\n\
          不接管则用系统浏览器打开那个实例，本应用退出。",
@@ -3538,6 +3548,19 @@ mod tests {
         // left out, so the user knows what the shell does not know.
         let (_, blind) = takeover_question(3080, 7, None, Path::new("/tmp"));
         assert!(blind.contains("读不到命令行"), "{blind}");
+    }
+
+    /// The question has to answer the user's next question about their open browser tab, and it
+    /// has to answer it correctly: the old cookie survives a restart on the same authority when
+    /// `DSH_HOME` is unchanged (measured, see the doc comment), and is refused when it is not.
+    #[test]
+    fn the_question_says_what_happens_to_an_open_browser_tab() {
+        let (_, detail) = takeover_question(3080, 4242, None, Path::new("/tmp"));
+        assert!(detail.contains("旧标签页不用手动关"), "{detail}");
+        assert!(detail.contains("刷新就会连到重启后的实例"), "{detail}");
+        // The exception, which is the case where the advice above would be wrong.
+        assert!(detail.contains("authentication required"), "{detail}");
+        assert!(detail.contains("dsh_home"), "{detail}");
     }
 
     /// An unanswered question falls back to exactly what the config asked for, so a headless or

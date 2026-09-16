@@ -324,7 +324,7 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 |---|---|
 | 端口无监听 | 定位 dsh/node（**逐个候选校验身份**，见配置表末行）→ 启动 → 等 URL → 打开窗口。状态页写明用的是哪棵树：`dsh 0.1.5-rc.2 · system /opt/homebrew/lib/node_modules/… · 端口 3080` |
 | 端口上是本应用上次启动的实例（state.json 对得上且存活） | 直接复用（cookie 对同一 authority 仍有效，实测跨重启有效） |
-| 端口上是**别人**启动的 Harness（CLI / Automator） | 先做两道身份校验（401 特征 + 该 PID 命令行像 `dsh web`，`plugin` 子命令不算）；都通过就**弹面板询问**（与 `take_over_existing` 无关，那一项只决定 120 秒无答复时怎么办）：**接管**（对该 PID 发 SIGTERM，只发单进程不碰它的进程组 → 等端口释放 → 自启拿新 token）／**保留并用系统浏览器打开**（本应用退出，页面**不带**重启按钮）／**保留并换端口**（本应用改用配置端口之上的第一个空闲端口启动，对方不受影响；仅当找到空闲端口时出现）／**什么都不做退出**。面板写明对方 pid、完整命令行、端口，以及**接管后会改用本应用配置的 workspace**（不会继续对方的工作目录） |
+| 端口上是**别人**启动的 Harness（CLI / Automator） | 先做两道身份校验（401 特征 + 该 PID 命令行像 `dsh web`，`plugin` 子命令不算）；都通过就**弹面板询问**（与 `take_over_existing` 无关，那一项只决定 120 秒无答复时怎么办）：**接管**（对该 PID 发 SIGTERM，只发单进程不碰它的进程组 → 等端口释放 → 自启拿新 token）／**保留并用系统浏览器打开**（本应用退出，页面**不带**重启按钮）／**保留并换端口**（本应用改用配置端口之上的第一个空闲端口启动，对方不受影响；仅当找到空闲端口时出现）／**什么都不做退出**。面板写明对方 pid、完整命令行、端口，以及**接管后会改用本应用配置的 workspace**（不会继续对方的工作目录）；并说明**浏览器里那个旧标签页不用手动关**（刷新就会连到重启后的实例 —— cookie 的签名密钥对同一 `dsh_home` 稳定，实测接管后旧 cookie 仍返回 200），唯一的例外是那个实例用了另一个 `dsh_home`，此时会看到 `authentication required`，需在启动它的终端里重新打开它打印的 URL |
 | 启动前发现新版 dsh | 先升级 CLI（splash 显示进度），随后重启实例跑新版本。用户自己装的那棵树默认**只提示不升级**（`system_updates: notify`）；新版本若超出已测试区间，在 `require_tested_dsh` 默认开启时**不安装**（装了也会被拒绝启动） |
 | 启动前发现新版插件市场 | 先停实例 → `dsh plugin --profile web add dshmarket@<版本>` → 重启实例。默认**不做**（`auto_update_plugins: false`），设为 `true` 才开启 |
 | WebView 缺可补的 API（如 `Iterator`） | 向 harness 窗口注入兼容层（ES5、逐块自守卫、只装缺的那些）后照常开原生窗口，日志记 `WebView 缺少 …：已注入兼容层`；`webkit_compat: false` 时改成"未注入"并走浏览器 |

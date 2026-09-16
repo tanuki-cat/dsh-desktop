@@ -119,6 +119,22 @@ the status page`）。判断抽成 `terminal_page(&ForeignAction)` 以便单测�
 以及浏览器需要已有该 authority 的登录 cookie —— 否则会看到 `authentication required`（实测无 cookie
 访问根路径就是 401 栅栏）。
 
+**旧标签页也写进文案**（2026-09-16，实测后补）：选了接管之后，浏览器里那个指向本端口的标签页会怎样，
+是用户下一句一定会问的事 —— 原先只写「都会断开」，等于把问题留在那里。实测结论是**不用手动关**：
+
+| 接管后对这个标签页的请求 | 结果 |
+| --- | --- |
+| 旧 cookie（接管**前**签发）→ 新实例根路径 | **200** |
+| 旧 cookie 改一个字符 | 401 |
+| 随便编的 cookie | 401 |
+| 旧 token URL，不带 cookie | 401 |
+| 旧 token URL + 旧 cookie | 303 → / → 200 |
+| `DSH_HOME` 换成另一个后的同一个旧 cookie | 401 |
+
+签名密钥对**同一个 `DSH_HOME` 稳定**，authority（`127.0.0.1:3080`）也没变，所以接管前后签发的 cookie
+互相认；篡改一个字符立刻 401，说明这个 200 是真的校验通过，不是栅栏放松了。因此文案写「刷新就会连到
+重启后的实例」，并把唯一的例外（`dsh_home` 不同 → 401）连同处理办法一起写出来。
+
 ### 3.4 布局：小窗口里的取舍
 
 实机截图暴露两处渲染缺陷，都不是逻辑问题，而是「内容比窗口高」时 CSS 的行为：
@@ -141,7 +157,7 @@ the status page`）。判断抽成 `terminal_page(&ForeignAction)` 以便单测�
 
 ## 4. 验证
 
-新增单测 11 项（`lib.rs` 8 项 + `window.rs` 3 项），集成测试 5 → 6 项。库内单测合计 116 → 141，
+新增单测 12 项（`lib.rs` 9 项 + `window.rs` 3 项），集成测试 5 → 6 项。库内单测合计 116 → 142，
 其中 14 项属于更新事务（见另一文档）：
 
 - `an_identified_foreign_instance_is_always_asked_about`：身份矩阵，识别出来就问、**与配置项无关**；
@@ -155,6 +171,8 @@ the status page`）。判断抽成 `terminal_page(&ForeignAction)` 以便单测�
   `Refuse` / `TakeOver` → `Failure`（有按钮）；
 - `a_long_command_line_is_elided_around_its_middle`：短命令行原样、长命令行首尾保留且长度受限；
 - `the_question_leads_with_what_takeover_would_do`：后果段落在证据段落之前，workspace 也在其之前；
+- `the_question_says_what_happens_to_an_open_browser_tab`：文案含「旧标签页不用手动关／刷新就连到新实例」
+  与例外「authentication required + dsh_home」；
 - `the_question_gets_a_window_and_a_layout_that_fit_it`：提问窗口高于普通窗口、页面用 `margin: auto`
   而非 flex 居中、提问态详情框有上限、空详情框隐藏。**负向验证**：把 flex 居中改回去，测试立刻以
   「flex 居中会裁掉溢出内容」失败 —— 正是实机截图里的现象；
@@ -180,7 +198,7 @@ the status page`）。判断抽成 `terminal_page(&ForeignAction)` 以便单测�
 命令行）。前三张正常，第四张暴露出「最后一个按钮被挤出可视区」，于是有了详情框上限与文案重排。
 截图也确认了修复前那种「转圈与标题被顶出可视区、说明从中间断掉」的现象不再出现。
 
-门禁：`cargo test` **141 passed / 0 failed**、`cargo fmt --check` 通过、`cargo clippy --all-targets`
+门禁：`cargo test` **142 passed / 0 failed**、`cargo fmt --check` 通过、`cargo clippy --all-targets`
 0 warning。产物冒烟：`make bundle` 后确认 `.app` 里含换端口选项与新的浏览器回退文案。
 
 **实机复现（2026-09-16，用户报告 → 已确认）**：默认配置下，端口上有别人启动的 `dsh web` 时启动桌面端，
