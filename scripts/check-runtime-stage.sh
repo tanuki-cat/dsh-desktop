@@ -87,6 +87,18 @@ else
   echo "  [ok]   无绝对符号链接"
 fi
 
+# pnpm 的 store 属于构建缓存，不属于模板：它既会进便携包，又会在首启播种时被复制进用户的
+# profile。stage-runtime.sh 曾把相对路径交给 pnpm，而 pnpm 相对**项目目录**解析它，于是 store
+# 落在 profile-template/.runtime-cache 里（review #12）。
+stray_store=$(find "$root/profile-template" -maxdepth 3 \( -name .runtime-cache -o -name pnpm-store \) 2>/dev/null || true)
+if [ -n "$stray_store" ]; then
+  echo "profile 模板里混进了 pnpm store（会被打进包并播种进用户 profile）：" >&2
+  echo "$stray_store" >&2
+  fail=1
+else
+  echo "  [ok]   模板内无 pnpm store"
+fi
+
 # macOS：quarantine xattr 会被原样复制进 .app，触发 Gatekeeper
 if command -v xattr >/dev/null 2>&1; then
   quarantined=$(xattr -r "$root" 2>/dev/null | grep -c quarantine || true)

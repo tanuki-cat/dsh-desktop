@@ -93,8 +93,24 @@ echo "安装 pnpm $pnpm_version 到 tools"
   --cache "$cache/npm" --no-fund --no-audit --loglevel=error "pnpm@$pnpm_version"
 
 echo "生成 profile 模板（含插件市场 dshmarket@${market_version}）"
-PNPM_STORE_DIR="$cache/pnpm-store" sh "$here/make-profile-template.sh" \
-  "$out/profile-template" "$market_version"
+# `cache` defaults to the RELATIVE `.runtime-cache`, and make-profile-template.sh runs
+# `pnpm install` from inside `$dest`. pnpm resolves a relative --store-dir against the project
+# directory, so the store landed in `profile-template/.runtime-cache/pnpm-store`: shipped in the
+# portable bundle, copied into the user profile on first seed, and never cached by CI (which
+# caches the real `.runtime-cache`). Absolute, like the Makefile already passes.
+mkdir -p "$cache"
+store_dir="$(cd "$cache" && pwd)/pnpm-store"
+# The tools prefix holds the pnpm this script just installed; passing it keeps the template on
+# the same pnpm the bundle ships instead of whatever happens to be on PATH. npm puts the shim
+# in the prefix root on Windows and in `bin/` elsewhere, and make-profile-template.sh accepts
+# either as long as it can execute it.
+tools_bin="$out/tools/bin"
+[ -x "$tools_bin/pnpm" ] || tools_bin="$out/tools"
+# pnpm is a `#!/usr/bin/env node` script: put the bundled node first, as the Makefile does, so the
+# template is built by the node that ships rather than whatever happens to be on PATH.
+node_dir=$(cd "$(dirname "$node_bin")" && pwd)
+PATH="$node_dir:$PATH" PNPM_STORE_DIR="$store_dir" sh "$here/make-profile-template.sh" \
+  "$out/profile-template" "$market_version" "$tools_bin"
 
 if command -v xattr >/dev/null 2>&1; then
   xattr -cr "$out" 2>/dev/null || true
