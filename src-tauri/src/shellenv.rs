@@ -9,13 +9,16 @@
 //! Values are never logged: callers log names only.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 /// Give a slow rc file some room, but never stall startup on it.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Bytes kept from the `env` dump. Measured at ~46 variables / a few KB; the cap only stops a
+/// shell that prints a whole document instead of its environment.
+const ENV_LIMIT: usize = 1024 * 1024;
 
 /// The shell must not dictate these: the app owns them, or they are session-local noise.
 const RESERVED: &[&str] = &[
@@ -105,40 +108,27 @@ pub fn import(shell: &Path) -> Option<(String, BTreeMap<String, String>)> {
 }
 
 fn capture(shell: &Path, flag: &str) -> Option<String> {
-    let mut child = Command::new(shell)
-        .args([flag, "env"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buffer = String::new();
-        let _ = stdout.read_to_string(&mut buffer);
-        buffer
-    });
-
-    let deadline = Instant::now() + CAPTURE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = reader.join().ok()?;
-                return if status.success() { Some(output) } else { None };
-            }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(40)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                // Dropped, not joined: a grandchild the shell left behind still holds the write
-                // end of the pipe, and joining would wait on it for ever — the unbounded wait
-                // this budget exists to remove.
-                drop(reader);
-                return None;
-            }
-        }
+    // `output_within` rather than a local reader loop: it bounds the wait for a finished child's
+    // pipe (a background process the rc file started inherits stdout and would otherwise hold
+    // `join` open indefinitely), caps the bytes, and decodes lossily — `read_to_string` returned
+    // `Err` without writing anything when any variable held a non-UTF-8 byte, which emptied the
+    // whole import and lost the very API key it exists to carry.
+    let out = crate::process::output_within(
+        Command::new(shell).args([flag, "env"]),
+        CAPTURE_TIMEOUT,
+        ENV_LIMIT,
+    )?;
+    if out.truncated {
+        // Names only, like every other line about the environment: the partial line is already
+        // gone, so nothing cut mid-value (an API key) is imported.
+        crate::harness::app_log(&format!(
+            "{} {flag} 的环境输出不完整（管道未关闭或超出上限），只导入完整的行",
+            shell.display()
+        ));
     }
+    out.status
+        .filter(|status| status.success())
+        .map(|_| out.text)
 }
 #[cfg(test)]
 mod tests;
