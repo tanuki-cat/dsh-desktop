@@ -192,7 +192,30 @@ pub fn commit(target: &Path, staged: &Path, backup: &Path) -> Result<(), String>
 /// the restored one instead of being deleted: it is the only evidence of what went wrong, and
 /// the next update attempt overwrites it anyway.
 pub fn rollback(target: &Path, backup: &Path) -> Result<(), String> {
+    rollback_with(target, backup, None)
+}
+
+/// [`rollback`] with the swap record's knowledge of whether a backup was ever written.
+///
+/// `had_previous == Some(false)` is the bundled first update: the tree being replaced had no
+/// predecessor, so there is nothing to restore and the failed tree is simply moved aside. The
+/// seed inside the app takes over again, which is the correct "previous version".
+pub fn rollback_with(
+    target: &Path,
+    backup: &Path,
+    had_previous: Option<bool>,
+) -> Result<(), String> {
     if !backup.exists() {
+        if had_previous == Some(false) {
+            // Nothing to put back: discard the tree that failed to boot so the seed is used
+            // again. Kept as `.failed` like any other rollback, for the same diagnostic reason.
+            if target.exists() {
+                let failed = failed_path(target);
+                let _ = std::fs::remove_dir_all(&failed);
+                move_path(target, &failed)?;
+            }
+            return Ok(());
+        }
         return Err(format!("回滚目录 {} 不存在", backup.display()));
     }
     let failed = failed_path(target);
@@ -272,6 +295,18 @@ pub struct SwapRecord {
     pub backup: String,
     pub version: String,
     pub at: u64,
+    /// Whether there was a previous tree to move to `backup` at all.
+    ///
+    /// False on the first update of a bundled install: the CLI then runs from the read-only seed
+    /// inside the app and the shadow prefix is still empty, so `commit` has nothing to move and
+    /// `backup` never comes into existence. A rollback must delete the failed tree rather than
+    /// look for a backup that was never written — otherwise the bad tree stays in place, the
+    /// record is kept "for the next launch", and every launch from then on fails the same way.
+    ///
+    /// `Option` so records written before this field existed still parse; `None` means "assume
+    /// there was one", which keeps the old behaviour of refusing to delete a user's install.
+    #[serde(default)]
+    pub had_previous: Option<bool>,
 }
 
 pub fn read_swap(path: &Path) -> Option<SwapRecord> {
@@ -311,12 +346,9 @@ pub fn snapshot_tree(from: &Path, to: &Path, skip: &[&str]) -> Result<(), String
         if skip.iter().any(|skip| name == std::ffi::OsStr::new(skip)) {
             continue;
         }
-        let target = to.join(&name);
-        let result = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            copy_tree(&entry.path(), &target)
-        } else {
-            std::fs::copy(entry.path(), &target).map(|_| ())
-        };
+        // `copy_entry`, not `is_dir` + `fs::copy`: a symlink is neither, and following one is
+        // what made a real profile unsnapshottable.
+        let result = copy_entry(&entry.path(), &to.join(&name));
         if let Err(error) = result {
             return Err(format!("无法快照 {}: {error}", entry.path().display()));
         }
@@ -346,7 +378,12 @@ pub fn restore_tree(from: &Path, to: &Path, skip: &[&str]) -> Result<(), String>
             continue;
         }
         let path = entry.path();
-        let removed = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        // A symlink to a directory is removed with `remove_file`: `remove_dir_all` would
+        // follow it and delete the target's contents.
+        let is_link = std::fs::symlink_metadata(&path)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        let removed = if !is_link && path.is_dir() {
             std::fs::remove_dir_all(&path)
         } else {
             std::fs::remove_file(&path)
@@ -356,14 +393,68 @@ pub fn restore_tree(from: &Path, to: &Path, skip: &[&str]) -> Result<(), String>
     for name in snapshot {
         let source = from.join(&name);
         let target = to.join(&name);
-        let result = if source.is_dir() {
-            copy_tree(&source, &target)
-        } else {
-            std::fs::copy(&source, &target).map(|_| ())
-        };
-        result.map_err(|error| format!("无法恢复 {}: {error}", target.display()))?;
+        copy_entry(&source, &target)
+            .map_err(|error| format!("无法恢复 {}: {error}", target.display()))?;
     }
     Ok(())
+}
+
+/// Copy one entry, preserving a symlink as a symlink.
+///
+/// `DirEntry::file_type` does not follow links, so a link is neither `is_dir` nor a regular file,
+/// and `fs::copy` on one follows it: a link to a directory fails outright ("neither a regular
+/// file nor a symlink to a regular file"), and a link to a file is materialised as a real copy.
+/// A profile is full of both — pnpm puts every dependency under `.dsh-module-fallback/` as a link
+/// into `node_modules/`, and `.bin/*` are links to files — so a snapshot of a real profile failed
+/// on the first directory link and left the plugin install with no rollback.
+pub(crate) fn copy_entry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(from)?;
+    if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(from)?;
+        // A relative target is relative to the directory holding the link, not to this process.
+        let base = from.parent().unwrap_or_else(|| Path::new(""));
+        return symlink(&target, &base.join(&target), to);
+    }
+    if meta.is_dir() {
+        return copy_tree(from, to);
+    }
+    std::fs::copy(from, to).map(|_| ())
+}
+
+/// Create a symlink to `target` at `to`, replacing whatever is already there.
+///
+/// `target` is written verbatim, so a relative link stays relative. `resolved` is the same target
+/// seen from the link's own directory, for the one place the target has to be inspected.
+#[cfg(unix)]
+fn symlink(target: &Path, _resolved: &Path, to: &Path) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(to);
+    let _ = std::fs::remove_dir_all(to);
+    std::os::unix::fs::symlink(target, to)
+}
+
+/// Windows needs a privilege for a file symlink and a different call for a directory one.
+///
+/// Falling back to a real copy keeps the snapshot usable when the privilege is absent (a normal
+/// user without Developer Mode); the tree then still restores, it just stops sharing inodes.
+///
+/// `resolved` is what the link points at, joined to the link's directory: canonicalising the bare
+/// `target` resolved a relative link against this process's working directory instead, so the
+/// fallback copied an unrelated file or failed.
+#[cfg(windows)]
+fn symlink(target: &Path, resolved: &Path, to: &Path) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(to);
+    let _ = std::fs::remove_dir_all(to);
+    let resolved = std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
+    let created = if resolved.is_dir() {
+        std::os::windows::fs::symlink_dir(target, to)
+    } else {
+        std::os::windows::fs::symlink_file(target, to)
+    };
+    match created {
+        Ok(()) => Ok(()),
+        Err(_) if resolved.is_dir() => copy_tree(&resolved, to),
+        Err(_) => std::fs::copy(&resolved, to).map(|_| ()),
+    }
 }
 
 /// Recursive copy into a path that does not exist yet.
@@ -371,12 +462,7 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
-        let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)?;
-        }
+        copy_entry(&entry.path(), &to.join(entry.file_name()))?;
     }
     Ok(())
 }

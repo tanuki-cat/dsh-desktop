@@ -73,16 +73,18 @@ impl Preference {
 }
 
 /// `system_updates` in config.json: what a newer core means for a CLI we do not own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+///
+/// The default is [`SystemUpdates::Notify`], and it is deliberately *not* the `#[derive(Default)]`
+/// variant: `Config` selects it through `default_system_updates()`, so a `#[default]` here would
+/// be a second, contradicting answer that nothing consults. A tree the user installed is not
+/// ours to rewrite behind their back (§2.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SystemUpdates {
-    /// Upgrade the user's installation in place — the behaviour from before the bundled
-    /// runtime existed. The default: silently losing auto-upgrade would be a functional
-    /// regression for everyone already running this shell.
-    #[default]
+    /// Upgrade the user's installation in place. Opt-in: `npm install -g` changes a global
+    /// prefix other tools on the machine also use.
     Install,
-    /// Report the new version and leave the tree alone (§2.4: never rewrite a prefix the
-    /// shell does not own).
+    /// Report the new version and leave the tree alone. What `Config` defaults to.
     Notify,
 }
 

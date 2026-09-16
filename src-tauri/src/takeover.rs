@@ -17,7 +17,13 @@ pub(crate) enum ForeignAction {
     /// Leave it running and open it in the system browser instead.
     UseBrowser,
     /// Leave it running and explain why this shell cannot use the port.
-    Refuse { reason: String },
+    Refuse {
+        reason: String,
+        /// True when the user answered the question with "cancel". The distinction matters to
+        /// a retry: an explicit refusal is final for this restart, while an unproven identity
+        /// or a held port is a state the user may have just fixed.
+        declined: bool,
+    },
     /// A Harness this shell can identify. The caller puts the question and turns the answer back
     /// into one of the other arms.
     Ask { pid: u32 },
@@ -43,6 +49,7 @@ pub(crate) fn foreign_instance_action(owner: Option<u32>, command: Option<&str>)
         (_, false) => ForeignAction::Refuse {
             reason: "端口上有进程按 Harness 协议应答，但无法确认它就是 dsh web（读不到命令行，或命令行不像 dsh）。为避免误杀其它程序，本应用不会接管它。请先手动停止该进程，或在 config.json 里换一个端口。"
                 .to_string(),
+            declined: false,
         },
         // Identified: ask, because stopping it kills a session someone may be watching and
         // restarts the instance under a different workspace.
@@ -52,6 +59,7 @@ pub(crate) fn foreign_instance_action(owner: Option<u32>, command: Option<&str>)
         (None, true) => ForeignAction::Refuse {
             reason: "端口上的 Harness 无法定位到具体进程（lsof 不可用）。请先手动停止它。"
                 .to_string(),
+            declined: false,
         },
     }
 }
@@ -214,6 +222,7 @@ pub(crate) fn resolve_foreign_action(
             reason: format!(
                 "已按你的选择保留端口 {port} 上的 Harness（pid {pid}），本应用没有接管它。"
             ),
+            declined: true,
         },
         // Unanswered, or an id this build no longer offers: the config decides.
         _ => unanswered_choice(config.take_over_existing, pid),
@@ -233,16 +242,28 @@ fn unanswered_choice(allow: bool, pid: u32) -> ForeignAction {
     }
 }
 
+/// What a restart should do about the instance now holding the port.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Retry {
+    /// The user let this shell signal it: stop it and try once more.
+    TakeOver,
+    /// The user said no. The answer is already given — asking again during the retry would put
+    /// the same question twice for one restart, which is what it looked like from the outside.
+    Declined,
+    /// Nobody was asked, or the answer was not permission: report the original failure.
+    Refused,
+}
+
 /// The same question for a Harness that appeared during a handoff or a restart.
 ///
-/// Returns whether the caller may signal it. An unanswered question follows `config.json`, and
-/// "use another port" is *not* permission to signal: that instance is exactly what the user asked
-/// the shell to keep.
-pub(crate) fn confirm_takeover(app: &AppHandle, config: &Config, port: u16, pid: u32) -> bool {
-    matches!(
-        resolve_foreign_action(app, config, port, ForeignAction::Ask { pid }),
-        ForeignAction::TakeOver { .. }
-    )
+/// An unanswered question follows `config.json`, and "use another port" is *not* permission to
+/// signal: that instance is exactly what the user asked the shell to keep.
+pub(crate) fn confirm_takeover(app: &AppHandle, config: &Config, port: u16, pid: u32) -> Retry {
+    match resolve_foreign_action(app, config, port, ForeignAction::Ask { pid }) {
+        ForeignAction::TakeOver { .. } => Retry::TakeOver,
+        ForeignAction::Refuse { declined: true, .. } => Retry::Declined,
+        _ => Retry::Refused,
+    }
 }
 
 /// The pid serving `port` as a Harness, when one is.

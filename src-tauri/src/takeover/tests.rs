@@ -48,7 +48,8 @@ fn leaving_the_instance_alone_does_not_offer_a_restart() {
     // A refusal is something the user can act on and retry in place, so the button stays.
     assert_eq!(
         terminal_page(&ForeignAction::Refuse {
-            reason: "port held".to_string()
+            reason: "port held".to_string(),
+            declined: false,
         }),
         TerminalPage::Failure
     );

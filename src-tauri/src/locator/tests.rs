@@ -4,6 +4,8 @@
 //! private items.
 
 use super::*;
+#[cfg(unix)]
+use std::time::Instant;
 
 /// The probe runs on whatever node this machine has; on a machine without node it is
 /// simply skipped (`None` is a valid answer the caller must handle).
@@ -145,7 +147,7 @@ fn an_unidentified_launcher_is_used_only_when_it_answers_with_a_version() {
 /// a tree that names this package — that is the invariant the field report broke.
 #[test]
 fn whatever_the_search_returns_is_really_this_cli() {
-    let Some(entry) = system_dsh(None) else {
+    let Some(entry) = system_dsh(None, None) else {
         eprintln!("skipped: no dsh resolvable on this machine");
         return;
     };
@@ -166,7 +168,7 @@ fn whatever_the_search_returns_is_really_this_cli() {
         // Nothing identified: the search only returns such a candidate after `--version`
         // answered with a version, so re-judging it now has to land in the same category.
         Ok(None) => {
-            let node = find_node_without_env(&entry);
+            let node = find_node_without_env(&entry, None);
             let probed = probe_version_line(node.as_deref(), &entry);
             match judge(&entry, |_| probed.clone()) {
                 Candidate::Unidentified(version) => {
@@ -249,4 +251,37 @@ fn resolves_real_js_behind_symlink() {
     let loc = locate(Some(link.clone()), None).unwrap();
     assert_eq!(loc.dsh_js, std::fs::canonicalize(&js).unwrap());
     assert!(loc.node.is_file());
+}
+
+/// The login shell's PATH is searched even when the app's own PATH has nothing: that is how a
+/// Finder-launched app finds an nvm/fnm node, which only `.zshrc` puts on PATH.
+#[cfg(unix)]
+#[test]
+fn the_imported_login_path_is_searched() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join("dsh-desktop-imported-path-test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let tool = dir.join("bin").join("dsh-desktop-only-here");
+    std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let shell_path = format!("relative/bin:{}", dir.join("bin").display());
+    assert_eq!(
+        search("dsh-desktop-only-here", Some(&shell_path)),
+        Some(tool.clone())
+    );
+    assert_eq!(
+        path_lookup_in("dsh-desktop-only-here", OsStr::new("relative/bin")),
+        None,
+        "a relative PATH entry is not searched"
+    );
+    // With an imported PATH in hand, a miss is a miss: no login shell is started for it.
+    let started = std::time::Instant::now();
+    assert_eq!(
+        search("dsh-desktop-no-such-tool", Some("/nonexistent")),
+        None
+    );
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    let _ = std::fs::remove_dir_all(&dir);
 }

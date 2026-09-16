@@ -183,8 +183,34 @@ pub const PACKAGE: &str = "@deepseek-ai/dsh";
 /// installed CLI quickly instead of stalling startup for npm's default timeout.
 pub const FETCH_TIMEOUT_MS: u32 = 8_000;
 
-/// A failed query is retried after this many minutes even inside the normal interval.
+/// A failed query is retried after this many minutes even inside the normal interval. Also the
+/// first retry window of a failed install; repeated failures of the same version wait longer
+/// (see [`failure_window_secs`]).
 pub const FAILED_RETRY_MINUTES: u64 = 5;
+
+/// The longest a repeatedly failing version is kept from being retried.
+const FAILED_RETRY_CAP_MINUTES: u64 = 24 * 60;
+
+/// How long a failure marker is remembered after its retry window has passed.
+///
+/// Longer than the window on purpose: the count of failures has to survive the retry it allowed, or
+/// every retry would start again from the shortest wait — which is how a version that can never
+/// boot got downloaded, swapped in and rolled back every five minutes. A week later the slate is
+/// clean, so an environment problem that has since been fixed is not held against the version.
+const FAILED_MEMORY_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Seconds a failure marker suppresses another attempt, given how often that version has failed.
+///
+/// Five minutes after the first failure — most failures are a registry hiccup or a locked profile —
+/// then four times longer for every repeat, up to a day. `0` is a marker written before the count
+/// existed and reads as one failure.
+pub fn failure_window_secs(failures: u32) -> u64 {
+    let repeats = failures.saturating_sub(1).min(8);
+    FAILED_RETRY_MINUTES
+        .saturating_mul(4u64.saturating_pow(repeats))
+        .min(FAILED_RETRY_CAP_MINUTES)
+        * 60
+}
 
 /// CLI versions this shell has actually been built and tested against. The shell drives the CLI
 /// through `--profile web --patch … --no-open --port N` and parses its `dsh web:` line, so a
@@ -707,6 +733,9 @@ pub struct Cache {
     pub failed: Option<String>,
     #[serde(default)]
     pub failed_at: u64,
+    /// How many times in a row `failed` has failed; sets the retry window.
+    #[serde(default)]
+    pub failures: u32,
 }
 
 impl Cache {
@@ -723,7 +752,9 @@ impl Cache {
         if ttl_minutes == 0 {
             return false;
         }
-        now.saturating_sub(self.checked_at) < ttl_minutes * 60
+        // Saturating: `update_check_interval_minutes` comes from config.json, and a large value
+        // would otherwise overflow — a panic in a debug build, a wrap in a release one.
+        now.saturating_sub(self.checked_at) < ttl_minutes.saturating_mul(60)
     }
 
     /// True when `status` is the cached "update available" answer whose install was already
@@ -741,7 +772,7 @@ impl Cache {
         match status {
             Status::UpdateAvailable { to, .. } => {
                 self.failed.as_deref() == Some(to.as_str())
-                    && now.saturating_sub(self.failed_at) < FAILED_RETRY_MINUTES * 60
+                    && now.saturating_sub(self.failed_at) < failure_window_secs(self.failures)
             }
             _ => false,
         }
@@ -794,9 +825,10 @@ pub struct Checked {
     /// True when this answer already led to an install that changed nothing, so the caller
     /// must report it without installing again.
     pub attempted: bool,
-    /// True when the last install of this answer failed and its short retry window has not
-    /// passed yet. Weaker than `attempted`: the caller must leave it alone *this* launch, but
-    /// the marker disappears on its own — a failed install is usually worth retrying.
+    /// True when the last install of this answer failed and its retry window has not passed yet.
+    /// Weaker than `attempted`: the caller must leave it alone *this* launch, but the window runs
+    /// out on its own — a failed install is usually worth retrying. The window grows with each
+    /// repeat failure of the same version (see [`failure_window_secs`]).
     pub failed_recently: bool,
 }
 
@@ -882,8 +914,9 @@ fn check_cached_at(
         installed: current.to_string(),
         latest,
         attempted,
-        failed: failed.as_ref().map(|(version, _)| version.clone()),
-        failed_at: failed.as_ref().map(|(_, at)| *at).unwrap_or(0),
+        failed: failed.as_ref().map(|marker| marker.version.clone()),
+        failed_at: failed.as_ref().map(|marker| marker.at).unwrap_or(0),
+        failures: failed.as_ref().map(|marker| marker.failures).unwrap_or(0),
     };
     // Asked of the answer that is about to be stored, so both paths through this function
     // answer the caller the same way.
@@ -911,21 +944,34 @@ pub fn carried_attempt(previous: Option<&Cache>, latest: Option<&str>) -> Option
     }
 }
 
+/// A remembered failed install: which version, when it last failed, and how often in a row.
+#[derive(Debug, PartialEq, Eq)]
+struct FailureMarker {
+    version: String,
+    at: u64,
+    failures: u32,
+}
+
 /// Which "the install failed" marker a fresh registry answer should carry forward.
 ///
 /// Like [`carried_attempt`] it only survives the same version — a new release is a new
-/// decision — but it is also dropped once its window has passed, so a transient failure cannot
-/// pin the shell to an old version until the next release.
+/// decision. It outlives its retry window (the window only decides whether *this* launch may try
+/// again) so that a repeat failure can lengthen the next wait, and it is forgotten after
+/// [`FAILED_MEMORY_SECS`], so an old failure cannot pin the shell to an old version.
 fn carried_failure(
     previous: Option<&Cache>,
     latest: Option<&str>,
     now: u64,
-) -> Option<(String, u64)> {
+) -> Option<FailureMarker> {
     let previous = previous?;
     let failed = previous.failed.clone()?;
     let same_version = latest == Some(failed.as_str());
-    let in_window = now.saturating_sub(previous.failed_at) < FAILED_RETRY_MINUTES * 60;
-    (same_version && in_window).then_some((failed, previous.failed_at))
+    let remembered = now.saturating_sub(previous.failed_at) < FAILED_MEMORY_SECS;
+    (same_version && remembered).then_some(FailureMarker {
+        version: failed,
+        at: previous.failed_at,
+        failures: previous.failures,
+    })
 }
 
 /// Remember that installing `latest` did not change the CLI this shell runs, so the cached
@@ -947,9 +993,27 @@ pub fn mark_plugin_attempt_failed(data_dir: &Path, latest: &str) {
     mark_failed_in(&plugin_cache_path(data_dir), latest);
 }
 
+/// The core counterpart: this version was staged and swapped in, and the tree never booted.
+///
+/// Without it the cache still reads `installed = from, latest = to`, so every later launch
+/// decides the update is available again — re-downloading the whole tree, swapping it in,
+/// waiting out the startup timeout and rolling back, once per launch, for ever. The window is
+/// the same short one a failed plugin install gets: a version that failed once may well have
+/// failed for a transient reason.
+pub fn mark_core_attempt_failed(data_dir: &Path, latest: &str) {
+    mark_failed_in(&cache_path(data_dir), latest);
+}
+
 fn mark_failed_in(cache_file: &Path, latest: &str) {
     let Some(mut cache) = read_cache_at(cache_file) else {
         return;
+    };
+    // A repeat of the same version lengthens the next wait; anything else starts the count over.
+    // A marker from before the count existed (0) is one earlier failure.
+    cache.failures = if cache.failed.as_deref() == Some(latest) {
+        cache.failures.max(1).saturating_add(1)
+    } else {
+        1
     };
     cache.failed = Some(latest.to_string());
     cache.failed_at = now_secs();

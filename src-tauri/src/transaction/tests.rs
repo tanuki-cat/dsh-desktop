@@ -246,11 +246,156 @@ fn a_swap_record_survives_a_round_trip_and_a_missing_file_is_not_a_record() {
         backup: "/data/runtime/rollback/0.1.5".to_string(),
         version: "0.1.6".to_string(),
         at: 1_700_000_000,
+        had_previous: Some(true),
     };
     write_swap(&path, &record).unwrap();
     assert_eq!(read_swap(&path).unwrap(), record);
 
     clear_swap(&path);
     assert!(read_swap(&path).is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A real profile is full of symlinks — pnpm puts every dependency under `.dsh-module-fallback/`
+/// as a link into `node_modules/`, and `.bin/*` are links to files. `fs::copy` follows them, so a
+/// link to a directory failed the whole snapshot and a link to a file was materialised.
+#[cfg(unix)]
+#[test]
+fn a_snapshot_preserves_symlinks() {
+    let root = scratch("snapshot-symlinks");
+    let live = root.join("live");
+    let snap = root.join("snap");
+    std::fs::create_dir_all(live.join("node_modules/pkg")).unwrap();
+    std::fs::write(live.join("node_modules/pkg/index.js"), "x").unwrap();
+    std::fs::create_dir_all(live.join("node_modules/.bin")).unwrap();
+    std::fs::write(live.join("node_modules/.bin/tool.js"), "y").unwrap();
+    // The two shapes a pnpm tree has: a link to a directory, and a link to a file.
+    std::os::unix::fs::symlink("node_modules/pkg", live.join("fallback-pkg")).unwrap();
+    std::os::unix::fs::symlink("../tool.js", live.join("node_modules/.bin/tool")).unwrap();
+
+    snapshot_tree(&live, &snap, &[]).expect("a profile with symlinks must snapshot");
+
+    for name in ["fallback-pkg", "node_modules/.bin/tool"] {
+        let meta = std::fs::symlink_metadata(snap.join(name)).unwrap();
+        assert!(meta.file_type().is_symlink(), "{name} was materialised");
+    }
+    assert_eq!(
+        std::fs::read_link(snap.join("fallback-pkg")).unwrap(),
+        Path::new("node_modules/pkg"),
+        "the link target must be preserved verbatim"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The reproduction from the review: a real pnpm profile has links under `.dsh-module-fallback/`
+/// (to directories) and in `node_modules/.bin/` (to files). Snapshotted against the live profile
+/// when one exists, so the shapes are the real ones rather than a fixture guess.
+#[cfg(unix)]
+#[test]
+fn a_real_profile_snapshots_when_one_is_present() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let profile = PathBuf::from(home).join(".dsh/profiles/web");
+    if !profile.is_dir() {
+        // A machine without a profile is not a failure; the fixture test above covers the shapes.
+        return;
+    }
+    let root = scratch("real-profile-snapshot");
+    let dest = root.join("snap");
+    snapshot_tree(&profile, &dest, PROFILE_LIVE_ENTRIES)
+        .expect("snapshotting a real profile must not fail");
+    assert!(dest.join("node_modules").is_dir() || dest.join("package.json").is_file());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Restoring must put the links back, and removing a link to a directory must not follow it.
+#[cfg(unix)]
+#[test]
+fn a_restore_puts_symlinks_back_without_following_them() {
+    let root = scratch("restore-symlinks");
+    let live = root.join("live");
+    let snap = root.join("snap");
+    std::fs::create_dir_all(live.join("real")).unwrap();
+    std::fs::write(live.join("real/keep.txt"), "keep").unwrap();
+    std::fs::create_dir_all(&snap).unwrap();
+    std::os::unix::fs::symlink("real", snap.join("dirlink")).unwrap();
+    std::os::unix::fs::symlink("real", live.join("dirlink")).unwrap();
+
+    restore_tree(&snap, &live, &[]).expect("restore must handle a directory link");
+
+    assert!(std::fs::symlink_metadata(live.join("dirlink"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(
+        live.join("real/keep.txt").is_file(),
+        "removing the old link must not delete what it pointed at"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The bundled first update: the shadow prefix is empty, so `commit` had no previous tree to move
+/// and `backup` was never written. A rollback then used to fail, leaving the tree that would not
+/// boot in place and the record on disk — so every later launch repeated the same failure.
+#[test]
+fn a_first_update_with_no_backup_discards_the_failed_tree() {
+    let root = scratch("rollback-first-update");
+    let target = root.join("prefix");
+    let staged = root.join("staging/0.1.6");
+    let backup = root.join("rollback/0.1.5");
+    std::fs::create_dir_all(&staged).unwrap();
+    std::fs::write(staged.join("bin.js"), "broken").unwrap();
+    assert!(!target.exists(), "the shadow prefix starts empty");
+
+    commit(&target, &staged, &backup).unwrap();
+    assert!(
+        target.exists() && !backup.exists(),
+        "nothing was moved to backup"
+    );
+
+    // The tree never booted, so this is the rollback the launch performs.
+    rollback_with(&target, &backup, Some(false)).expect("a first update must still roll back");
+    assert!(
+        !target.exists(),
+        "the failed tree must be gone so the seed is used again"
+    );
+    assert!(failed_path(&target).is_dir(), "it is kept as evidence");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A record written before `had_previous` existed must keep the old, safe behaviour: never delete
+/// a tree just because a backup is missing.
+#[test]
+fn a_legacy_record_still_refuses_to_delete_the_install() {
+    let root = scratch("rollback-legacy");
+    let target = root.join("prefix");
+    let backup = root.join("rollback/0.1.5");
+    std::fs::create_dir_all(&target).unwrap();
+
+    assert!(rollback_with(&target, &backup, None).is_err());
+    assert!(
+        target.exists(),
+        "an unknown history must not delete anything"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The normal case still restores the previous tree rather than discarding the new one.
+#[test]
+fn a_rollback_with_a_backup_restores_it() {
+    let root = scratch("rollback-restore");
+    let target = root.join("prefix");
+    let staged = root.join("staging/0.1.6");
+    let backup = root.join("rollback/0.1.5");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("old.js"), "old").unwrap();
+    std::fs::create_dir_all(&staged).unwrap();
+    std::fs::write(staged.join("new.js"), "new").unwrap();
+
+    commit(&target, &staged, &backup).unwrap();
+    assert!(backup.exists(), "a previous tree was moved aside");
+    rollback_with(&target, &backup, Some(true)).unwrap();
+    assert!(target.join("old.js").is_file(), "the old tree is back");
     let _ = std::fs::remove_dir_all(&root);
 }

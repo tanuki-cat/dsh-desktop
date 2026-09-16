@@ -121,6 +121,7 @@ fn cache_freshness_follows_interval_and_installed_version() {
         attempted: None,
         failed: None,
         failed_at: 0,
+        failures: 0,
     };
     // Inside the window, same installed version -> fresh.
     assert!(entry(Some("0.1.5-rc.2"), "0.1.5-rc.1").is_fresh(1_000 + 59 * 60, "0.1.5-rc.1", 60));
@@ -146,6 +147,7 @@ fn cache_round_trips_on_disk() {
         attempted: Some("0.1.5-rc.2".into()),
         failed: None,
         failed_at: 0,
+        failures: 0,
     };
     write_cache(&dir, &cache).unwrap();
     assert_eq!(read_cache(&dir), Some(cache));
@@ -180,6 +182,7 @@ fn carried_attempt_follows_the_registry_answer() {
         attempted: attempted.map(str::to_string),
         failed: None,
         failed_at: 0,
+        failures: 0,
     };
     assert_eq!(
         carried_attempt(
@@ -230,6 +233,7 @@ fn an_expired_window_does_not_reopen_an_ineffective_install() {
         attempted: Some("0.1.5-rc.2".into()),
         failed: None,
         failed_at: 0,
+        failures: 0,
     };
     let wanted = vec!["latest".to_string()];
     std::fs::write(&tags, r#"{"latest":"0.1.5-rc.2"}"#).unwrap();
@@ -277,6 +281,7 @@ fn an_ineffective_install_is_not_retried_inside_the_window() {
             attempted: None,
             failed: None,
             failed_at: 0,
+            failures: 0,
         },
     )
     .unwrap();
@@ -313,6 +318,7 @@ fn an_ineffective_install_is_not_retried_inside_the_window() {
             attempted: Some("0.1.5-rc.2".into()),
             failed: None,
             failed_at: 0,
+            failures: 0,
         },
     )
     .unwrap();
@@ -340,6 +346,7 @@ fn a_failed_install_only_suppresses_its_short_window() {
         attempted: None,
         failed: Some("1.46.1".into()),
         failed_at,
+        failures: 0,
     };
 
     // Just failed: this launch must report the update without stopping the Harness.
@@ -376,36 +383,101 @@ fn a_failed_install_only_suppresses_its_short_window() {
 }
 
 #[test]
-fn a_failed_attempt_is_carried_only_inside_its_window() {
-    let failed = |at: u64| Cache {
+fn a_failed_attempt_is_remembered_past_its_retry_window() {
+    let failed = |at: u64, failures: u32| Cache {
         checked_at: at,
         installed: "1.45.1".into(),
         latest: Some("1.46.1".into()),
         attempted: None,
         failed: Some("1.46.1".into()),
         failed_at: at,
+        failures,
+    };
+    let marker = |at: u64, failures: u32| FailureMarker {
+        version: "1.46.1".to_string(),
+        at,
+        failures,
     };
 
     // Same version, inside the window: the marker survives a fresh registry answer.
     assert_eq!(
-        carried_failure(Some(&failed(1_000)), Some("1.46.1"), 1_000 + 60),
-        Some(("1.46.1".to_string(), 1_000))
+        carried_failure(Some(&failed(1_000, 1)), Some("1.46.1"), 1_000 + 60),
+        Some(marker(1_000, 1))
     );
-    // Window over: dropped, so the next launch may install.
+    // Past the retry window the marker is still carried — the count has to survive the retry it
+    // allowed, or a version that never boots would be retried at the shortest interval for ever.
+    let past_window = 1_000 + FAILED_RETRY_MINUTES * 60;
+    assert_eq!(
+        carried_failure(Some(&failed(1_000, 1)), Some("1.46.1"), past_window),
+        Some(marker(1_000, 1))
+    );
+    assert!(!failed(1_000, 1).failed_recently(
+        past_window,
+        &Status::UpdateAvailable {
+            from: "1.45.1".into(),
+            to: "1.46.1".into()
+        }
+    ));
+    // Forgotten after a week.
     assert_eq!(
         carried_failure(
-            Some(&failed(1_000)),
+            Some(&failed(1_000, 3)),
             Some("1.46.1"),
-            1_000 + FAILED_RETRY_MINUTES * 60
+            1_000 + FAILED_MEMORY_SECS
         ),
         None
     );
     // A newer version is a new decision, not a repeat.
     assert_eq!(
-        carried_failure(Some(&failed(1_000)), Some("1.46.2"), 1_000),
+        carried_failure(Some(&failed(1_000, 1)), Some("1.46.2"), 1_000),
         None
     );
     assert_eq!(carried_failure(None, Some("1.46.1"), 1_000), None);
+}
+
+/// A version that keeps failing waits longer each time, up to a day; a different version starts
+/// over. Without this a tree that can never boot was downloaded, swapped in, timed out and rolled
+/// back once every five minutes.
+#[test]
+fn repeated_failures_of_one_version_back_off() {
+    assert_eq!(failure_window_secs(0), FAILED_RETRY_MINUTES * 60);
+    assert_eq!(failure_window_secs(1), FAILED_RETRY_MINUTES * 60);
+    assert_eq!(failure_window_secs(2), FAILED_RETRY_MINUTES * 4 * 60);
+    assert_eq!(failure_window_secs(3), FAILED_RETRY_MINUTES * 16 * 60);
+    assert_eq!(failure_window_secs(20), 24 * 60 * 60);
+    assert_eq!(failure_window_secs(u32::MAX), 24 * 60 * 60);
+
+    let dir = std::env::temp_dir().join("dsh-desktop-core-failure-backoff-test");
+    let _ = std::fs::remove_dir_all(&dir);
+    let seeded = Cache {
+        checked_at: now_secs(),
+        installed: "0.1.5".into(),
+        latest: Some("0.1.6".into()),
+        attempted: None,
+        failed: None,
+        failed_at: 0,
+        failures: 0,
+    };
+    write_cache(&dir, &seeded).unwrap();
+    let update = Status::UpdateAvailable {
+        from: "0.1.5".into(),
+        to: "0.1.6".into(),
+    };
+
+    mark_core_attempt_failed(&dir, "0.1.6");
+    mark_core_attempt_failed(&dir, "0.1.6");
+    let twice = read_cache(&dir).unwrap();
+    assert_eq!(twice.failures, 2);
+    // Ten minutes on: past the first window, still inside the second.
+    assert!(twice.failed_recently(twice.failed_at + 10 * 60, &update));
+
+    mark_core_attempt_failed(&dir, "0.1.7");
+    assert_eq!(
+        read_cache(&dir).unwrap().failures,
+        1,
+        "a new version starts over"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -454,6 +526,7 @@ fn the_plugin_check_keeps_its_own_cache_window() {
             attempted: None,
             failed: None,
             failed_at: 0,
+            failures: 0,
         },
     )
     .unwrap();
@@ -468,6 +541,7 @@ fn the_plugin_check_keeps_its_own_cache_window() {
             attempted: None,
             failed: None,
             failed_at: 0,
+            failures: 0,
         })
         .unwrap(),
     )

@@ -236,7 +236,7 @@ fn forcing_bundled_resolves_into_the_seed_tree() {
         runtime: runtime::Preference::Bundled,
         ..Config::load(&data_dir)
     };
-    let resolved = resolve_runtime(Some(&root), &data_dir, &config).expect("seed resolves");
+    let resolved = resolve_runtime(Some(&root), &data_dir, &config, None).expect("seed resolves");
     assert_eq!(resolved.node, seed.join("node/bin/node"));
     assert_eq!(resolved.dsh_js, dsh_dir.join("lib/bin.js"));
     assert_eq!(resolved.version, "9.9.9");
@@ -708,4 +708,40 @@ fn the_exit_reason_reaches_the_user_as_words() {
         exit_reason(&std::process::ExitStatus::from_raw(9)),
         "被信号 9 终止"
     );
+}
+
+/// A restart asks about the instance on the port at most once: an answer given during the attempt
+/// ("no", or "keep it and use another port") is final for that restart.
+#[test]
+fn a_failed_restart_does_not_ask_the_same_question_twice() {
+    let failed = StartError::from("boot timed out".to_string());
+    assert!(may_ask_after_failure(&failed, 3080, 3080));
+
+    let declined = StartError {
+        reason: "kept".to_string(),
+        declined: true,
+    };
+    assert!(!may_ask_after_failure(&declined, 3080, 3080));
+
+    // The user kept the instance on 3080 and this attempt moved to 3081.
+    assert!(!may_ask_after_failure(&failed, 3080, 3081));
+}
+
+/// The 3d swap must not pull a tree out from under an instance the user chose to keep, and must
+/// not refuse an update for a tree nothing can be using.
+#[test]
+fn a_kept_instance_blocks_only_a_swap_of_the_tree_it_may_use() {
+    let target = Path::new("/data/runtime/prefix/lib/node_modules/@deepseek-ai/dsh");
+    let ours =
+        "/app/node /data/runtime/prefix/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web";
+    let other = "/usr/local/bin/node /usr/local/bin/dsh web";
+
+    // First update of a bundled build: the shadow tree does not exist yet.
+    assert!(!swap_conflicts(target, false, true, None));
+    // The user's own prefix: a kept terminal instance is assumed to use it, whatever it prints.
+    assert!(swap_conflicts(target, true, false, Some(other)));
+    // The shadow prefix: decided by the command line, and an unreadable one is a conflict.
+    assert!(swap_conflicts(target, true, true, Some(ours)));
+    assert!(!swap_conflicts(target, true, true, Some(other)));
+    assert!(swap_conflicts(target, true, true, None));
 }

@@ -28,19 +28,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use takeover::{
     confirm_takeover, foreign_instance_action, harness_listener, identified_dsh_web,
     resolve_foreign_action, terminal_page, wait_for_handoff, wait_for_port_free, ForeignAction,
-    TerminalPage,
+    Retry, TerminalPage,
 };
 use tauri::{AppHandle, Listener, Manager, RunEvent};
 use update_flow::{
     clear_stale_staging, commit_core_update, confirm_core_update, recover_pending_swap,
-    roll_back_core_update, stage_core_update, stop_instance_before_update, update_market_plugin,
-    StagedUpdate, UpdatePaths,
+    roll_back_core_update, stage_core_update, update_market_plugin, StagedUpdate, UpdatePaths,
 };
 
 /// First run may initialise a profile; later runs are fast (measured ~4s on macOS).
 const STARTUP_TIMEOUT_FIRST: Duration = Duration::from_secs(90);
 const STARTUP_TIMEOUT_NEXT: Duration = Duration::from_secs(30);
 const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+
+/// The dsh profile this shell supervises. Named here rather than inline because the plugin skip
+/// message has to quote the same name it acts on.
+const PROFILE_NAME: &str = "web";
 
 /// How long the shell waits for someone else to bring the port back before it starts its own
 /// Harness.
@@ -59,6 +62,10 @@ const HANDOFF_POLL: Duration = Duration::from_millis(400);
 const HEALTHY_RUN: Duration = Duration::from_secs(60);
 /// Consecutive short runs the shell restarts on its own before it stops and reports.
 const MAX_AUTO_RESTARTS: u32 = 3;
+/// How often an adopted instance is checked for liveness. It has no `Child` to wait on, so
+/// this is the only signal; a few seconds of delay before recovery is imperceptible next to
+/// the restart that follows.
+const REUSED_POLL: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -646,10 +653,14 @@ fn keep_system_install(
 }
 
 /// Decide which node and which dsh tree to supervise (bundled-runtime plan §2.3/§2.4).
+///
+/// `shell_path` is the login shell's `PATH`, when it was imported: the user's own installation is
+/// looked up there as well as on the app's PATH (see `locator::system_node`).
 fn resolve_runtime(
     resources: Option<&Path>,
     data_dir: &Path,
     config: &Config,
+    shell_path: Option<&str>,
 ) -> Result<ResolvedRuntime, String> {
     let seed = seed_root_for(resources);
     let seed_node = seed.as_deref().and_then(node_in);
@@ -684,9 +695,11 @@ fn resolve_runtime(
     if !probe_system {
         harness::app_log("跳过系统运行时探测：preference/env 已经决定了用哪棵树");
     }
-    let system_node = probe_system.then(locator::system_node).flatten();
+    let system_node = probe_system
+        .then(|| locator::system_node(shell_path))
+        .flatten();
     let system_dsh = probe_system
-        .then(|| locator::system_dsh(config.dsh_path.clone()))
+        .then(|| locator::system_dsh(config.dsh_path.clone(), shell_path))
         .flatten();
     let facts = system_node
         .as_ref()
@@ -840,7 +853,9 @@ fn seed_profile_template(config: &Config, bundled: bool, seed: Option<&Path>) ->
         .dsh_home
         .clone()
         .or_else(|| home_dir().map(|home| home.join(".dsh")));
-    let profile = home.as_ref().map(|home| home.join("profiles").join("web"));
+    let profile = home
+        .as_ref()
+        .map(|home| home.join("profiles").join(PROFILE_NAME));
     let decision = seed_decision(
         bundled,
         template
@@ -895,18 +910,52 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Seed a profile template into place, preserving its symlinks.
+///
+/// The template is a pnpm tree, so it carries the same links a profile does (`.bin/*` into
+/// `node_modules/`, and every dependency under `.dsh-module-fallback/`). `is_dir` is false for a
+/// link, which sent directory links into `fs::copy` and failed the whole seed.
 fn copy_tree_into(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
-        let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree_into(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)?;
-        }
+        transaction::copy_entry(&entry.path(), &to.join(entry.file_name()))?;
     }
     Ok(())
+}
+
+/// Whether the instance currently owning `port` is the one recorded in our state file.
+///
+/// The same test `stop_instance_before_update` uses to tell "our own Harness" from "somebody
+/// else's": only our own is safe to swap a tree under without asking.
+fn ours_on_port(data_dir: &Path, port: u16) -> bool {
+    let owner = harness::listener_pid(port);
+    process::read_state(data_dir)
+        .map(|state| state.pid)
+        .is_some_and(|pid| Some(pid) == owner && process::is_alive(pid))
+}
+
+/// Whether an instance left running may be serving from the tree a swap would replace.
+///
+/// Pure, so the matrix is testable. `owned` is whether `target` is this shell's own shadow prefix;
+/// `command` is the running instance's command line, when it could be read.
+///
+/// - No tree at `target` yet (a bundled build's first update): nothing can be running from it.
+/// - The user's own prefix: an instance they kept is most likely their terminal `dsh`, started
+///   through a launcher symlink whose path does not name the tree — so it is assumed to use it.
+/// - The shadow prefix: only a plugin-market handoff replays this shell's own command line, which
+///   names the tree's real path; an unreadable command line is assumed to.
+fn swap_conflicts(target: &Path, target_exists: bool, owned: bool, command: Option<&str>) -> bool {
+    if !target_exists {
+        return false;
+    }
+    if !owned {
+        return true;
+    }
+    match command {
+        Some(command) => command.contains(&*target.to_string_lossy()),
+        None => true,
+    }
 }
 
 /// Forget a supervised pid without signalling it (used when the process is already gone).
@@ -917,12 +966,40 @@ fn disown(pid: u32) {
     }
 }
 
+/// Why a launch attempt did not end with a Harness window.
+#[derive(Debug)]
+struct StartError {
+    /// What the user reads on the failure page.
+    reason: String,
+    /// The user answered this attempt's takeover question with "no". A retry must report that,
+    /// not put the same question again — the answer is already given.
+    declined: bool,
+}
+
+impl From<String> for StartError {
+    fn from(reason: String) -> Self {
+        StartError {
+            reason,
+            declined: false,
+        }
+    }
+}
+
+/// Whether a failed restart may still ask about the instance on `port`.
+///
+/// Not when the attempt already asked and the answer was "no" (`declined`), and not when the
+/// answer was "keep it, use another port" — which shows as the launch port having moved away
+/// from `port` (`port_now`). Either answer is final for this restart.
+fn may_ask_after_failure(error: &StartError, port: u16, port_now: u16) -> bool {
+    !error.declined && port_now == port
+}
+
 /// A launch that failed after spawning must not leave a half-started Harness behind: it
 /// would keep the port and make the failure page a lie.
-fn abort_start(pid: u32, reason: String) -> Result<(), String> {
+fn abort_start(pid: u32, reason: String) -> Result<(), StartError> {
     process::terminate(pid, TERMINATE_GRACE);
     disown(pid);
-    Err(reason)
+    Err(reason.into())
 }
 
 /// What the watchdog does about one unexpected exit.
@@ -1048,12 +1125,21 @@ fn take_over_handoff_and_start(
     }
     match start(app, data_dir) {
         Ok(()) => Ok(()),
+        // The user already answered for the instance on this port during the attempt — "no", or
+        // "keep it and use another port". Asking again is the same question twice for one restart.
+        Err(error) if !may_ask_after_failure(&error, port, runtime_port(config.port)) => {
+            harness::app_log(&format!(
+                "本次启动失败（{}），用户已选择保留端口 {port} 上的实例：不再追问",
+                error.reason
+            ));
+            Err(error.reason)
+        }
         // A handoff slower than the grace can still take the port while our own launch boots.
         // Reporting a failure there would be wrong — the port is serving a Harness — so ask about
         // that instance and make the one remaining attempt if the answer allows it. The guard is
         // the identity, not the config: whether to signal is the user's answer, and the config
         // only decides what an unanswered question means.
-        Err(reason) => match harness_listener(port) {
+        Err(StartError { reason, .. }) => match harness_listener(port) {
             // Unidentified: report the original failure rather than killing a process this
             // shell cannot prove is the CLI.
             Some(pid) if !identified_dsh_web(pid) => {
@@ -1063,22 +1149,31 @@ fn take_over_handoff_and_start(
                 Err(reason)
             }
             // A retry is still this shell deciding to end somebody else instance, so it is
-            // the same question.
-            Some(pid) if !confirm_takeover(app, &config, port, pid) => {
-                harness::app_log(&format!(
-                    "本次启动失败（{reason}），端口 {port} 上的 pid {pid} 未被接管：保留该实例"
-                ));
-                Err(reason)
-            }
-            Some(pid) => {
-                harness::app_log(&format!(
-                    "本次启动失败（{reason}），但端口 {port} 已由 pid {pid} 服务：接管后重试一次"
-                ));
-                window::set_status(app, "正在接管重新启动的 Harness…", &format!("pid {pid}"));
-                process::terminate_pid(pid, TERMINATE_GRACE);
-                let _ = wait_for_port_free(port, TERMINATE_GRACE);
-                start(app, data_dir)
-            }
+            // the same question. It is only reached when this attempt did not ask it already
+            // (the arms above), so the user sees it at most once per restart.
+            Some(pid) => match confirm_takeover(app, &config, port, pid) {
+                Retry::TakeOver => {
+                    harness::app_log(&format!(
+                        "本次启动失败（{reason}），但端口 {port} 已由 pid {pid} 服务：接管后重试一次"
+                    ));
+                    window::set_status(app, "正在接管重新启动的 Harness…", &format!("pid {pid}"));
+                    process::terminate_pid(pid, TERMINATE_GRACE);
+                    let _ = wait_for_port_free(port, TERMINATE_GRACE);
+                    start(app, data_dir).map_err(|error| error.reason)
+                }
+                Retry::Declined => {
+                    harness::app_log(&format!(
+                        "本次启动失败（{reason}），端口 {port} 上的 pid {pid} 已按用户选择保留"
+                    ));
+                    Err(reason)
+                }
+                Retry::Refused => {
+                    harness::app_log(&format!(
+                        "本次启动失败（{reason}），端口 {port} 上的 pid {pid} 未被接管：保留该实例"
+                    ));
+                    Err(reason)
+                }
+            },
             // Nothing owns the port any more: report the original failure.
             None => Err(reason),
         },
@@ -1101,18 +1196,68 @@ fn watch_harness(
 ) {
     let started = Instant::now();
     let status = child.wait();
-    if EXITING.load(Ordering::SeqCst) {
-        return;
-    }
+    let clean = status.as_ref().is_ok_and(|status| status.code() == Some(0));
     let reason = status
         .as_ref()
         .map(exit_reason)
         .unwrap_or_else(|error| format!("无法等待进程结束: {error}"));
+    recover_exited(app, data_dir, pid, ring, started, reason, clean);
+}
+
+/// Watch a Harness this shell adopted rather than spawned, by polling its pid.
+///
+/// The reuse branch hands the window straight to an instance an earlier launch left running, and
+/// there is no `Child` to wait on — so without this the instance could die unnoticed: the page
+/// keeps drawing its last frame, the liveness watchdog only checks that frames move, and the
+/// window sits on a page that can never connect again. That is the failure the automatic
+/// recovery exists to prevent, and it applied to every reused instance.
+fn watch_reused(app: AppHandle, data_dir: PathBuf, pid: u32, ring: harness::Ring) {
+    let started = Instant::now();
+    loop {
+        std::thread::sleep(REUSED_POLL);
+        if EXITING.load(Ordering::SeqCst) {
+            return;
+        }
+        // Gone, or replaced on the port by a different process: either way this launch is no
+        // longer being served by what it adopted.
+        if process::is_alive(pid) {
+            continue;
+        }
+        // No exit status is available for a process that is not our child, so the exit cannot be
+        // called clean: an unknown outcome must not earn the longer handoff wait.
+        recover_exited(
+            app,
+            data_dir,
+            pid,
+            ring,
+            started,
+            "进程已不在（复用启动，拿不到退出码）".to_string(),
+            false,
+        );
+        return;
+    }
+}
+
+/// What to do about a Harness that is no longer running, however it was being watched.
+fn recover_exited(
+    app: AppHandle,
+    data_dir: PathBuf,
+    pid: u32,
+    ring: harness::Ring,
+    started: Instant,
+    reason: String,
+    clean: bool,
+) {
+    // Quitting stops the Harness on purpose, and the watchdog wakes up for that exit like any
+    // other. It must not be read as a crash: that logged "exited unexpectedly" on every quit and
+    // raced the exit with a restart and a freshly opened status window.
+    if EXITING.load(Ordering::SeqCst) {
+        return;
+    }
     harness::app_log(&format!("Harness pid {pid} exited unexpectedly ({reason})"));
     disown(pid);
     process::clear_state(&data_dir);
     let output = ring.tail();
-    let clean = status.as_ref().is_ok_and(|status| status.code() == Some(0));
 
     match exit_action(started.elapsed(), AUTO_RESTARTS.load(Ordering::SeqCst), clean) {
         ExitAction::Report => window::show_failure(
@@ -1186,9 +1331,10 @@ impl PluginSkip {
                 "PATH 上没有 pnpm，跳过插件市场更新（不停止正在运行的 Harness）".to_string()
             }
             PluginSkip::NotDeclared => format!(
-                "profile {} 里没有声明 {}：界面不会出现插件市场，也不会自动安装（                 用 `dsh plugin --profile web add {}` 装上，或改用自带运行时版让首启播种模板）",
+                "profile {} 里没有声明 {}：界面不会出现插件市场，也不会自动安装（用 `dsh plugin --profile {} add {}` 装上，或改用自带运行时版让首启播种模板）",
+                PROFILE_NAME,
                 update::MARKET_PLUGIN,
-                update::MARKET_PLUGIN,
+                PROFILE_NAME,
                 update::MARKET_PLUGIN
             ),
         }
@@ -1329,12 +1475,12 @@ fn startup(app: AppHandle) {
     let _ = std::fs::create_dir_all(&data_dir);
 
     window::set_status(&app, "正在检查运行环境…", "");
-    if let Err(reason) = start(&app, &data_dir) {
-        fail(&app, "DeepSeek Harness 启动失败", &reason);
+    if let Err(error) = start(&app, &data_dir) {
+        fail(&app, "DeepSeek Harness 启动失败", &error.reason);
     }
 }
 
-fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
+fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
     harness::init_app_log(&data_dir.join("logs").join("harness.log"));
 
     // The config comes first: step 1 needs the port this run will use to tell a leftover
@@ -1390,8 +1536,8 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     }
 
     // The login-shell capture costs ~160 ms and depends on nothing that follows, so it runs
-    // alongside the version lookup and update check and is joined just before the child env
-    // is assembled.
+    // alongside the swap recovery below and is joined just before the runtime is resolved: the
+    // PATH it carries is where that resolution looks for the user's own node and dsh.
     // A Windows GUI process already inherits the user's variables and has no login shell to
     // capture; asking for `/bin/zsh` there only delayed startup and changed nothing.
     #[cfg(windows)]
@@ -1418,13 +1564,43 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     //     would pick the same unproven tree again and fail the same way.
     let runtime_root = data_dir.join("runtime");
     let paths = UpdatePaths::new(&runtime_root);
-    recover_pending_swap(&paths);
+    recover_pending_swap(&paths, data_dir);
     clear_stale_staging(&paths);
 
     // 3) Resolve the runtime: bundled seed / shadow prefix / the user's install (§2.3/§2.4).
     window::set_status(app, "正在解析运行时…", "");
-    let mut resolved =
-        resolve_runtime(app.path().resource_dir().ok().as_deref(), data_dir, &config)?;
+    // The login shell's PATH is the one the user's terminal sees. Resolving with it is what finds
+    // an nvm/fnm install: those tools initialise in `.zshrc`, which the `-lic` capture reads and a
+    // bare `-lc` lookup does not — so the lookup used to miss a node the child PATH then had.
+    let mut imported: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(handle) = env_capture {
+        let captured = handle.join().ok();
+        let shell = captured
+            .as_ref()
+            .map(|(shell, _)| shell.clone())
+            .unwrap_or_else(|| "登录 shell".to_string());
+        match captured.and_then(|(_, imported)| imported) {
+            Some((flag, vars)) => {
+                let names: Vec<String> = vars.keys().cloned().collect();
+                // Names only: values may be credentials.
+                harness::app_log(&format!(
+                    "imported {} env vars via {shell} {flag}: {}",
+                    names.len(),
+                    names.join(", ")
+                ));
+                imported = vars;
+            }
+            None => harness::app_log(&format!(
+                "login shell env import failed ({shell}); using the app environment"
+            )),
+        }
+    }
+    let mut resolved = resolve_runtime(
+        app.path().resource_dir().ok().as_deref(),
+        data_dir,
+        &config,
+        imported.get("PATH").map(String::as_str),
+    )?;
     let mut version = resolved.version.clone();
 
     // The profile directory decides the startup timeout, so look at it *before* seeding: a
@@ -1435,7 +1611,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         .clone()
         .or_else(|| home_dir().map(|home| home.join(".dsh")))
         .unwrap_or_else(|| PathBuf::from(".dsh"));
-    let first_launch = !home.join("profiles").join("web").exists();
+    let first_launch = !home.join("profiles").join(PROFILE_NAME).exists();
 
     // First launch of a bundled build: put the profile template (plugin market included) in
     // place before the CLI starts, so the marketplace exists without any download (§2.5).
@@ -1512,6 +1688,14 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                             "update {to} was already attempted and changed nothing; not installing again"
                         ));
                     }
+                    // The same suppression the plugin market gets: a version whose tree was
+                    // swapped in and never booted must not be re-downloaded and re-swapped on
+                    // every single launch.
+                    update::Status::UpdateAvailable { to, .. } if checked.failed_recently => {
+                        harness::app_log(&format!(
+                            "update {to} failed to start last time; not retrying yet (the wait grows with each failure)"
+                        ));
+                    }
                     update::Status::UpdateAvailable { from, to } => {
                         window::set_status(
                             app,
@@ -1551,50 +1735,51 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                             harness::app_log(&format!(
                                 "update available: {from} -> {to}, installing"
                             ));
-                            // npm rewrites the CLI tree in place. Anything serving from it must be
-                            // stopped first, or the live session breaks on its next lazy require().
-                            // A deferred update only skips the install: startup continues and the
-                            // instance keeps running (its tree was never touched).
-                            match stop_instance_before_update(app, data_dir, port, &config) {
-                                Err(reason) => harness::app_log(&format!(
-                                    "update deferred, keeping v{from}: {reason}"
+                            // Staging happens BEFORE anything is stopped. It builds the new
+                            // tree in `runtime/staging/…` and never touches the one in use, so
+                            // the running session can keep serving while a 300-second npm
+                            // install runs — and a registry that fails half-way costs the user
+                            // nothing. The stop happens in step 3c, once a verified tree exists
+                            // and the launch is actually committed to swapping it in.
+                            let cache = runtime_root.join("npm-cache");
+                            // Which tree the new version belongs in: this shell own
+                            // shadow prefix, or the user prefix when they asked for
+                            // in-place upgrades of their own installation.
+                            let target_prefix = resolved
+                                .update_prefix(data_dir)
+                                .or_else(|| update::install_prefix(&resolved.dsh_js));
+                            // Build and verify the new tree next to the live one. Nothing
+                            // is replaced until that succeeded, so a registry that fails
+                            // half-way leaves the CLI the user has exactly as it was.
+                            let staged = match target_prefix.as_deref() {
+                                // No prefix to speak of: a CLI whose layout names no
+                                // npm prefix at all (a hand-built tree). There is
+                                // nothing to swap, so say that instead of guessing.
+                                None => Err(format!(
+                                    "无法确定 {} 所属的 npm 前缀，不做原地更新",
+                                    resolved.dsh_js.display()
                                 )),
-                                Ok(()) => {
-                                    let cache = runtime_root.join("npm-cache");
-                                    // Which tree the new version belongs in: this shell own
-                                    // shadow prefix, or the user prefix when they asked for
-                                    // in-place upgrades of their own installation.
-                                    let target_prefix = resolved
-                                        .update_prefix(data_dir)
-                                        .or_else(|| update::install_prefix(&resolved.dsh_js));
-                                    // Build and verify the new tree next to the live one. Nothing
-                                    // is replaced until that succeeded, so a registry that fails
-                                    // half-way leaves the CLI the user has exactly as it was.
-                                    let staged = match target_prefix.as_deref() {
-                                        // No prefix to speak of: a CLI whose layout names no
-                                        // npm prefix at all (a hand-built tree). There is
-                                        // nothing to swap, so say that instead of guessing.
-                                        None => Err(format!(
-                                            "无法确定 {} 所属的 npm 前缀，不做原地更新",
-                                            resolved.dsh_js.display()
-                                        )),
-                                        Some(prefix) => {
-                                            stage_core_update(&npm, &to, prefix, &paths, &cache)
-                                        }
-                                    };
-                                    match staged {
-                                        Err(reason) => harness::app_log(&format!(
-                                            "update staged but not committed, keeping v{from}: {reason}"
-                                        )),
-                                        // Verified, not yet in place: the swap waits until the
-                                        // launch is committed to booting it.
-                                        Ok(staged) => {
-                                            harness::app_log(&format!(
-                                                "update staged: {from} -> {to}（校验通过，待切换）"
-                                            ));
-                                            staged_update = Some(staged);
-                                        }
-                                    }
+                                Some(prefix) => {
+                                    stage_core_update(&npm, &to, prefix, &paths, &cache)
+                                }
+                            };
+                            match staged {
+                                Err(reason) => {
+                                    // The startup thread waits on this install (up to its full
+                                    // budget when a proxy stalls), so a failure is remembered
+                                    // like a failed boot: the next launch does not wait again.
+                                    update::mark_core_attempt_failed(data_dir, &to);
+                                    harness::app_log(&format!(
+                                        "update staged but not committed, keeping v{from}: {reason}"
+                                    ))
+                                }
+                                // Verified, not yet in place: the swap waits until the
+                                // launch is committed to booting it.
+                                Ok(staged) => {
+                                    harness::app_log(&format!(
+                                        "update staged: {from} -> {to}（校验通过，待切换）"
+                                    ));
+                                    staged_update = Some(staged);
                                 }
                             }
                         }
@@ -1618,30 +1803,8 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     //      and friends. This runs before the plugin step because `dsh plugin add` forwards to
     //      pnpm, and pnpm only exists in the bundled tools prefix or on the login shell PATH
     //      (review A1); the Harness then gets this very PATH, so the shell and everything it
-    //      spawns share one toolchain.
-    let mut imported: BTreeMap<String, String> = BTreeMap::new();
-    if let Some(handle) = env_capture {
-        let captured = handle.join().ok();
-        let shell = captured
-            .as_ref()
-            .map(|(shell, _)| shell.clone())
-            .unwrap_or_else(|| "登录 shell".to_string());
-        match captured.and_then(|(_, imported)| imported) {
-            Some((flag, vars)) => {
-                let names: Vec<String> = vars.keys().cloned().collect();
-                // Names only: values may be credentials.
-                harness::app_log(&format!(
-                    "imported {} env vars via {shell} {flag}: {}",
-                    names.len(),
-                    names.join(", ")
-                ));
-                imported = vars;
-            }
-            None => harness::app_log(&format!(
-                "login shell env import failed ({shell}); using the app environment"
-            )),
-        }
-    }
+    //      spawns share one toolchain. The login-shell variables were collected before the
+    //      runtime was resolved (see step 3).
     let child = ChildEnv::assemble(
         &config,
         &resolved.node,
@@ -1663,17 +1826,20 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
         harness::app_log("刚播种 profile 模板，本轮不检查插件市场（下次启动再查）");
     }
     if check_market && !seeded_this_run {
-        let profile_dir = home.join("profiles").join("web");
+        let profile_dir = home.join("profiles").join(PROFILE_NAME);
         let declared = update::declares_plugin(&profile_dir, update::MARKET_PLUGIN);
-        if declared {
-            let installed = update::installed_plugin(&profile_dir, update::MARKET_PLUGIN);
-            // Resolve pnpm before anything is stopped: it is what actually installs a plugin,
-            // and without it the CLI exits 127 after the instance is already gone (review A1).
-            let pnpm = update::find_pnpm(Some(OsStr::new(&child.path)));
-            if let Some(skip) = plugin_skip_reason(declared, installed.as_deref(), pnpm.as_deref())
-            {
-                harness::app_log(&skip.reason());
-            } else if let Some(current) = installed {
+        let installed = update::installed_plugin(&profile_dir, update::MARKET_PLUGIN);
+        // Resolve pnpm before anything is stopped: it is what actually installs a plugin,
+        // and without it the CLI exits 127 after the instance is already gone (review A1).
+        let pnpm = update::find_pnpm(Some(OsStr::new(&child.path)));
+        // Asked unconditionally, not only when the market is declared: "the profile does not
+        // declare it" is exactly the case whose reason never reached the log, and the comment
+        // on `plugin_skip_reason` promises that it does.
+        // Reaching the `else` means every precondition held, so `installed` is present.
+        if let Some(skip) = plugin_skip_reason(declared, installed.as_deref(), pnpm.as_deref()) {
+            harness::app_log(&skip.reason());
+        } else {
+            if let Some(current) = installed {
                 match update::npm_for(&resolved.node) {
                     None => harness::app_log("找不到 npm，跳过插件市场更新检查"),
                     Some(npm) => {
@@ -1697,9 +1863,8 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                                 if checked.failed_recently =>
                             {
                                 harness::app_log(&format!(
-                                    "plugin {} {to} failed to install last time; not retrying for {} minutes",
-                                    update::MARKET_PLUGIN,
-                                    update::FAILED_RETRY_MINUTES
+                                    "plugin {} {to} failed to install last time; not retrying yet (the wait grows with each failure)",
+                                    update::MARKET_PLUGIN
                                 ));
                             }
                             update::Status::UpdateAvailable { from, to } => {
@@ -1753,13 +1918,17 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
             return Err(format!(
                 "{}\n\n如需强行使用，请在 config.json 里设置 \"require_tested_dsh\": false。",
                 compatibility.describe()
-            ));
+            )
+            .into());
         }
     }
 
     // Whether the detection step signalled something and must therefore wait for the port to
     // come free before spawning.
     let mut took_over = false;
+    // An instance the user chose to keep running (the "use another port" answer), with its pid
+    // when known. The swap in 3d must not pull the tree out from under it.
+    let mut kept_instance: Option<Option<u32>> = None;
     // 3c) Detection. Runs after the update so a freshly installed CLI is what we boot. The startup URL carries a per-process token that no other process can
     //     recover, so a foreign instance can never hand us a session.
     match harness::probe(port) {
@@ -1801,8 +1970,18 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                         // orphan.
                         adopt(pid, data_dir);
                         let compat = harness_compat(&config);
-                        return window::create_harness(app, &url, port, compat.as_deref())
-                            .map_err(|e| e.to_string());
+                        window::create_harness(app, &url, port, compat.as_deref())
+                            .map_err(|e| e.to_string())?;
+                        // There is no `Child` for a reused instance, so liveness is polled:
+                        // without it the window would stay on a page that can never connect
+                        // again, which is exactly what the automatic recovery exists to avoid.
+                        let handle = app.clone();
+                        let watched_dir = data_dir.to_path_buf();
+                        // Nothing was spawned here, so there is no output of our own to show;
+                        // the failure page says what is known instead of quoting an empty log.
+                        let ring = harness::Ring::new();
+                        std::thread::spawn(move || watch_reused(handle, watched_dir, pid, ring));
+                        return Ok(());
                     }
                 }
                 // Our own instance that a fresh update (or one about to be committed) just
@@ -1857,18 +2036,22 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                                     .unwrap_or_else(|| "pid 未知".to_string())
                             ));
                             PORT_OVERRIDE.store(free, Ordering::SeqCst);
+                            kept_instance = Some(owner);
                             // The spawn below reads `port`, so the rest of this attempt runs
                             // against the new one.
                             port = free;
                         }
-                        ForeignAction::Refuse { reason } => return Err(reason),
+                        ForeignAction::Refuse { reason, declined } => {
+                            return Err(StartError { reason, declined })
+                        }
                         // The startup path answers the question through
                         // `resolve_foreign_action`, so reaching this arm means a caller
                         // forgot to; refuse rather than signal silently.
                         ForeignAction::Ask { pid } => {
                             return Err(format!(
                                 "端口 {port} 上的 Harness（pid {pid}）没有得到处理，已放弃本次启动。"
-                            ));
+                            )
+                            .into());
                         }
                         ForeignAction::TakeOver { pid } => {
                             // Stop it, then start our own so the window receives a fresh
@@ -1888,16 +2071,16 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
                 let deadline = std::time::Instant::now() + TERMINATE_GRACE;
                 while !matches!(harness::probe(port), harness::Probe::Closed) {
                     if std::time::Instant::now() > deadline {
-                        return Err(format!("接管失败：端口 {port} 仍被占用。"));
+                        return Err(format!("接管失败：端口 {port} 仍被占用。").into());
                     }
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
             }
         }
         harness::Probe::Other => {
-            return Err(format!(
-                "端口 {port} 被其它程序占用，请在 config.json 里换一个端口。"
-            ));
+            return Err(
+                format!("端口 {port} 被其它程序占用，请在 config.json 里换一个端口。").into(),
+            );
         }
         harness::Probe::Closed => {}
     }
@@ -1907,15 +2090,53 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     //     a launch that never happens would leave a rollback record for the next launch to
     //     undo. From here on, a failure to boot is exactly what the record is for.
     if let Some(staged) = staged_update.take() {
-        let from = version.clone();
-        match commit_core_update(staged, &paths) {
-            Ok((installed_path, installed_version)) => {
-                version = installed_version;
-                resolved.dsh_js = installed_path;
-                core_swapped = true;
-                harness::app_log(&format!("dsh updated: {from} -> {to}", to = version));
+        // Two ways a Harness this shell does not control can still be running when the swap is
+        // due, and in both the staged tree is dropped while the launch itself carries on.
+        //
+        // An instance the user chose to keep ("use another port") may serve from exactly the tree
+        // the swap would replace: renaming it out from under a live process fails outright on
+        // Windows and breaks it on its next lazy `require()` on Unix. Its port is no longer
+        // `port` — the answer moved this launch elsewhere — so it is judged by what it runs,
+        // not by probing.
+        let kept_conflict = kept_instance.is_some_and(|pid| {
+            swap_conflicts(
+                staged.target(),
+                staged.target().exists(),
+                resolved.updates == runtime::Updates::Shadow,
+                pid.and_then(harness::process_command).as_deref(),
+            )
+        });
+        // A Harness that appeared on the spawn port after detection (a late handoff): the launch
+        // cannot boot the new tree on that port anyway, and the spawn below reports it.
+        let raced = !took_over
+            && harness::probe(port) == harness::Probe::Harness
+            && !ours_on_port(data_dir, port);
+        if kept_conflict || raced {
+            harness::app_log(&format!(
+                "{}：放弃本次切换（已暂存的 v{} 作废，下次启动再更新）",
+                if kept_conflict {
+                    "被保留的外部实例可能正在使用待替换的 CLI 树"
+                } else {
+                    "检测之后端口上又出现了外部 Harness"
+                },
+                staged.version
+            ));
+            drop(staged);
+        } else {
+            let from = version.clone();
+            let staged_version = staged.version.clone();
+            match commit_core_update(staged, &paths) {
+                Ok((installed_path, installed_version)) => {
+                    version = installed_version;
+                    resolved.dsh_js = installed_path;
+                    core_swapped = true;
+                    harness::app_log(&format!("dsh updated: {from} -> {to}", to = version));
+                }
+                Err(reason) => {
+                    update::mark_core_attempt_failed(data_dir, &staged_version);
+                    harness::app_log(&format!("update failed, keeping v{from}: {reason}"))
+                }
             }
-            Err(reason) => harness::app_log(&format!("update failed, keeping v{from}: {reason}")),
         }
     }
 
@@ -1977,7 +2198,10 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     // (measured ~4s on a warm machine, but plugin installs can take much longer).
     // `first_launch` was captured before seeding, so a bundled first start still gets 90 s
     // (review P1-6).
-    let timeout = if first_launch {
+    // A tree that was just swapped in is booting for the first time too: a new CLI version may
+    // migrate the profile or rebuild caches on its first start, and timing that out on the warm
+    // budget rolls back an update that was only slow.
+    let timeout = if first_launch || core_swapped {
         STARTUP_TIMEOUT_FIRST
     } else {
         STARTUP_TIMEOUT_NEXT
@@ -1993,6 +2217,13 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
             // put the previous one back now, while the reason is still in hand, instead of
             // making the user hit the same wall on the next launch.
             let rolled_back = core_swapped && roll_back_core_update(&paths);
+            // The cache still names this version as the newest, so without a marker every
+            // later launch would stage and swap the same broken tree again.
+            // `version` was updated to the swapped one at the commit above, so it names the
+            // tree that failed rather than the one that was running before.
+            if core_swapped {
+                update::mark_core_attempt_failed(data_dir, &version);
+            }
             return abort_start(
                 pid,
                 format!(

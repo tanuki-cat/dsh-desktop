@@ -4,7 +4,7 @@
 //! is recorded between them, so a launch that dies mid-update can put the previous tree back.
 
 use crate::harness;
-use crate::takeover::confirm_takeover;
+use crate::takeover::{confirm_takeover, Retry};
 use crate::transaction;
 use crate::update;
 use crate::{process, window, Config, ResolvedRuntime, DSH_PACKAGE_NAME, TERMINATE_GRACE};
@@ -57,6 +57,22 @@ pub(crate) fn update_market_plugin(
     from: &str,
     to: &str,
 ) -> bool {
+    // The snapshot comes first: it only reads the dependency tree (the entries the running
+    // Harness writes are skipped), so the instance keeps serving while it is taken — and a
+    // snapshot that fails costs nothing but this update.
+    let snapshot = match snapshot_profile(paths, profile_dir, to) {
+        Ok(snapshot) => snapshot,
+        Err(reason) => {
+            // Without a snapshot the install would be one-way, and the plugin market is not
+            // worth an unrecoverable profile. Marked like a failed install, so the next launch
+            // does not copy the whole tree again straight away.
+            update::mark_plugin_attempt_failed(data_dir, to);
+            harness::app_log(&format!(
+                "plugin update deferred, keeping v{from}: 无法快照 profile: {reason}"
+            ));
+            return false;
+        }
+    };
     // Same hazard as a core update: pnpm rewrites the profile node_modules in place and a
     // running harness would break on its next lazy require().
     if let Err(reason) = stop_instance_before_update(app, data_dir, port, config) {
@@ -65,17 +81,6 @@ pub(crate) fn update_market_plugin(
         ));
         return false;
     }
-    let snapshot = match snapshot_profile(paths, profile_dir, to) {
-        Ok(snapshot) => snapshot,
-        Err(reason) => {
-            // Without a snapshot the install would be one-way, and the plugin market is not
-            // worth an unrecoverable profile.
-            harness::app_log(&format!(
-                "plugin update deferred, keeping v{from}: 无法快照 profile: {reason}"
-            ));
-            return false;
-        }
-    };
     let installed = update::install_plugin(
         &resolved.node,
         &resolved.dsh_js,
@@ -162,11 +167,18 @@ pub(crate) struct StagedUpdate {
     _staging: transaction::Staging,
     /// The staged package directory, about to become the live one.
     dir: PathBuf,
-    version: String,
+    pub(crate) version: String,
     /// The live package directory this will replace.
     target: PathBuf,
     /// Where the live tree goes while the new one proves it boots.
     backup: PathBuf,
+}
+
+impl StagedUpdate {
+    /// The live package directory the commit would replace.
+    pub(crate) fn target(&self) -> &Path {
+        &self.target
+    }
 }
 
 /// The package directory a CLI would occupy inside `prefix`, whether or not it is there yet.
@@ -253,6 +265,9 @@ pub(crate) fn commit_core_update(
     staged: StagedUpdate,
     paths: &UpdatePaths,
 ) -> Result<(PathBuf, String), String> {
+    // Recorded before the swap because it cannot be observed afterwards: once `commit` has run,
+    // an absent backup is indistinguishable from one that was never written.
+    let had_previous = staged.target.exists();
     transaction::write_swap(
         &paths.swap,
         &transaction::SwapRecord {
@@ -260,6 +275,7 @@ pub(crate) fn commit_core_update(
             backup: staged.backup.to_string_lossy().to_string(),
             version: staged.version.clone(),
             at: update::now_secs(),
+            had_previous: Some(had_previous),
         },
     )?;
     if let Err(error) = transaction::commit(&staged.target, &staged.dir, &staged.backup) {
@@ -283,7 +299,11 @@ pub(crate) fn roll_back_core_update(paths: &UpdatePaths) -> bool {
     let Some(record) = transaction::read_swap(&paths.swap) else {
         return false;
     };
-    match transaction::rollback(Path::new(&record.target), Path::new(&record.backup)) {
+    match transaction::rollback_with(
+        Path::new(&record.target),
+        Path::new(&record.backup),
+        record.had_previous,
+    ) {
         Ok(()) => {
             harness::app_log(&format!(
                 "v{} 未能启动，已回滚到上一棵树（{}）",
@@ -340,7 +360,11 @@ pub(crate) fn clear_stale_staging(paths: &UpdatePaths) {
 /// names is the one the previous launch replaced, and a launch that finds this file is by
 /// definition one where the new tree never printed its startup URL — the process was killed, or
 /// the boot timed out.
-pub(crate) fn recover_pending_swap(paths: &UpdatePaths) {
+///
+/// The version is also marked as failed, like a rollback the launch itself performs: the cache
+/// still names it as the newest, and without the marker the next launch would stage and swap the
+/// same tree straight away.
+pub(crate) fn recover_pending_swap(paths: &UpdatePaths, data_dir: &Path) {
     let Some(record) = transaction::read_swap(&paths.swap) else {
         return;
     };
@@ -351,11 +375,12 @@ pub(crate) fn recover_pending_swap(paths: &UpdatePaths) {
         record.version,
         backup.display()
     ));
-    match transaction::rollback(&target, &backup) {
+    match transaction::rollback_with(&target, &backup, record.had_previous) {
         Ok(()) => {
             harness::app_log(&format!("已回滚 {}", target.display()));
             transaction::clear_swap(&paths.swap);
             transaction::prune(&paths.rollback, ROLLBACK_GENERATIONS);
+            update::mark_core_attempt_failed(data_dir, &record.version);
         }
         Err(error) => {
             // Keep the record: the next launch should try again rather than leave a tree
@@ -435,7 +460,7 @@ pub(crate) fn stop_instance_before_update(
     // A foreign instance is somebody else session, and an update stops it for reasons that
     // have nothing to do with what they were doing: ask before touching it. Declining turns
     // this into a deferred update, which is what the config-only version used to do.
-    if ours.is_none() && !confirm_takeover(app, config, port, pid) {
+    if ours.is_none() && confirm_takeover(app, config, port, pid) != Retry::TakeOver {
         return Err(format!(
             "端口 {port} 上的外部 Harness（pid {pid}）没有被接管，跳过本次更新"
         ));

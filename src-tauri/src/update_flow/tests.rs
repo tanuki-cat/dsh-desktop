@@ -61,8 +61,27 @@ fn a_staged_update_swaps_the_tree_and_an_unconfirmed_one_is_rolled_back() {
     assert_eq!(record.version, "0.1.6");
     assert_eq!(record.target, live.to_string_lossy());
 
+    // The cache still names the new version as the newest, as it does after a real check.
+    update::write_cache(
+        &root,
+        &update::Cache {
+            checked_at: update::now_secs(),
+            installed: "0.1.5".into(),
+            latest: Some("0.1.6".into()),
+            attempted: None,
+            failed: None,
+            failed_at: 0,
+            failures: 0,
+        },
+    )
+    .unwrap();
+
     // The next launch finds the record and puts the previous tree back.
-    recover_pending_swap(&paths);
+    recover_pending_swap(&paths, &root);
+    // …and marks the version, so that launch does not stage and swap the same tree again.
+    let cache = update::read_cache(&root).expect("the cache is still there");
+    assert_eq!(cache.failed.as_deref(), Some("0.1.6"));
+    assert_eq!(cache.failures, 1);
     assert_eq!(
         std::fs::read_to_string(live.join("lib/bin.js")).unwrap(),
         "old\n"
@@ -167,6 +186,7 @@ fn a_confirmed_boot_keeps_the_new_tree_and_clears_the_record() {
             backup: "/tmp/backup".to_string(),
             version: "0.1.6".to_string(),
             at: 0,
+            had_previous: Some(true),
         },
     )
     .unwrap();

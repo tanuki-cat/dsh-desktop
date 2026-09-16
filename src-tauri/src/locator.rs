@@ -3,10 +3,10 @@
 //! `dsh` ships as `#!/usr/bin/env node`, and a GUI-launched app has no Homebrew PATH, so
 //! resolving the launcher alone is not enough: node must be resolved too.
 
-use std::io::Read;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct DshLocation {
@@ -19,7 +19,7 @@ pub fn locate(
     remembered: Option<PathBuf>,
     override_env: Option<String>,
 ) -> Result<DshLocation, String> {
-    let launcher = find_launcher(remembered, override_env)?;
+    let launcher = find_launcher(remembered, override_env, None)?;
     let dsh_js = real_path(&launcher);
     let node = find_node(&launcher)?;
     Ok(DshLocation {
@@ -50,7 +50,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A fallback consulted only when the app environment and PATH did not resolve the executable.
 /// It gets its own constant rather than sharing [`PROBE_TIMEOUT`] because the two measure
 /// different things and only happen to land on the same number today.
+/// Windows resolves executables from the app environment and PATH, so this budget is unused
+/// there.
+#[cfg_attr(windows, allow(dead_code))]
 const SHELL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bytes kept from a `node -e` probe. The answer is two words; this only stops a node that
+/// prints a document instead.
+const PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// Probe node once (~80 ms) for the facts above.
 pub fn probe_node(node: &Path) -> Option<NodeFacts> {
@@ -61,54 +68,19 @@ pub fn probe_node(node: &Path) -> Option<NodeFacts> {
 fn probe_node_within(node: &Path, timeout: Duration) -> Option<NodeFacts> {
     const SCRIPT: &str =
         "process.stdout.write(process.arch + \" \" + (typeof require(\"module\").stripTypeScriptTypes))";
-    let mut child = Command::new(node)
-        .arg("-e")
-        .arg(SCRIPT)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    // Read on another thread: the pipe must be drained while we wait, or a chatty node fills
-    // the buffer and deadlocks against our try_wait loop.
-    let reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stdout.read_to_string(&mut text);
-        text
-    });
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let text = reader.join().unwrap_or_default();
-                if !status.success() {
-                    return None;
-                }
-                let mut parts = text.split_whitespace();
-                let arch = parts.next()?.to_string();
-                let strip_types = parts.next() == Some("function");
-                return Some(NodeFacts { arch, strip_types });
-            }
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            other => {
-                let _ = child.kill();
-                let _ = child.wait();
-                // The reader is dropped, not joined: a grandchild can still hold the pipe
-                // (`sh -c 'sleep 30'`), and waiting for it here would reintroduce the very
-                // hang this deadline exists to avoid. The thread ends with the pipe.
-                drop(reader);
-                let why = match other {
-                    Err(error) => format!("探测失败: {error}"),
-                    _ => format!("探测超过 {}s 未返回", timeout.as_secs()),
-                };
-                crate::harness::app_log(&format!("{why}；按不可用处理: {}", node.display()));
-                return None;
-            }
-        }
-    }
+    // `output_within` rather than a local reader loop: it drains the pipe while waiting (a chatty
+    // node would otherwise fill the buffer and deadlock against the wait), and its bounded drain
+    // means a node that leaves a child holding stdout cannot park this thread after exiting.
+    let out = crate::process::output_within(
+        Command::new(node).arg("-e").arg(SCRIPT),
+        timeout,
+        PROBE_OUTPUT_LIMIT,
+    )?;
+    out.status.filter(|status| status.success())?;
+    let mut parts = out.text.split_whitespace();
+    let arch = parts.next()?.to_string();
+    let strip_types = parts.next() == Some("function");
+    Some(NodeFacts { arch, strip_types })
 }
 
 /// The npm package every candidate has to be: a `dsh` that is something else is not this CLI.
@@ -296,7 +268,13 @@ pub fn judge(launcher: &Path, probe: impl FnOnce(&Path) -> Option<String>) -> Ca
 ///
 /// Duplicates are dropped after resolving symlinks: the login shell usually prints the same file
 /// PATH already offered, and probing one candidate twice costs a node start each time.
-fn launcher_candidates(remembered: Option<PathBuf>, override_env: Option<String>) -> Vec<PathBuf> {
+///
+/// `shell_path` is the login shell's imported PATH (see [`search`]).
+fn launcher_candidates(
+    remembered: Option<PathBuf>,
+    override_env: Option<String>,
+    shell_path: Option<&str>,
+) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     let mut push = |path: PathBuf| {
         if path.is_file() {
@@ -312,11 +290,16 @@ fn launcher_candidates(remembered: Option<PathBuf>, override_env: Option<String>
     if let Some(path) = path_lookup("dsh") {
         push(path);
     }
+    if let Some(path) = shell_path.and_then(|paths| path_lookup_in("dsh", OsStr::new(paths))) {
+        push(path);
+    }
     for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
         push(Path::new(dir).join("dsh"));
     }
-    if let Some(path) = login_shell_lookup("dsh") {
-        push(path);
+    if shell_path.is_none() {
+        if let Some(path) = login_shell_lookup("dsh") {
+            push(path);
+        }
     }
     let mut seen: Vec<PathBuf> = Vec::new();
     candidates.retain(|candidate| {
@@ -332,49 +315,26 @@ fn launcher_candidates(remembered: Option<PathBuf>, override_env: Option<String>
 
 /// Run the candidate with its own node and return the first line it prints.
 ///
-/// Bounded by the same budget as the node probe: a launcher that hangs must not park startup.
+/// Bounded by the same budget as the node probe: a launcher that hangs must not park startup, and
+/// a launcher that exits while leaving a child on stdout must not park it either.
 fn probe_version_line(node: Option<&Path>, entry: &Path) -> Option<String> {
     let node = node?;
-    let mut child = Command::new(node)
-        .arg(entry)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stdout.read_to_string(&mut text);
-        text
-    });
-    let deadline = Instant::now() + PROBE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let text = reader.join().unwrap_or_default();
-                return status.success().then_some(text);
-            }
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                drop(reader);
-                return None;
-            }
-        }
-    }
+    let out = crate::process::output_within(
+        Command::new(node).arg(entry).arg("--version"),
+        PROBE_TIMEOUT,
+        PROBE_OUTPUT_LIMIT,
+    )?;
+    out.status.filter(|status| status.success())?;
+    Some(out.text)
 }
 
 /// The first candidate that really is this CLI, or an error naming what was rejected.
 fn find_launcher(
     remembered: Option<PathBuf>,
     override_env: Option<String>,
+    shell_path: Option<&str>,
 ) -> Result<PathBuf, String> {
-    let candidates = launcher_candidates(remembered, override_env);
+    let candidates = launcher_candidates(remembered, override_env, shell_path);
     if candidates.is_empty() {
         return Err(
             "找不到 dsh。可在 config.json 里设置 dsh_path，或用环境变量 DSH_DESKTOP_DSH 指定绝对路径。"
@@ -384,9 +344,14 @@ fn find_launcher(
     let mut rejected: Vec<String> = Vec::new();
     let mut unidentified: Option<(PathBuf, String)> = None;
     for candidate in &candidates {
-        let node = find_node_without_env(candidate);
+        // Resolved lazily: `judge` only needs node when it has to run `--version`, and looking
+        // it up eagerly cost a login shell per candidate on a machine whose PATH has no node —
+        // even for candidates the manifest already identified. With nvm or fnm installed each
+        // of those shells costs 0.3–1 s before the splash page can move.
+        let mut node: Option<Option<PathBuf>> = None;
         match judge(candidate, |entry| {
-            probe_version_line(node.as_deref(), entry)
+            let resolved = node.get_or_insert_with(|| find_node_without_env(candidate, shell_path));
+            probe_version_line(resolved.as_deref(), entry)
         }) {
             Candidate::Ours => return Ok(candidate.clone()),
             Candidate::Unidentified(version) => {
@@ -419,9 +384,10 @@ fn find_launcher(
 /// The system `dsh` launcher, resolved without requiring node to exist (review P1-4).
 ///
 /// `remembered` is `config.json`'s `dsh_path`: the documented place to point the shell at an
-/// installation the automatic search cannot find.
-pub fn system_dsh(remembered: Option<PathBuf>) -> Option<PathBuf> {
-    find_launcher(remembered, None)
+/// installation the automatic search cannot find. `shell_path` is the login shell's imported
+/// PATH, when there is one (see [`search`]).
+pub fn system_dsh(remembered: Option<PathBuf>, shell_path: Option<&str>) -> Option<PathBuf> {
+    find_launcher(remembered, None, shell_path)
         .ok()
         .map(|launcher| real_path(&launcher))
 }
@@ -431,8 +397,8 @@ pub fn system_dsh(remembered: Option<PathBuf>) -> Option<PathBuf> {
 /// `DSH_DESKTOP_NODE` is deliberately not consulted: it is an input of its own
 /// (`Inputs::env_node`), and feeding it back as "the system node" would push the user's explicit
 /// choice through the capability gate that override exists to bypass (review P1-4).
-pub fn system_node() -> Option<PathBuf> {
-    find_node_without_env(Path::new(""))
+pub fn system_node(shell_path: Option<&str>) -> Option<PathBuf> {
+    find_node_without_env(Path::new(""), shell_path)
 }
 
 fn find_node(launcher: &Path) -> Result<PathBuf, String> {
@@ -442,15 +408,15 @@ fn find_node(launcher: &Path) -> Result<PathBuf, String> {
             return Ok(p);
         }
     }
-    find_node_without_env(launcher).ok_or_else(|| {
+    find_node_without_env(launcher, None).ok_or_else(|| {
         "找不到 node。dsh 以 `#!/usr/bin/env node` 运行，没有 node 时启动会直接失败（exit 127）。"
             .to_string()
     })
 }
 
-/// The node belonging to an installation: next to the launcher first, then PATH, then the login
-/// shell. Split out from `find_node` so the system probe can run without a launcher (P1-4).
-fn find_node_without_env(launcher: &Path) -> Option<PathBuf> {
+/// The node belonging to an installation: next to the launcher first, then the search path (see
+/// [`search`]). Split out from `find_node` so the system probe can run without a launcher (P1-4).
+fn find_node_without_env(launcher: &Path, shell_path: Option<&str>) -> Option<PathBuf> {
     if let Some(dir) = launcher.parent() {
         for name in ["node", "node.exe"] {
             let candidate = dir.join(name);
@@ -459,11 +425,33 @@ fn find_node_without_env(launcher: &Path) -> Option<PathBuf> {
             }
         }
     }
-    path_lookup("node").or_else(|| login_shell_lookup("node"))
+    search("node", shell_path)
 }
 
+/// `name` on the app's PATH, then on the login shell's.
+///
+/// `shell_path` is the PATH the `-lic` environment capture imported. It is the one a terminal
+/// sees, including what `.zshrc` adds — which is where nvm and fnm initialise, and which a bare
+/// `$SHELL -lc 'command -v …'` never reads. With it in hand that extra login shell is skipped: it
+/// could only find less, and each one costs up to a second on such a machine. Without it (the
+/// import was off or failed) the `-lc` lookup is still the last resort.
+fn search(name: &str, shell_path: Option<&str>) -> Option<PathBuf> {
+    if let Some(found) = path_lookup(name) {
+        return Some(found);
+    }
+    match shell_path {
+        Some(paths) => path_lookup_in(name, OsStr::new(paths)),
+        None => login_shell_lookup(name),
+    }
+}
+
+/// `name` on the app's own PATH.
 pub(crate) fn path_lookup(name: &str) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
+    path_lookup_in(name, &std::env::var_os("PATH")?)
+}
+
+/// `name` in the directories of `paths`, with the platform's executable extensions.
+pub(crate) fn path_lookup_in(name: &str, paths: &OsStr) -> Option<PathBuf> {
     // Windows resolves `node` to `node.exe` and `dsh` to `dsh.cmd`; a bare name would never
     // match there, which made the system runtime look "not installed".
     // Command extensions first: `npm` alone matches the POSIX wrapper npm ships next to
@@ -475,7 +463,11 @@ pub(crate) fn path_lookup(name: &str) -> Option<PathBuf> {
         .collect();
     #[cfg(not(windows))]
     let names: Vec<String> = vec![name.to_string()];
-    for dir in std::env::split_paths(&paths) {
+    for dir in std::env::split_paths(paths) {
+        // A relative entry would be resolved against this app's working directory.
+        if !dir.is_absolute() {
+            continue;
+        }
         for candidate in &names {
             let path = dir.join(candidate);
             if path.is_file() {
