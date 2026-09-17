@@ -214,22 +214,25 @@ fn the_probe_asks_about_every_shimmed_api_and_the_syntax_floor() {
 }
 
 /// Run a compat block through a real JS engine, as `tests/webkit_compat_shim.rs` does for the
-/// shipped bundle. Skipped where node is unavailable, like that integration test.
-fn run_shim(block: &str, probe: &str) -> Option<String> {
+/// shipped bundle.
+///
+/// `node` has no substitute here: returning early when it is missing made the cases below report
+/// `ok` while asserting nothing, which is how a broken shim stayed green once already (review D6).
+/// A runner without node is a runner that cannot check the compat layer, and it should say so.
+fn run_shim(block: &str, probe: &str) -> String {
     let script = format!("{block}\n{probe}\n");
     let output = std::process::Command::new("node")
         .arg("-e")
         .arg(&script)
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return Some(format!(
-            "node failed: {} {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .expect("node must be on PATH: the compat layer is only checked in a real engine");
+    assert!(
+        output.status.success(),
+        "the shim must run in node: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 /// `String(value).replace(/s/g, "")` deleted every letter `s` instead of whitespace, so a
@@ -244,9 +247,7 @@ fn the_base64_shim_decodes_whitespace_and_keeps_every_other_character() {
       try { out.push(Array.from(Uint8Array.fromBase64("c3lzdGVt")).map(function (b) { return String.fromCharCode(b); }).join("")); } catch (e) { out.push("THREW"); }
       process.stdout.write(out.join(" | "));
     "#;
-    let Some(out) = run_shim(UINT8_FROM_BASE64_SHIM, probe) else {
-        return; // no node on this machine
-    };
+    let out = run_shim(UINT8_FROM_BASE64_SHIM, probe);
     // "hello" twice (once with embedded whitespace), then "system" — whose base64 contains an `s`.
     assert_eq!(out, "104,101,108,108,111 | 104,101,108,108,111 | system");
 }
@@ -263,38 +264,71 @@ fn the_sum_precise_shim_keeps_non_finite_results() {
         Math.sumPrecise([Infinity, -Infinity])
       ].join(" | "));
     "#;
-    let Some(out) = run_shim(MATH_SUM_PRECISE_SHIM, probe) else {
-        return;
-    };
+    let out = run_shim(MATH_SUM_PRECISE_SHIM, probe);
     assert_eq!(out, "Infinity | Infinity | 6 | NaN");
 }
 
 /// With no initial value the first element becomes the accumulator, so the reducer's index starts
 /// at 1 — the shim counted from 0 and handed callers a different index than the spec does.
+///
+/// The block is selected by the name the probe reports (`Iterator`), never by `Iterator.prototype.
+/// reduce`: `compat_script` matches names exactly, so the longer spelling injected *nothing* and
+/// this test then asserted on node own `Iterator.prototype.reduce`, which already numbers calls
+/// the same way. It passed for the wrong reason from the day it was written (review B3).
+///
+/// The driver strips the native helper first and fails when it cannot, so a pass can only come
+/// from the shim, and a machine that cannot run the check fails loudly instead of silently.
 #[test]
 fn the_iterator_reduce_shim_numbers_the_first_call_one() {
+    // The native global is removed *before* the block is injected, the same order the shipped
+    // bundle sees on an old engine: `Iterator` is deletable in node (`configurable: true`), while
+    // the built-in prototype methods are not. Without this the block would guard itself out
+    // (`if (typeof globalThis.Iterator !== "undefined") return`) and the call below would reach
+    // node own implementation — exactly how this case used to pass while proving nothing.
+    // Two things have to go: the global (the block guards itself out when it exists) and the
+    // helper on `%IteratorPrototype%` (node 22 ships iterator helpers, and `defineHelper` skips
+    // a name that is already a function — leaving the native one in place).
+    let strip = [
+        "var proto = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));",
+        "try { delete globalThis.Iterator; } catch (error) {}",
+        "try { delete proto.reduce; } catch (error) {}",
+        "if (typeof proto.reduce === \"function\") { process.stdout.write(\"NATIVE\"); }",
+    ]
+    .join("\n");
+    // The probe only has to run the helper: whatever `reduce` is there now can only be the one
+    // the block just installed, because the native one was deleted above (and if that delete ever
+    // stops working, the strip step has already written `NATIVE` into stdout, which fails the
+    // equality below instead of silently comparing the engine against itself).
     let probe = [
-        "var seen = [];",
-        "[10, 20, 30].values().reduce(function (acc, v, i) { seen.push(i); return acc + v; });",
-        "process.stdout.write(seen.join(','));",
+        "if (typeof globalThis.Iterator !== \"function\") { process.stdout.write(\"NOT-REVIVED\"); }",
+        "else {",
+        "  var seen = [];",
+        "  [10, 20, 30].values().reduce(function (acc, v, i) { seen.push(i); return acc + v; });",
+        "  process.stdout.write(seen.join(','));",
+        "}",
     ]
     .join("\n");
     let script = format!(
-        "{}\n{probe}\n",
-        compat_script(&["Iterator.prototype.reduce".to_string()])
+        "{strip}\n{}\n{probe}\n",
+        compat_script(&["Iterator".to_string()])
     );
-    let Ok(output) = std::process::Command::new("node")
+    let output = std::process::Command::new("node")
         .arg("-e")
         .arg(&script)
         .output()
-    else {
-        return;
-    };
-    if !output.status.success() {
-        // The engine already ships `Iterator.prototype.reduce`: nothing to shim, nothing to check.
-        return;
-    }
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1,2");
+        .expect("node must run: this test cannot pass without a real engine");
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(
+        output.status.success(),
+        "the shim must run in node: {} {}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ne!(
+        stdout, "NOT-REVIVED",
+        "the Iterator block did not install anything: compat_script was given the wrong key"
+    );
+    assert_eq!(stdout, "1,2");
 }
 /// Syntax the client bundles use that no polyfill can add: the module has to parse.
 ///
@@ -703,7 +737,7 @@ fn load_retry_follows_the_started_event_and_never_fails_a_live_port() {
 
 #[test]
 fn download_names_never_collide() {
-    let dir = std::env::temp_dir().join("dsh-desktop-download-test");
+    let dir = crate::test_dir("dsh-desktop-download-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -730,4 +764,52 @@ fn download_names_never_collide() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Exhausting the numbered candidates must not fall back to a name that is already taken.
+///
+/// The old fallback returned the requested name itself, so the one case it existed for — a
+/// thousand files already called `a.pdf` — silently overwrote one of them (review C4).
+#[test]
+fn an_exhausted_name_search_never_reuses_a_taken_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-desktop-download-exhaust-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let name = std::ffi::OsStr::new("a.pdf");
+    std::fs::write(dir.join("a.pdf"), "x").unwrap();
+    for index in 1..1000 {
+        std::fs::write(dir.join(format!("a-{index}.pdf")), "x").unwrap();
+    }
+
+    let chosen = unique_download_path(&dir, name);
+    assert!(
+        !chosen.exists(),
+        "the chosen name must be free: {}",
+        chosen.display()
+    );
+    assert_ne!(
+        chosen,
+        dir.join("a.pdf"),
+        "the existing file must not be reused"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A watcher may only act while its window is still the one it was created for.
+///
+/// Both watchdogs read the window back by label, and after a rebuild that label answers with
+/// the *new* window: without this test a stale loop would reload it, retitle it, or — on the
+/// load watcher `Report` arm — destroy it and replace a working page with a failure page.
+#[test]
+fn a_watcher_stops_acting_once_its_window_was_rebuilt() {
+    assert!(may_act(7, 7));
+    // Any other generation is somebody else window: older or newer, the answer is the same.
+    assert!(!may_act(7, 8));
+    assert!(!may_act(8, 7));
+    assert!(!may_act(0, 1));
 }

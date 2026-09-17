@@ -345,6 +345,10 @@ pub fn ask_choice(
             .and_then(|asked| asked.answer.lock().unwrap().clone())
     });
     *ASKED.lock().unwrap() = None;
+    // The window was grown for the question, and it stays on screen afterwards as the status
+    // page: leaving it at the question size keeps a 520x560 window for one line of text, which
+    // also contradicts `body.asking`, which only applies while the question is up (review C6).
+    size_after_question(app);
     match answer {
         Some(choice) => {
             harness::app_log(&format!("接管确认：用户选择 {}", choice.id));
@@ -828,6 +832,18 @@ fn size_for_question(app: &AppHandle) {
     let _ = window.center();
 }
 
+/// Put the status window back to its ordinary size once the question is answered.
+///
+/// Best effort, like [`size_for_question`]: a window that refuses the resize is not a reason to
+/// fail the answer that was just read.
+fn size_after_question(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(SPLASH) else {
+        return;
+    };
+    let _ = window.set_size(tauri::LogicalSize::new(SPLASH_SIZE.0, SPLASH_SIZE.1));
+    let _ = window.center();
+}
+
 pub fn create_splash(app: &AppHandle) -> tauri::Result<()> {
     let window = WebviewWindowBuilder::new(app, SPLASH, WebviewUrl::App("index.html".into()))
         .title("DeepSeek Harness")
@@ -881,7 +897,9 @@ pub fn allow_next_failure() {
 /// died after a successful start. Rebuilds the splash when it was already closed, and offers the
 /// restart button: the shell can start another Harness in this very process.
 pub fn show_failure(app: &AppHandle, status: &str, detail: &str) {
-    if FAILURE_SHOWN.swap(true, Ordering::SeqCst) {
+    // Read, not swap: the latch is only set once the page is actually on screen (see below), so a
+    // page that never came up cannot silence the next one.
+    if FAILURE_SHOWN.load(Ordering::SeqCst) {
         harness::app_log(&format!(
             "failure page already shown; keeping it instead of: {status}"
         ));
@@ -890,6 +908,12 @@ pub fn show_failure(app: &AppHandle, status: &str, detail: &str) {
     if present_status_page(app) {
         RETRY_OFFERED.store(true, Ordering::SeqCst);
         eval_status(app, "__setFailure", status, detail);
+        FAILURE_SHOWN.store(true, Ordering::SeqCst);
+    } else {
+        // The page could not be put up at all. Latching here would silently swallow every later
+        // terminal page — the user would never see the reason, and the log would only say
+        // "already shown" about a page that was never shown (review B4).
+        FAILURE_SHOWN.store(false, Ordering::SeqCst);
     }
 }
 
@@ -899,7 +923,7 @@ pub fn show_failure(app: &AppHandle, status: &str, detail: &str) {
 /// the running instance and hands only the rendering to the browser, so a restart button there
 /// would kill a working Harness and open a second browser tab.
 pub fn show_notice(app: &AppHandle, status: &str, detail: &str) {
-    if FAILURE_SHOWN.swap(true, Ordering::SeqCst) {
+    if FAILURE_SHOWN.load(Ordering::SeqCst) {
         harness::app_log(&format!(
             "failure page already shown; keeping it instead of: {status}"
         ));
@@ -908,6 +932,10 @@ pub fn show_notice(app: &AppHandle, status: &str, detail: &str) {
     if present_status_page(app) {
         RETRY_OFFERED.store(false, Ordering::SeqCst);
         eval_status(app, "__setStatus", status, detail);
+        FAILURE_SHOWN.store(true, Ordering::SeqCst);
+    } else {
+        // Same rule as [`show_failure`]: a page that never appeared must not latch.
+        FAILURE_SHOWN.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1214,6 +1242,17 @@ pub fn create_harness(
     if let Some(existing) = app.get_webview_window(HARNESS) {
         let _ = existing.destroy();
     }
+    // `destroy` is asynchronous — it posts a `Destroy` message, and the label only leaves the
+    // window table when the resulting `Destroyed` event arrives (`tauri::manager::on_window_close`).
+    // Building the same label in between fails with `WindowLabelAlreadyExists`, and a `Destroyed`
+    // that lands after the build removes the *new* window from that table while it stays on
+    // screen: `get_webview_window(HARNESS)` then answers `None` for ever, so the liveness watch
+    // gives up, crash recovery bails out and the status page can no longer destroy it. Waiting for
+    // the label to come free removes the race; a window that will not go away is reported instead
+    // of being built over.
+    if !wait_for_label_release(app, HARNESS, LABEL_RELEASE_WAIT) {
+        return Err(tauri::Error::WindowLabelAlreadyExists(HARNESS.to_string()));
+    }
     // Set as the page reports its progress. A navigation the webview drops reports nothing at
     // all, which is what the retry thread below watches for.
     let signals = Arc::new(LoadSignals::default());
@@ -1263,8 +1302,13 @@ pub fn create_harness(
         .on_download(move |_webview, event| {
             match event {
                 DownloadEvent::Requested { url, destination } => {
-                    *destination =
-                        unique_download_path(&downloads_dir(), &file_name_of(destination));
+                    let Some(dir) = downloads_dir() else {
+                        harness::app_log(&format!("download dropped (no directory): {url}"));
+                        // Refusing here is the point: wry treats a `false` return as "do not
+                        // download", which is better than writing the file next to the process.
+                        return false;
+                    };
+                    *destination = unique_download_path(&dir, &file_name_of(destination));
                     harness::app_log(&format!(
                         "download started: {url} -> {}",
                         destination.display()
@@ -1286,19 +1330,25 @@ pub fn create_harness(
     }
     let window = builder.build()?;
 
+    // Both watchers are created with the generation this window got, and both consult it before
+    // touching anything: a rebuild bumps it, which is how an old thread learns that the label
+    // now answers with somebody else window.
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+
     // A first navigation that never renders used to leave a blank window with nothing in the
     // log. The token URL is safe to revisit (measured: it is not single-use), so retry it.
     let watcher = window.clone();
     let watcher_app = window.app_handle().clone();
     let target = url.clone();
-    std::thread::spawn(move || watch_first_load(watcher_app, watcher, target, port, signals));
+    std::thread::spawn(move || {
+        watch_first_load(watcher_app, watcher, target, port, signals, generation)
+    });
 
     // From here on the page is on its own: a WebContent process killed under memory pressure, or
     // a main thread wedged by a plugin, leaves a window that looks alive and answers nothing —
     // including the UI's own reconnection logic, which lives in that very process.
     let alive_app = window.app_handle().clone();
     let alive_url = url.clone();
-    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || watch_page_liveness(alive_app, alive_url, generation));
 
     // Closing the Harness window quits the app, which stops the supervised process.
@@ -1407,14 +1457,25 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64) {
             harness::app_log("页面存活检查结束：harness 窗口已不在");
             return;
         };
+        // Checked BEFORE anything is done to that window. The label answers with the *new*
+        // window after a rebuild, so a loop that only checked at the end of its iteration would
+        // reload or report on a page it never watched — with the old streak behind it.
+        if !may_act(generation, GENERATION.load(Ordering::SeqCst)) {
+            harness::app_log("页面存活检查结束：harness 窗口已被重建");
+            return;
+        }
         let answer = probe_frames(&window);
         let state = judge_frames(answer, frames);
         if let Some(count) = answer {
             frames = Some(count);
         }
-        // Only asked once a probe has already failed: a healthy page needs no second question,
-        // and the answer costs another round trip through the UI process.
-        let busy = state != PageState::Drawing && page_is_busy(probe_activity(&window).as_deref());
+        // Only asked once a probe has already failed, and only of a page that still answers: a
+        // healthy page needs no second question, and a silent one cannot answer this either —
+        // asking it anyway spends the full [`LIVENESS_TIMEOUT`] on every failed cycle, which
+        // pushed the whole recovery from ~45 s to ~100 s (review C2). `Silent` is by definition
+        // "not busy", so skipping the question changes no decision.
+        let busy =
+            matches!(state, PageState::Frozen) && page_is_busy(probe_activity(&window).as_deref());
         match liveness_action(state, attended(&window), busy, misses, reloads) {
             LivenessAction::Alive => {
                 if misses > 0 || reloads > 0 {
@@ -1481,9 +1542,9 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64) {
                 return;
             }
         }
-        // A window that was replaced while a probe was in flight belongs to another watchdog:
-        // reloading it from here would fight the newer one over the same label.
-        if generation != GENERATION.load(Ordering::SeqCst) {
+        // The window may also have been replaced while a probe was in flight: same test, so the
+        // loop stops before the next iteration can act on a page this watchdog never watched.
+        if !may_act(generation, GENERATION.load(Ordering::SeqCst)) {
             harness::app_log("页面存活检查结束：harness 窗口已被重建");
             return;
         }
@@ -1537,6 +1598,40 @@ fn probe_frames(window: &WebviewWindow) -> Option<u64> {
 /// Bumped every time the window is rebuilt, so an old watchdog can tell it lost its subject.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// How long a rebuilt window waits for the previous one to leave the window table.
+///
+/// The `Destroyed` event normally lands within a frame or two; this only has to cover a busy UI
+/// thread. It is not a timeout to wait out — it is the point at which rebuilding over a window
+/// that refused to go away becomes a worse outcome than reporting the failure.
+const LABEL_RELEASE_WAIT: Duration = Duration::from_secs(2);
+
+/// Whether a watchdog may still act: false once the window it was watching was replaced.
+///
+/// Each watcher is created with the generation its window got, and every action it takes — a
+/// reload, a title change, a failure page — has to be checked against the current one. Reading
+/// the window by label is not enough on its own: after a rebuild that label answers with the
+/// *new* window, so an old loop would otherwise reload or report on a page it never watched.
+fn may_act(generation: u64, current: u64) -> bool {
+    generation == current
+}
+
+/// Wait up to `wait` for `label` to leave the window table (see [`create_harness`]).
+fn wait_for_label_release(app: &AppHandle, label: &str, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        if app.get_webview_window(label).is_none() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            harness::app_log(&format!(
+                "等待窗口 {label} 释放超时（{wait:?}）：上一次 destroy 还没有落地，放弃重建"
+            ));
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// What to do after the page missed its load deadline.
 #[derive(Debug, PartialEq, Eq)]
 enum LoadOutcome {
@@ -1587,9 +1682,17 @@ fn watch_first_load(
     url: Url,
     port: u16,
     signals: Arc<LoadSignals>,
+    generation: u64,
 ) {
     for attempt in 1..=LOAD_ATTEMPTS {
         if wait_for_load(&signals, LOAD_TIMEOUT) {
+            return;
+        }
+        // A replaced window is not this watcher subject any more — and the check matters most
+        // on the `Report` arm below, which destroys whatever is on screen: without it a stale
+        // loop would tear down the new, working window and put a failure page in its place.
+        if !may_act(generation, GENERATION.load(Ordering::SeqCst)) {
+            harness::app_log("首次加载检查结束：harness 窗口已被重建");
             return;
         }
         let window_alive = app.get_webview_window(HARNESS).is_some();
@@ -1650,11 +1753,37 @@ fn port_serving(port: u16) -> bool {
     matches!(harness::probe(port), harness::Probe::Harness)
 }
 
-fn downloads_dir() -> PathBuf {
-    let base = crate::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let dir = base.join("Downloads");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+/// Where a download lands: the platform download directory, then `$HOME/Downloads`.
+///
+/// `$HOME/Downloads` is a macOS convention: on Linux the directory is whatever XDG says
+/// (`~/下载`, another disk) and on Windows it is the shell known folder, which the user can move
+/// anywhere. Both are read from the environment the platform actually publishes rather than
+/// guessed, and the fallback is only for a machine that publishes neither (review C3).
+fn downloads_dir() -> Option<PathBuf> {
+    let candidates: Vec<PathBuf> = [
+        // XDG: `user-dirs.dirs` is sourced by the session, which exports the result.
+        std::env::var_os("XDG_DOWNLOAD_DIR").map(PathBuf::from),
+        // Windows publishes the shell folders; `%USERPROFILE%\Downloads` is the usual value.
+        std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join("Downloads")),
+        crate::home_dir().map(|home| home.join("Downloads")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for dir in candidates {
+        // A relative entry would resolve against this process, which is never what it means.
+        if !dir.is_absolute() {
+            continue;
+        }
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return Some(dir);
+        }
+    }
+    // No home directory at all: refusing the download leaves the user able to pick another
+    // route, while writing into the process working directory (what this used to do) drops the
+    // file somewhere they will never look (review C3).
+    harness::app_log("找不到下载目录（HOME 与 XDG_DOWNLOAD_DIR 都不可用），拒绝本次下载");
+    None
 }
 
 /// Never overwrite an existing download: `report.pdf` becomes `report-1.pdf` when taken.
@@ -1681,7 +1810,18 @@ fn unique_download_path(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
             return candidate;
         }
     }
-    dir.join(name)
+    // A thousand taken names is not a reason to overwrite the file that is already there — the
+    // old fallback returned exactly that name, so the download silently replaced it. A timestamp
+    // is unique enough to finish the download, and readable enough to find again (review C4).
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let file = match &extension {
+        Some(extension) => format!("{stem}-{stamp}.{extension}"),
+        None => format!("{stem}-{stamp}"),
+    };
+    dir.join(file)
 }
 
 fn file_name_of(suggested: &std::path::Path) -> std::ffi::OsString {
