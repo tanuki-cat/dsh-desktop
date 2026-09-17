@@ -22,3 +22,6 @@ src-tauri/gen/
 
 # local release artifacts (the CI writes its zips to the same directory)
 dist/
+
+# Finder metadata: it appears in every directory macOS touches, including this one
+.DS_Store

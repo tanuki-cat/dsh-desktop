@@ -196,16 +196,21 @@ RUNTIME_DIR       := $(TAURI_DIR)/runtime
 RUNTIME_CACHE     := .runtime-cache
 # 交叉编译时（TARGET 非空）必须按**目标**平台 staging：在 arm64 runner 上打 x64 包却塞进 arm64 的
 # node，产物装到目标机上直接起不来。Rust 三元组的第一段就是架构（x86_64-apple-darwin → x86_64）。
+# `make windows` 走的是 WINDOWS_TARGET，同样要按它的架构取 node（见下面的 NODE_OS 判定）。
 NODE_ARCH_HOST    := $(shell uname -m | sed -e s/arm64/arm64/ -e s/aarch64/arm64/ -e s/x86_64/x64/)
-NODE_ARCH_TARGET  := $(shell echo "$(TARGET)" | cut -d- -f1 | sed -e s/aarch64/arm64/ -e s/x86_64/x64/)
-NODE_ARCH         := $(if $(TARGET),$(NODE_ARCH_TARGET),$(NODE_ARCH_HOST))
+NODE_TRIPLE       := $(if $(TARGET),$(TARGET),$(if $(filter windows,$(MAKECMDGOALS)),$(WINDOWS_TARGET)))
+NODE_ARCH_TARGET  := $(shell echo "$(NODE_TRIPLE)" | cut -d- -f1 | sed -e s/aarch64/arm64/ -e s/x86_64/x64/)
+NODE_ARCH         := $(if $(NODE_TRIPLE),$(NODE_ARCH_TARGET),$(NODE_ARCH_HOST))
 ifeq ($(PLATFORM),macos)
 NODE_OS           := darwin
 else
 NODE_OS           := linux
 endif
-# make windows（交叉编译实验）时 tarball 也要跟着换，否则 staging 里会混进 unix 的 node
-ifneq ($(findstring windows,$(TARGET)),)
+# make windows（交叉编译实验）时 tarball 也要跟着换，否则 staging 里会混进 unix 的 node。
+# 判据是「TARGET 指向 windows」或「本次的目标就是 windows」：windows: 目标用的是
+# WINDOWS_TARGET 而不是 TARGET，只看 TARGET 会让这条分支对文档里的用法永不生效（review D5）。
+# 也不能直接看 WINDOWS_TARGET —— 它有 `?=` 默认值，在任何平台上都非空。
+ifneq ($(findstring windows,$(TARGET))$(filter windows,$(MAKECMDGOALS)),)
 NODE_OS           := win
 endif
 ifeq ($(NODE_OS),win)

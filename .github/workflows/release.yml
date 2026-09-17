@@ -41,6 +41,40 @@ jobs:
           echo "tauri.conf.json=$version  Cargo.toml=$cargo_version  package.json=$node_version"
           [ "$version" = "$cargo_version" ] || { echo "::error::Cargo.toml 与 tauri.conf.json 版本不一致"; exit 1; }
           [ "$version" = "$node_version" ] || { echo "::error::package.json 与 tauri.conf.json 版本不一致"; exit 1; }
+
+          # 随包运行时的版本来自三个地方：Makefile（macOS/Linux 的 runtime-stage）、
+          # scripts/stage-runtime.sh（Windows 的 staging）、以及 windows-portable.yml 里两份
+          # workflow 默认值（workflow_dispatch 与 workflow_call 各一份）。它们此前没有任何
+          # 门禁 —— 改了 Makefile 却漏改 workflow 默认值时，同一个 tag 下 Windows 便携包与
+          # macOS/Linux 包会带不同版本的 dsh / Node，而 Release 正文仍宣称单一版本（review B6）。
+          #
+          # The awk below walks each input block: the key line sets the indentation, and the
+          # first `default:` at a deeper one is its value. Plain `grep -A2` was tried first and
+          # silently matched nothing, which would have made this check vacuous.
+          workflow_value() {
+            awk -v key="$1:" '
+              {
+                match($0, /^ */); indent = RLENGTH
+                if ($1 == key) { keyindent = indent; inside = 1; next }
+                if (inside) {
+                  if (indent <= keyindent && $0 !~ /^ *$/) { inside = 0; next }
+                  if ($1 == "default:") { print $2 }
+                }
+              }' .github/workflows/windows-portable.yml | sort -u
+          }
+          for name in NODE_VERSION DSH_VERSION; do
+            make_value=$(grep -m1 "^$name " Makefile | awk '{ print $3 }')
+            lower=$(printf %s "$name" | tr "A-Z" "a-z")
+            script_value=$(grep -m1 "^${lower}=" scripts/stage-runtime.sh | sed -e "s/^[^:]*:-//" -e "s/}.*$//")
+            portable_values=$(workflow_value "$lower")
+            echo "$name: Makefile=$make_value  stage-runtime.sh=$script_value  windows-portable.yml=$(printf %s "$portable_values" | tr "\n" " ")"
+            [ -n "$make_value" ] || { echo "::error::Makefile 里找不到 $name"; exit 1; }
+            [ -n "$portable_values" ] || { echo "::error::windows-portable.yml 里找不到 $lower 的默认值"; exit 1; }
+            [ "$make_value" = "$script_value" ] || { echo "::error::$name 在 Makefile 与 stage-runtime.sh 之间不一致（$make_value vs $script_value）"; exit 1; }
+            for portable in $portable_values; do
+              [ "$portable" = "$make_value" ] || { echo "::error::$name 在 Makefile 与 windows-portable.yml 之间不一致（$make_value vs $portable）"; exit 1; }
+            done
+          done
           if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
             echo "::error::tag ${GITHUB_REF_NAME} 与清单版本 v${version} 不一致，请先改版本号再打 tag"
             exit 1
@@ -124,7 +158,7 @@ jobs:
             .runtime-cache/SHASUMS256*.txt
             .runtime-cache/npm
             .runtime-cache/pnpm-store
-          key: runtime-${{ runner.os }}-${{ matrix.suffix }}-${{ hashFiles('src-tauri/runtime.lock', 'Makefile', 'scripts/stage-runtime.sh', 'scripts/make-profile-template.sh') }}
+          key: runtime-${{ runner.os }}-${{ matrix.suffix }}-${{ hashFiles('src-tauri/runtime.lock', 'Makefile', 'scripts/stage-runtime.sh', 'scripts/make-profile-template.sh', 'scripts/check-runtime-stage.sh') }}
           restore-keys: |
             runtime-${{ runner.os }}-${{ matrix.suffix }}-
 
@@ -363,6 +397,13 @@ jobs:
           MD
           sed -i.bak "s|__VERSION__|${VERSION}|g" notes.md && rm -f notes.md.bak   # GNU/BSD sed 都可用
           head -5 notes.md
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes-file notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A re-run rebuilds notes.md (new artifact names, new text); uploading over an
+            # existing release used to leave the *old* body in place, so the published notes and
+            # the published files could disagree (review D3).
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md
+          fi
           gh release upload "$TAG" dist/* --clobber
           gh release view "$TAG" --json url --jq .url

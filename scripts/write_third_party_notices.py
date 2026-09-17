@@ -103,6 +103,15 @@ def main():
         handle.write("\n".join(lines))
     unknown = sum(1 for line in lines if "| UNKNOWN |" in line)
     print(f"已写入 {out}（UNKNOWN 条目 {unknown} 个）")
+    # An UNKNOWN license is a distribution question, not a formatting one: shipping a tree whose
+    # license nobody could name needs a deliberate decision, so failing here makes that decision
+    # visible instead of leaving it in a table nobody reads (review D4).
+    if unknown:
+        print(
+            f"{unknown} 个包没有声明 license：确认许可后再发布（不要只改这一行）",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
