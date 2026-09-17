@@ -43,12 +43,38 @@ first_of() {
   return 0
 }
 
+# 可执行内容与普通文件分开判：tauri 复制资源会保留 mode，所以丢可执行位的 node/pnpm 会一路
+# 进包，而"存在"这一条完全看不出来（review A2：实测 chmod -x 后闸门仍 exit 0）。
+# Windows 上可执行性不是 mode 位，退化为"存在且不是目录"。
+first_exec_of() {
+  first_of "$@"
+  candidate=$first_of_result
+  [ -n "$candidate" ] || return 0
+  if [ -d "$candidate" ]; then
+    echo "  [坏]   $candidate 是目录，不是可执行文件" >&2
+    missing="$missing $candidate"
+    first_of_result=""
+    return 0
+  fi
+  if [ -x "$candidate" ]; then
+    return 0
+  fi
+  # Git Bash 里 Windows 的 .exe 未必带执行位；只要不是目录就放行。
+  case "$candidate" in
+    *.exe | *.cmd | *.bat) return 0 ;;
+  esac
+  echo "  [坏]   $candidate 没有可执行位" >&2
+  missing="$missing $candidate"
+  first_of_result=""
+  return 0
+}
+
 echo "必需内容："
-first_of "$root/node/bin/node" "$root/node/node.exe"; node_bin=$first_of_result
+first_exec_of "$root/node/bin/node" "$root/node/node.exe"; node_bin=$first_of_result
 first_of "$root/node/lib/node_modules/npm/bin/npm-cli.js" "$root/node/node_modules/npm/bin/npm-cli.js"; npm_cli=$first_of_result
 first_of "$root/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/package.json" "$root/dsh-prefix/node_modules/@deepseek-ai/dsh/package.json"; dsh_pkg=$first_of_result
 first_of "$root/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/lib/bin.js" "$root/dsh-prefix/node_modules/@deepseek-ai/dsh/lib/bin.js"; dsh_js=$first_of_result
-first_of "$root/tools/bin/pnpm" "$root/tools/pnpm" "$root/tools/pnpm.cmd"; pnpm_bin=$first_of_result
+first_exec_of "$root/tools/bin/pnpm" "$root/tools/pnpm" "$root/tools/pnpm.cmd"; pnpm_bin=$first_of_result
 first_of "$root/profile-template/package.json"; template=$first_of_result
 first_of "$root/profile-template/node_modules/dshmarket/package.json"; market=$first_of_result
 first_of "$root/profile-template/pnpm-lock.yaml"; lock=$first_of_result
