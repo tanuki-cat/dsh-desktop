@@ -138,7 +138,10 @@
         document.getElementById("status").textContent = pending[0];
         var box = document.getElementById("detail");
         box.textContent = pending[1] || "";
-        document.body.classList.toggle("error", Boolean(pending[1]));
+        // The third slot is the terminal flag, not the detail text: every progress message
+        // carries a detail line (the runtime, the port, the version), so keying ".error" off
+        // `pending[1]` hid the spinner on a perfectly healthy start (review C5).
+        document.body.classList.toggle("error", Boolean(pending[2]));
         var retry = document.getElementById("retry");
         retry.hidden = !pending[2];
         if (!retry.hidden) {
@@ -180,14 +183,23 @@
               var buttons = box.querySelectorAll("button");
               for (var j = 0; j < buttons.length; j++) buttons[j].disabled = true;
               button.textContent = "已选择：" + option.label;
+              // `invoke` resolves asynchronously, so a rejected promise is NOT caught by a
+              // surrounding try/catch — it becomes an unhandled rejection and the page keeps
+              // saying "已选择" while Rust waits out the full 120 s. The answer then falls back
+              // to `config.json`, which can be the opposite of the button just pressed (with
+              // `take_over_existing: true`, "keep it" ends up taking the instance over).
+              var failed = function () {
+                button.textContent = "选择没有送达，请关闭窗口重开";
+              };
               try {
-                window.__TAURI_INTERNALS__.invoke("plugin:event|emit", {
+                var sent = window.__TAURI_INTERNALS__.invoke("plugin:event|emit", {
                   event: "dsh-desktop:takeover-choice",
                   payload: { question: question, id: option.id }
                 });
+                if (sent && typeof sent.catch === "function") sent.catch(failed);
               } catch (error) {
-                // Rust never heard the answer: say so instead of leaving a dead page.
-                button.textContent = "选择没有送达，请关闭窗口重开";
+                // A synchronous throw (no IPC bridge at all) lands here.
+                failed();
               }
             });
             box.appendChild(button);

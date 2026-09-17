@@ -10,6 +10,12 @@ use dsh_desktop_lib::window;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// A per-process temporary directory, so two `cargo test` runs on one machine (another checkout,
+/// or two CI jobs sharing a runner) cannot delete each other's files mid-test (review D7).
+fn test_dir(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
+}
+
 fn path_lookup(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
@@ -60,13 +66,21 @@ fn page_head_scripts() -> String {
     scripts
 }
 
+/// The node these tests run in, or a loud stop.
+///
+/// It used to return an empty string when node was missing, and every caller only printed what it
+/// got back — so three cases reported `ok` while asserting nothing at all. A diagnostic that
+/// cannot run must not look like one that passed (review D6).
+fn require_node() -> PathBuf {
+    path_lookup("node").unwrap_or_else(|| {
+        panic!("node must be on PATH: these cases run the compat layer in a real engine")
+    })
+}
+
 /// Runs one generated script through a node driver, returning its stdout.
 fn run_in_node(name: &str, driver: &str, script: &str, extra_arg: Option<&str>) -> String {
-    let Some(node) = path_lookup("node") else {
-        eprintln!("skipped: node is not on PATH");
-        return String::new();
-    };
-    let dir = std::env::temp_dir().join(format!("dsh-desktop-{name}"));
+    let node = require_node();
+    let dir = test_dir(&format!("dsh-desktop-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir must be creatable");
     let script_path = dir.join("script.js");
@@ -104,11 +118,8 @@ fn run_in_node_with_page(
     script: &str,
     extra_arg: Option<&str>,
 ) -> String {
-    let Some(node) = path_lookup("node") else {
-        eprintln!("skipped: node is not on PATH");
-        return String::new();
-    };
-    let dir = std::env::temp_dir().join(format!("dsh-desktop-{name}"));
+    let node = require_node();
+    let dir = test_dir(&format!("dsh-desktop-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir must be creatable");
     let driver_path = dir.join("driver.js");
@@ -307,6 +318,9 @@ fn the_compat_layer_revives_an_engine_without_those_apis() {
         .join(", ");
     let driver = DRIVER.replace("%PATHS%", &format!("[{paths}]"));
     let stdout = run_in_node("dsh-desktop-compat-shim-test", &driver, &script, None);
+    // The driver asserts everything that matters; this only proves it ran at all, so a silently
+    // skipped case can never be read as a passing one (review D6).
+    assert!(!stdout.trim().is_empty(), "the driver must report");
     println!("{}", stdout.trim());
 }
 
@@ -419,6 +433,96 @@ fn the_takeover_panel_renders_its_options_and_reports_the_click() {
         "",
         Some(window::CHOICE_EVENT),
     );
+    // The driver asserts everything that matters; this only proves it ran at all, so a silently
+    // skipped case can never be read as a passing one (review D6).
+    assert!(!stdout.trim().is_empty(), "the driver must report");
+    println!("{}", stdout.trim());
+}
+
+/// The other half of the click: what the page does when the answer never reaches Rust.
+///
+/// `invoke` is asynchronous, so a rejected promise escapes a surrounding `try/catch`. Left
+/// unhandled it becomes an unhandled rejection the page never notices, the button keeps saying
+/// "已选择", and Rust waits out the full 120 s before falling back to `config.json` — which can
+/// be the opposite of the button that was pressed.
+const CHOICE_REJECT_DRIVER: &str = r#"
+const assert = require("assert");
+const fs = require("fs");
+const vm = require("vm");
+
+const makeElement = function (tag) {
+  const element = {
+    tagName: tag.toUpperCase(),
+    children: [],
+    hidden: false,
+    disabled: false,
+    listeners: {},
+    _text: "",
+    appendChild(child) { this.children.push(child); return child; },
+    removeChild(child) { this.children = this.children.filter((c) => c !== child); return child; },
+    addEventListener(name, fn) { (this.listeners[name] = this.listeners[name] || []).push(fn); },
+    click() { (this.listeners.click || []).forEach((fn) => fn.call(this)); },
+    querySelectorAll() {
+      const found = [];
+      const walk = (node) => { if (node.tagName === "BUTTON") found.push(node); node.children.forEach(walk); };
+      this.children.forEach(walk);
+      return found;
+    },
+    classList: { toggle() {} }
+  };
+  Object.defineProperty(element, "firstChild", { get() { return this.children[0] || null; } });
+  Object.defineProperty(element, "textContent", {
+    get() { return this._text; },
+    set(value) { this._text = String(value); this.children = []; }
+  });
+  return element;
+};
+
+const byId = {};
+globalThis.document = {
+  body: makeElement("body"),
+  getElementById(id) { return (byId[id] = byId[id] || makeElement("div")); },
+  createElement(tag) { return makeElement(tag); }
+};
+globalThis.window = globalThis;
+let calls = 0;
+// A bridge that is there but fails: exactly the case a synchronous try/catch cannot see.
+globalThis.__TAURI_INTERNALS__ = {
+  invoke() { calls += 1; return Promise.reject(new Error("ipc down")); }
+};
+
+const page = fs.readFileSync(process.argv[4], "utf8");
+const bodies = [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+bodies.forEach((body) => vm.runInThisContext(body, { filename: "page.js" }));
+
+globalThis.__askChoice(3, "检测到其它 Harness", "pid 4242", [{ id: "browser", label: "保留它，用系统浏览器打开" }], "");
+const button = byId.choice.querySelectorAll()[0];
+button.click();
+assert.strictEqual(calls, 1, "the click must try to report itself");
+
+// The rejection is reported on the next microtask turn; `await` in a driver would need a wrapper,
+// so the check runs from the promise queue instead and fails the process on a mismatch.
+Promise.resolve().then(() => {
+  assert.strictEqual(
+    button.textContent,
+    "选择没有送达，请关闭窗口重开",
+    "a failed answer must say so instead of claiming the choice was made"
+  );
+  console.log("choice failure path ok: " + button.textContent);
+}).catch((error) => { console.error(error.message); process.exit(1); });
+"#;
+
+#[test]
+fn a_choice_that_never_reaches_rust_says_so() {
+    let stdout = run_in_node_with_page(
+        "dsh-desktop-choice-reject-test",
+        CHOICE_REJECT_DRIVER,
+        "",
+        Some(window::CHOICE_EVENT),
+    );
+    // The driver asserts everything that matters; this only proves it ran at all, so a silently
+    // skipped case can never be read as a passing one (review D6).
+    assert!(!stdout.trim().is_empty(), "the driver must report");
     println!("{}", stdout.trim());
 }
 
@@ -431,5 +535,8 @@ fn the_probe_reports_what_an_old_engine_lacks() {
         &window::probe_script(),
         Some(window::PROBE_EVENT),
     );
+    // The driver asserts everything that matters; this only proves it ran at all, so a silently
+    // skipped case can never be read as a passing one (review D6).
+    assert!(!stdout.trim().is_empty(), "the driver must report");
     println!("{}", stdout.trim());
 }
