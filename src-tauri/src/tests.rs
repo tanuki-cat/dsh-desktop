@@ -53,7 +53,7 @@ fn self_heal_keeps_a_record_it_can_reuse_and_clears_a_stale_one() {
 
 #[test]
 fn a_seed_copy_is_all_or_nothing() {
-    let root = std::env::temp_dir().join("dsh-desktop-copy-tree-test");
+    let root = crate::test_dir("dsh-desktop-copy-tree-test");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let target = root.join("profiles/web");
@@ -90,7 +90,7 @@ fn a_missing_home_never_becomes_the_filesystem_root() {
 
 #[test]
 fn a_bad_workspace_is_repaired_in_memory_only() {
-    let dir = std::env::temp_dir().join("dsh-desktop-repair-test");
+    let dir = crate::test_dir("dsh-desktop-repair-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -122,7 +122,7 @@ fn a_bad_workspace_is_repaired_in_memory_only() {
 
 #[test]
 fn a_bad_dsh_path_is_ignored_in_memory_only() {
-    let dir = std::env::temp_dir().join("dsh-desktop-dsh-path-test");
+    let dir = crate::test_dir("dsh-desktop-dsh-path-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -202,7 +202,7 @@ fn a_port_override_lasts_for_one_launch_only() {
 
 #[test]
 fn finds_a_seed_under_the_resource_directory() {
-    let dir = std::env::temp_dir().join("dsh-desktop-seed-test");
+    let dir = crate::test_dir("dsh-desktop-seed-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("runtime/node/bin")).unwrap();
     std::fs::write(dir.join("runtime/node/bin/node"), "").unwrap();
@@ -215,7 +215,7 @@ fn finds_a_seed_under_the_resource_directory() {
 
 #[test]
 fn forcing_bundled_resolves_into_the_seed_tree() {
-    let root = std::env::temp_dir().join("dsh-desktop-resolve-test");
+    let root = crate::test_dir("dsh-desktop-resolve-test");
     let seed = root.join("runtime");
     let dsh_dir = seed.join("dsh-prefix/lib/node_modules/@deepseek-ai/dsh");
     let _ = std::fs::remove_dir_all(&root);
@@ -310,7 +310,7 @@ fn the_system_runtime_gate_only_refuses_what_it_must() {
 
 #[test]
 fn system_updates_defaults_to_leaving_the_user_install_alone() {
-    let dir = std::env::temp_dir().join("dsh-desktop-system-updates-test");
+    let dir = crate::test_dir("dsh-desktop-system-updates-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -333,7 +333,7 @@ fn system_updates_defaults_to_leaving_the_user_install_alone() {
 /// shell may touch something it does not own, so each is asserted rather than assumed.
 #[test]
 fn defaults_do_not_take_over_foreign_state() {
-    let dir = std::env::temp_dir().join("dsh-desktop-config-defaults-test");
+    let dir = crate::test_dir("dsh-desktop-config-defaults-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let config = Config::load(&dir);
@@ -364,7 +364,7 @@ fn runtime_preference_parses_the_env_spelling() {
 
 #[test]
 fn partial_configs_parse_and_broken_ones_are_not_overwritten() {
-    let dir = std::env::temp_dir().join("dsh-desktop-config-test");
+    let dir = crate::test_dir("dsh-desktop-config-test");
     let _ = std::fs::remove_dir_all(&dir);
 
     // Missing file: defaults are seeded once.
@@ -390,7 +390,7 @@ fn partial_configs_parse_and_broken_ones_are_not_overwritten() {
 
 #[test]
 fn a_workspace_that_is_not_a_usable_directory_is_repaired() {
-    let dir = std::env::temp_dir().join("dsh-desktop-workspace-test");
+    let dir = crate::test_dir("dsh-desktop-workspace-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -509,7 +509,7 @@ fn a_profile_without_the_market_says_so_instead_of_going_quiet() {
 
 #[test]
 fn the_child_path_carries_the_bundled_tools_that_hold_pnpm() {
-    let data_dir = std::env::temp_dir().join("dsh-desktop-child-env-test");
+    let data_dir = crate::test_dir("dsh-desktop-child-env-test");
     let _ = std::fs::remove_dir_all(&data_dir);
     let config = Config::load(&data_dir);
     // Absolute on the host platform: a leading `/` is root-relative on Windows, and
@@ -567,7 +567,7 @@ fn the_child_path_carries_the_bundled_tools_that_hold_pnpm() {
 
 #[test]
 fn seeding_reports_itself_so_the_first_launch_stays_offline() {
-    let root = std::env::temp_dir().join("dsh-desktop-seed-outcome-test");
+    let root = crate::test_dir("dsh-desktop-seed-outcome-test");
     let _ = std::fs::remove_dir_all(&root);
     let seed = root.join("runtime");
     let template = seed.join("profile-template");
@@ -744,4 +744,19 @@ fn a_kept_instance_blocks_only_a_swap_of_the_tree_it_may_use() {
     assert!(swap_conflicts(target, true, true, Some(ours)));
     assert!(!swap_conflicts(target, true, true, Some(other)));
     assert!(swap_conflicts(target, true, true, None));
+}
+
+/// The 3d swap is refused when any of the three "somebody may be using this tree" signals
+/// fires, and allowed only when none of them does.
+#[test]
+fn only_a_clear_field_lets_the_staged_tree_be_committed() {
+    assert!(!swap_blocked(false, false, false));
+    // The user kept the instance that may be running this tree.
+    assert!(swap_blocked(true, false, false));
+    // A Harness took the port this launch is about to spawn on.
+    assert!(swap_blocked(false, true, false));
+    // A Harness is still on the port detection started from: it is not in state.json, so
+    // neither the reuse branch nor the `Some(pid)` branch would have stopped it.
+    assert!(swap_blocked(false, false, true));
+    assert!(swap_blocked(true, true, true));
 }

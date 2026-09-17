@@ -958,6 +958,24 @@ fn swap_conflicts(target: &Path, target_exists: bool, owned: bool, command: Opti
     }
 }
 
+/// Whether the verified tree must stay staged because somebody is still serving from it.
+///
+/// Pure, so the matrix is testable. Three independent reasons, any one of which is enough:
+///
+/// - `kept_conflict` — the user asked to keep the instance on the original port and it may be
+///   running this very tree (see [`swap_conflicts`]);
+/// - `raced` — a Harness appeared on the *spawn* port after detection, so the new tree cannot
+///   boot there anyway;
+/// - `raced_original` — a Harness appeared on the *original* port while this launch was moved
+///   elsewhere. Nothing else covers this one: the instance is not in `state.json` (the
+///   watchdog restarted it while an update was staging, so the reuse branch does not adopt it
+///   and the `Some(pid)` branch does not stop it), yet it serves from the tree the swap would
+///   rename away. Committing anyway leaves the app rolling a broken tree back and restarting
+///   onto it — a failure page it cannot leave (see the v0.4.4 review, item A1).
+fn swap_blocked(kept_conflict: bool, raced: bool, raced_original: bool) -> bool {
+    kept_conflict || raced || raced_original
+}
+
 /// Forget a supervised pid without signalling it (used when the process is already gone).
 fn disown(pid: u32) {
     let mut guard = LIVE.lock().unwrap();
@@ -1489,6 +1507,10 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
     // The port this run uses, which is the configured one unless an earlier takeover question
     // moved it (see [`PORT_OVERRIDE`]). Mutable because the question below can move it again.
     let mut port = runtime_port(config.port);
+    // The port this launch was configured for, kept unchanged while `port` follows an answer
+    // that moves the launch elsewhere. The swap in 3d needs it: a stale instance left on the
+    // original port is exactly the one nothing else notices (see `swap_blocked`).
+    let configured_port = port;
     // The two paths every startup failure is traced back to; cheap to log, and the only way
     // to diagnose a machine we cannot run on.
     harness::app_log(&format!(
@@ -1639,6 +1661,28 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
     ] {
         if let Err(error) = std::fs::create_dir_all(&dir) {
             harness::app_log(&format!("无法创建 {}: {error}", dir.display()));
+        }
+    }
+
+    // 3b2) The shell drives the CLI through `--profile web --patch … --no-open --port N` and reads
+    //      its startup line. Versions outside the range we test against may change either, so say so
+    //      now instead of failing later with a timeout that hides the real reason.
+    //
+    //      Placed before the update check on purpose: a version this shell refuses to boot must not
+    //      be staged, and must not have the running instance stopped for it either. The staging
+    //      step below builds a ~290 MB tree and (on the plugin path) stops a live Harness, all of
+    //      which is wasted when the launch then refuses to start — and the stop is worse than
+    //      wasted, because the refusal returns without ever starting a replacement (review C1).
+    let compatibility = update::compatibility(&version);
+    let untested = !matches!(compatibility, update::Compatibility::Tested);
+    if untested {
+        harness::app_log(&format!("warning: {}", compatibility.describe()));
+        if config.require_tested_dsh {
+            return Err(format!(
+                "{}\n\n如需强行使用，请在 config.json 里设置 \"require_tested_dsh\": false。",
+                compatibility.describe()
+            )
+            .into());
         }
     }
 
@@ -1907,22 +1951,6 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
         }
     }
 
-    // 3b2) The shell drives the CLI through `--profile web --patch … --no-open --port N` and reads
-    //      its startup line. Versions outside the range we test against may change either, so say so
-    //      now instead of failing later with a timeout that hides the real reason.
-    let compatibility = update::compatibility(&version);
-    let untested = !matches!(compatibility, update::Compatibility::Tested);
-    if untested {
-        harness::app_log(&format!("warning: {}", compatibility.describe()));
-        if config.require_tested_dsh {
-            return Err(format!(
-                "{}\n\n如需强行使用，请在 config.json 里设置 \"require_tested_dsh\": false。",
-                compatibility.describe()
-            )
-            .into());
-        }
-    }
-
     // Whether the detection step signalled something and must therefore wait for the port to
     // come free before spawning.
     let mut took_over = false;
@@ -2111,13 +2139,23 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
         let raced = !took_over
             && harness::probe(port) == harness::Probe::Harness
             && !ours_on_port(data_dir, port);
-        if kept_conflict || raced {
+        // The port this launch detected the instance on, before any answer moved it. A stale
+        // instance there is the one case detection cannot see: it is not in state.json (the
+        // watchdog restarted it while an update was staging), so the reuse branch does not adopt
+        // it and the `Some(pid)` branch does not stop it either — while it keeps serving from the
+        // very tree this swap is about to rename out from under it.
+        let raced_original = port != configured_port
+            && harness::probe(configured_port) == harness::Probe::Harness
+            && !ours_on_port(data_dir, configured_port);
+        if swap_blocked(kept_conflict, raced, raced_original) {
             harness::app_log(&format!(
                 "{}：放弃本次切换（已暂存的 v{} 作废，下次启动再更新）",
                 if kept_conflict {
                     "被保留的外部实例可能正在使用待替换的 CLI 树"
-                } else {
+                } else if raced {
                     "检测之后端口上又出现了外部 Harness"
+                } else {
+                    "原端口上仍有实例在服务，它可能正在使用待替换的 CLI 树"
                 },
                 staged.version
             ));
@@ -2346,6 +2384,17 @@ fn harness_compat(config: &Config) -> Option<String> {
         .webkit_compat
         .then(window::needed_compat_script)
         .flatten()
+}
+
+/// A per-process temporary directory for tests.
+///
+/// The name carries the process id: a second `cargo test` on the same machine — another checkout,
+/// or two CI jobs sharing a runner — would otherwise reuse `temp_dir()/dsh-desktop-<name>` and
+/// delete the other run files mid-test (review D7). Within one binary the names stay distinct,
+/// which is what keeps parallel `#[test]`s apart.
+#[cfg(test)]
+pub(crate) fn test_dir(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
 }
 
 #[cfg(test)]
