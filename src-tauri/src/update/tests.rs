@@ -138,7 +138,7 @@ fn cache_freshness_follows_interval_and_installed_version() {
 
 #[test]
 fn cache_round_trips_on_disk() {
-    let dir = std::env::temp_dir().join("dsh-desktop-update-cache-test");
+    let dir = crate::test_dir("dsh-desktop-update-cache-test");
     let _ = std::fs::remove_dir_all(&dir);
     let cache = Cache {
         checked_at: 42,
@@ -157,7 +157,7 @@ fn cache_round_trips_on_disk() {
 /// A cache file written before the `attempted` field existed must keep working.
 #[test]
 fn cache_files_without_the_attempt_field_still_parse() {
-    let dir = std::env::temp_dir().join("dsh-desktop-update-cache-legacy-test");
+    let dir = crate::test_dir("dsh-desktop-update-cache-legacy-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -215,7 +215,7 @@ fn carried_attempt_follows_the_registry_answer() {
 #[test]
 fn an_expired_window_does_not_reopen_an_ineffective_install() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = std::env::temp_dir().join("dsh-desktop-update-window-test");
+    let dir = crate::test_dir("dsh-desktop-update-window-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -265,7 +265,7 @@ fn an_expired_window_does_not_reopen_an_ineffective_install() {
 /// stop the Harness and rebuild the tree.
 #[test]
 fn an_ineffective_install_is_not_retried_inside_the_window() {
-    let dir = std::env::temp_dir().join("dsh-desktop-update-attempt-test");
+    let dir = crate::test_dir("dsh-desktop-update-attempt-test");
     let _ = std::fs::remove_dir_all(&dir);
     // The cached branch never executes npm, so the path only has to exist as a value.
     let npm = Path::new("/nonexistent/npm");
@@ -333,7 +333,7 @@ fn an_ineffective_install_is_not_retried_inside_the_window() {
 /// the registry head moves on (review A5).
 #[test]
 fn a_failed_install_only_suppresses_its_short_window() {
-    let dir = std::env::temp_dir().join("dsh-desktop-plugin-failed-attempt-test");
+    let dir = crate::test_dir("dsh-desktop-plugin-failed-attempt-test");
     let _ = std::fs::remove_dir_all(&dir);
     // The cached branch never executes npm, so the path only has to exist as a value.
     let npm = Path::new("/nonexistent/npm");
@@ -447,7 +447,7 @@ fn repeated_failures_of_one_version_back_off() {
     assert_eq!(failure_window_secs(20), 24 * 60 * 60);
     assert_eq!(failure_window_secs(u32::MAX), 24 * 60 * 60);
 
-    let dir = std::env::temp_dir().join("dsh-desktop-core-failure-backoff-test");
+    let dir = crate::test_dir("dsh-desktop-core-failure-backoff-test");
     let _ = std::fs::remove_dir_all(&dir);
     let seeded = Cache {
         checked_at: now_secs(),
@@ -482,7 +482,7 @@ fn repeated_failures_of_one_version_back_off() {
 
 #[test]
 fn the_market_plugin_is_read_from_the_profile_it_would_load() {
-    let dir = std::env::temp_dir().join("dsh-desktop-plugin-profile-test");
+    let dir = crate::test_dir("dsh-desktop-plugin-profile-test");
     let _ = std::fs::remove_dir_all(&dir);
     let plugin = dir.join("node_modules").join(MARKET_PLUGIN);
     std::fs::create_dir_all(&plugin).unwrap();
@@ -512,7 +512,7 @@ fn the_market_plugin_is_read_from_the_profile_it_would_load() {
 
 #[test]
 fn the_plugin_check_keeps_its_own_cache_window() {
-    let dir = std::env::temp_dir().join("dsh-desktop-plugin-cache-test");
+    let dir = crate::test_dir("dsh-desktop-plugin-cache-test");
     let _ = std::fs::remove_dir_all(&dir);
     assert_ne!(cache_path(&dir), plugin_cache_path(&dir));
 
@@ -623,7 +623,7 @@ fn a_version_that_would_not_be_run_is_not_installed() {
 fn find_pnpm_takes_the_first_executable_match_on_path() {
     use std::os::unix::fs::PermissionsExt;
 
-    let root = std::env::temp_dir().join("dsh-desktop-find-pnpm-test");
+    let root = crate::test_dir("dsh-desktop-find-pnpm-test");
     let empty = root.join("empty");
     let good = root.join("good");
     let _ = std::fs::remove_dir_all(&root);

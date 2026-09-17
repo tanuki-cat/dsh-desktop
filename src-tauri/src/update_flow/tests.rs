@@ -9,7 +9,7 @@ use super::*;
 /// the next one. This is the whole P2-10 contract, minus the npm call.
 #[test]
 fn a_staged_update_swaps_the_tree_and_an_unconfirmed_one_is_rolled_back() {
-    let root = std::env::temp_dir().join("dsh-desktop-core-swap-test");
+    let root = crate::test_dir("dsh-desktop-core-swap-test");
     let _ = std::fs::remove_dir_all(&root);
     let runtime = root.join("runtime");
     let paths = UpdatePaths::new(&runtime);
@@ -100,7 +100,7 @@ fn a_staged_update_swaps_the_tree_and_an_unconfirmed_one_is_rolled_back() {
 /// next launch removes it. The directory itself stays: this launch stages into it.
 #[test]
 fn a_stale_staging_tree_is_cleared_without_taking_the_directory_with_it() {
-    let root = std::env::temp_dir().join("dsh-desktop-stale-staging-test");
+    let root = crate::test_dir("dsh-desktop-stale-staging-test");
     let _ = std::fs::remove_dir_all(&root);
     let paths = UpdatePaths::new(&root.join("runtime"));
     std::fs::create_dir_all(paths.staging.join("staging-0.1.5")).unwrap();
@@ -129,7 +129,7 @@ fn a_stale_staging_tree_is_cleared_without_taking_the_directory_with_it() {
 /// undone from it without touching the state the running Harness keeps writing.
 #[test]
 fn a_profile_snapshot_makes_a_failed_plugin_install_reversible() {
-    let root = std::env::temp_dir().join("dsh-desktop-profile-snapshot-test");
+    let root = crate::test_dir("dsh-desktop-profile-snapshot-test");
     let _ = std::fs::remove_dir_all(&root);
     let paths = UpdatePaths::new(&root.join("runtime"));
     std::fs::create_dir_all(&paths.profiles).unwrap();
@@ -175,7 +175,7 @@ fn a_profile_snapshot_makes_a_failed_plugin_install_reversible() {
 /// would have to undo.
 #[test]
 fn a_confirmed_boot_keeps_the_new_tree_and_clears_the_record() {
-    let root = std::env::temp_dir().join("dsh-desktop-core-confirm-test");
+    let root = crate::test_dir("dsh-desktop-core-confirm-test");
     let _ = std::fs::remove_dir_all(&root);
     let paths = UpdatePaths::new(&root.join("runtime"));
     std::fs::create_dir_all(&paths.rollback).unwrap();

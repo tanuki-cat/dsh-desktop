@@ -14,6 +14,12 @@ use std::process::Command;
 /// PATH with no node in it, standing in for a Finder/Dock launch.
 const NO_NODE_PATH: &str = "/nonexistent-bin";
 
+/// A per-process temporary directory, so two `cargo test` runs on one machine (another checkout,
+/// or two CI jobs sharing a runner) cannot delete each other's files mid-test (review D7).
+fn test_dir(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
+}
+
 fn path_lookup(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
@@ -33,7 +39,7 @@ fn npm_still_runs_when_the_app_path_has_no_node() {
     // Everything above is resolved from the real PATH; from here on the process looks
     // like a GUI launch. The private cache keeps the test off the user cache.
     std::env::set_var("PATH", NO_NODE_PATH);
-    let cache = std::env::temp_dir().join("dsh-desktop-live-npm-cache-env");
+    let cache = test_dir("dsh-desktop-live-npm-cache-env");
     let _ = std::fs::remove_dir_all(&cache);
     std::env::set_var("npm_config_cache", &cache);
 

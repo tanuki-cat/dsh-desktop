@@ -33,7 +33,7 @@ fn probes_a_real_node_for_arch_and_capability() {
 fn gives_up_on_a_node_that_never_answers() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = std::env::temp_dir().join("dsh-desktop-hanging-node-test");
+    let dir = crate::test_dir("dsh-desktop-hanging-node-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let fake = dir.join("node");
@@ -69,7 +69,7 @@ fn reads_version_from_the_owning_package() {
     assert_eq!(version_of(&entry).as_deref(), Some("1.2.3"));
     assert_eq!(describe_version(&entry), "1.2.3");
     // Nothing to read above the script: the caller must fall back to running the CLI.
-    let orphan = std::env::temp_dir().join("dsh-desktop-no-package/bin.js");
+    let orphan = crate::test_dir("dsh-desktop-no-package/bin.js");
     assert_eq!(version_of(&orphan), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -105,7 +105,7 @@ fn a_foreign_dsh_is_never_mistaken_for_this_cli() {
 
     // A compiled launcher from another project, sitting in a tree with no manifest at all:
     // it cannot be identified, and it is not a node script that could answer `--version`.
-    let bare = std::env::temp_dir().join("dsh-desktop-foreign-binary-test");
+    let bare = crate::test_dir("dsh-desktop-foreign-binary-test");
     let _ = std::fs::remove_dir_all(&bare);
     std::fs::create_dir_all(&bare).unwrap();
     let binary = bare.join("dsh");
@@ -124,7 +124,7 @@ fn a_foreign_dsh_is_never_mistaken_for_this_cli() {
 /// it is used, but only because it answered `--version` with a version.
 #[test]
 fn an_unidentified_launcher_is_used_only_when_it_answers_with_a_version() {
-    let dir = std::env::temp_dir().join("dsh-desktop-unidentified-dsh-test");
+    let dir = crate::test_dir("dsh-desktop-unidentified-dsh-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let shim = dir.join("dsh");
@@ -198,7 +198,7 @@ fn only_a_version_line_counts_as_an_answer() {
 #[cfg(unix)]
 #[test]
 fn the_environment_override_wins_over_the_remembered_path() {
-    let dir = std::env::temp_dir().join("dsh-desktop-locator-order-test");
+    let dir = crate::test_dir("dsh-desktop-locator-order-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     // Both launchers live inside a package that really is this CLI: the search now refuses a
@@ -233,7 +233,7 @@ fn the_environment_override_wins_over_the_remembered_path() {
 #[cfg(unix)]
 #[test]
 fn resolves_real_js_behind_symlink() {
-    let dir = std::env::temp_dir().join("dsh-desktop-locator-test");
+    let dir = crate::test_dir("dsh-desktop-locator-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("lib/bin")).unwrap();
     std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -259,7 +259,7 @@ fn resolves_real_js_behind_symlink() {
 #[test]
 fn the_imported_login_path_is_searched() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = std::env::temp_dir().join("dsh-desktop-imported-path-test");
+    let dir = crate::test_dir("dsh-desktop-imported-path-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     let tool = dir.join("bin").join("dsh-desktop-only-here");

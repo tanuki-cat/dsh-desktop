@@ -5,6 +5,12 @@
 use dsh_desktop_lib::update;
 use std::path::PathBuf;
 
+/// A per-process temporary directory, so two `cargo test` runs on one machine (another checkout,
+/// or two CI jobs sharing a runner) cannot delete each other's files mid-test (review D7).
+fn test_dir(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
+}
+
 fn path_lookup(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
@@ -16,7 +22,7 @@ fn path_lookup(name: &str) -> Option<PathBuf> {
 /// writable (restricted sandbox, read-only home), which has nothing to do with this shell.
 /// Both tests share one directory, so the process-global setting stays race-free.
 fn use_private_npm_cache() {
-    let cache = std::env::temp_dir().join("dsh-desktop-live-npm-cache");
+    let cache = test_dir("dsh-desktop-live-npm-cache");
     let _ = std::fs::create_dir_all(&cache);
     std::env::set_var("npm_config_cache", &cache);
 }
@@ -59,7 +65,7 @@ fn cache_short_circuits_the_second_query() {
     let npm = update::npm_for(&node).expect("npm must be resolvable from node");
     use_private_npm_cache();
     let tags = vec!["latest".to_string(), "next".to_string()];
-    let dir = std::env::temp_dir().join("dsh-desktop-live-cache-test");
+    let dir = test_dir("dsh-desktop-live-cache-test");
     let _ = std::fs::remove_dir_all(&dir);
 
     let started = std::time::Instant::now();

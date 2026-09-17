@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[test]
 fn spawn_paths_are_named_in_the_error() {
-    let dir = std::env::temp_dir().join("dsh-desktop-spawn-validate-test");
+    let dir = crate::test_dir("dsh-desktop-spawn-validate-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let node = dir.join("node");
@@ -52,7 +52,7 @@ fn spawn_paths_are_named_in_the_error() {
 
 #[test]
 fn rotates_while_running_and_keeps_three_backups() {
-    let dir = std::env::temp_dir().join("dsh-desktop-log-rotation-test");
+    let dir = crate::test_dir("dsh-desktop-log-rotation-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("harness.log");
@@ -83,7 +83,7 @@ fn rotates_while_running_and_keeps_three_backups() {
 
 #[test]
 fn a_session_below_the_limit_never_rotates() {
-    let dir = std::env::temp_dir().join("dsh-desktop-log-small-test");
+    let dir = crate::test_dir("dsh-desktop-log-small-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("harness.log");
@@ -98,7 +98,7 @@ fn a_session_below_the_limit_never_rotates() {
 
 #[test]
 fn an_oversized_file_rotates_before_the_next_line() {
-    let dir = std::env::temp_dir().join("dsh-desktop-log-leftover-test");
+    let dir = crate::test_dir("dsh-desktop-log-leftover-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("harness.log");
@@ -121,7 +121,7 @@ fn an_oversized_file_rotates_before_the_next_line() {
 /// leaving the log far above its target until the *next* line arrived.
 #[test]
 fn one_oversized_line_does_not_overshoot_the_limit() {
-    let dir = std::env::temp_dir().join("dsh-desktop-log-overshoot-test");
+    let dir = crate::test_dir("dsh-desktop-log-overshoot-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("harness.log");
@@ -148,7 +148,7 @@ fn one_oversized_line_does_not_overshoot_the_limit() {
 /// Rotating an empty file would only shuffle the backups: the line still has to be written.
 #[test]
 fn an_empty_log_is_not_rotated_for_one_oversized_line() {
-    let dir = std::env::temp_dir().join("dsh-desktop-log-empty-rotate-test");
+    let dir = crate::test_dir("dsh-desktop-log-empty-rotate-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("harness.log");
@@ -169,7 +169,7 @@ fn an_empty_log_is_not_rotated_for_one_oversized_line() {
 /// one rotates it, which loses the shell's own log lines.
 #[test]
 fn open_shares_one_logger_per_path() {
-    let dir = std::env::temp_dir().join("dsh-desktop-log-share-test");
+    let dir = crate::test_dir("dsh-desktop-log-share-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("harness.log");

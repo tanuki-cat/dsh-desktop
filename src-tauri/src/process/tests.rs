@@ -141,7 +141,7 @@ fn non_utf8_output_is_decoded_lossily() {
 
 #[test]
 fn state_round_trip() {
-    let dir = std::env::temp_dir().join("dsh-desktop-state-test");
+    let dir = crate::test_dir("dsh-desktop-state-test");
     let _ = std::fs::remove_dir_all(&dir);
     let state = HarnessState {
         pid: 4242,

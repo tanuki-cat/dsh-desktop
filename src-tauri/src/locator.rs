@@ -15,6 +15,13 @@ pub struct DshLocation {
     pub node: PathBuf,
 }
 
+/// Resolve a launcher, its real entry script and its node in one go.
+///
+/// Production resolves the node and the dsh tree **separately** (`system_node` / `system_dsh`),
+/// because a machine can have one without the other (§2.4). This all-in-one form is what the
+/// locator own tests use to state the candidate order and the symlink walk as a single outcome,
+/// so it is kept deliberately: removing it would leave those three cases asserting through two
+/// functions instead of one (review E1).
 pub fn locate(
     remembered: Option<PathBuf>,
     override_env: Option<String>,

@@ -6,6 +6,7 @@
 
 use crate::harness;
 use crate::process::HarnessState;
+#[cfg(unix)]
 use std::time::Duration;
 
 /// Budget for one `ps` call.
@@ -13,6 +14,8 @@ use std::time::Duration;
 /// `ps` reads kernel tables and normally answers in milliseconds; this only has to cover a
 /// machine under enough load that the shell would otherwise wait behind it. A call that runs out
 /// is treated as "unknown", which is the branch that keeps the process rather than signalling it.
+/// Unix-only: it budgets the [`parent_command`] / [`ps_identity`] calls, and Windows has no `ps`.
+#[cfg(unix)]
 const PS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What step 1 does with the record a crashed shell may have left behind.
@@ -67,7 +70,30 @@ pub(crate) fn self_heal_action(
 pub(crate) fn looks_like_our_orphan(pid: u32) -> bool {
     // `-ww` matters: the flags that identify our spawn sit behind a long node path, and some
     // `ps` builds truncate the command column to the terminal width without it.
-    let Some(text) = crate::process::stdout_within(
+    let Some(text) = ps_identity(pid) else {
+        harness::app_log(&format!("无法确认残留进程 {pid} 的身份，按无关进程处理"));
+        return false;
+    };
+    let Some((ppid, _)) = parse_ps_identity(&text) else {
+        return false;
+    };
+    looks_like_our_harness(&text, classify_parent(ppid))
+}
+
+/// `ps -p <pid> -o ppid=,command=` for one pid, or `None` when the platform has no `ps`.
+///
+/// Split by platform so the Windows build does not carry a `Command::new("ps")` that can only
+/// ever fail: the orphan check is a Unix one (it reads a parent pid and matches launchd or
+/// `systemd`), and on Windows the caller falls back to the conservative answer — keep the
+/// process (see [`Parent::Live`]). Without this split the whole module was Unix-only code that
+/// the Windows target compiled anyway, so `cargo clippy --target x86_64-pc-windows-gnu` had
+/// nothing to say about it (review B7).
+///
+/// Note the deliberate asymmetry with [`parent_command`]: that one is still called on Windows,
+/// so the enum stays whole there and only the `ps` call itself is absent.
+#[cfg(unix)]
+fn ps_identity(pid: u32) -> Option<String> {
+    crate::process::stdout_within(
         std::process::Command::new("ps").args([
             "-ww",
             "-p",
@@ -76,16 +102,13 @@ pub(crate) fn looks_like_our_orphan(pid: u32) -> bool {
             "ppid=,command=",
         ]),
         PS_TIMEOUT,
-    ) else {
-        harness::app_log(&format!(
-            "ps 不可用或超时，无法确认残留进程 {pid} 的身份，按无关进程处理"
-        ));
-        return false;
-    };
-    let Some((ppid, _)) = parse_ps_identity(&text) else {
-        return false;
-    };
-    looks_like_our_harness(&text, classify_parent(ppid))
+    )
+}
+
+/// Windows has no `ps`; the identity question is answered by keeping the process.
+#[cfg(not(unix))]
+fn ps_identity(_pid: u32) -> Option<String> {
+    None
 }
 
 /// `ps -p <pid> -o ppid=,command=` output -> (parent pid, command line).
@@ -119,10 +142,22 @@ fn classify_parent(ppid: u32) -> Parent {
         // The kernel: no userspace parent is left to own it.
         return Parent::Gone;
     }
-    parent_from_ps(crate::process::stdout_within(
+    parent_from_ps(parent_command(ppid))
+}
+
+/// The parent command line, or `None` where the platform cannot answer (`ps` is Unix-only).
+#[cfg(unix)]
+fn parent_command(ppid: u32) -> Option<String> {
+    crate::process::stdout_within(
         std::process::Command::new("ps").args(["-ww", "-p", &ppid.to_string(), "-o", "command="]),
         PS_TIMEOUT,
-    ))
+    )
+}
+
+/// Windows has no `ps`: an unanswered parent lookup is [`Parent::Live`], i.e. keep the process.
+#[cfg(not(unix))]
+fn parent_command(_ppid: u32) -> Option<String> {
+    None
 }
 
 /// The decision once `ps` has answered, split out so every branch is testable without running it.

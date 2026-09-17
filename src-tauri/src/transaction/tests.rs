@@ -8,7 +8,7 @@ use super::*;
 /// A private directory per test: these write real trees, and the process-global temp dir is
 /// shared with every other test in the binary.
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("dsh-desktop-txn-{name}"));
+    let dir = crate::test_dir(&format!("dsh-desktop-txn-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

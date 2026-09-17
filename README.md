@@ -85,7 +85,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   `plugin update available: dshmarket 1.45.1 -> 1.46.1, installing`、`plugin updated: dshmarket 1.45.1 -> 1.46.1`，
   随后 harness 重启并正常服务；profile 的依赖范围被改写为 `^1.46.1`、`node_modules` 内实装 1.46.1，
   且 `plugin-check.json` 与核心的 `update-check.json` 各自独立（时间戳与内容互不影响）。
-- 离线测试：`cargo test` **185 passed**，另有 **6 个集成用例**（在真实 node 引擎里跑兼容层与探测脚本）。单测覆盖：URL 解析含 LAN 后缀、凭据脱敏（`Bearer`/`api_key`/`Cookie` 等）、状态文件往返、locator 软链解析与
+- 离线测试：`cargo test` **188 passed**，另有 **7 个集成用例**（在真实 node 引擎里跑兼容层与探测脚本）。单测覆盖：URL 解析含 LAN 后缀、凭据脱敏（`Bearer`/`api_key`/`Cookie` 等）、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
   缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口与跨窗口都不重复安装"、npm PATH 前缀、端口探针超时（沉默对端与持续发送对端两类）、
   package.json 版本解析、部分/损坏 config.json 处理、workspace / dsh_path 回退不改文件、HOME 缺失不回落 `/`、
@@ -150,7 +150,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 | `make doctor` | 检查工具链与平台依赖 | Linux 用 `pkg-config` 查 `webkit2gtk-4.1` / `gtk+-3.0` / `libsoup-3.0` 并给出 Debian/Fedora/Arch 安装命令；macOS 提示装 Xcode CLT |
 | `make check` | `cargo check --all-targets` | 与 CI 口径一致 |
 | `make fmt` / `make fmt-check` / `make clippy` | 格式化 / 只检查格式（CI 门禁用，不改工作区）/ lint（`clippy -D warnings`） | |
-| `make test` | `make test-scripts` ＋ 离线单元测试（当前 **185** 个）＋ 在真实 JS 引擎里跑兼容层的集成测试 | 不联网；只有兼容层那个集成测试需要 PATH 上有 `node`（没有就跳过） |
+| `make test` | `make test-scripts` ＋ 离线单元测试（当前 **188** 个）＋ 在真实 JS 引擎里跑兼容层的集成测试 | 不联网；集成测试需要 PATH 上有 `node`，**没有就失败**（曾经的静默跳过会让 3 个用例 0 断言地报 ok） |
 | `make test-scripts` | `scripts/` 自检：用假目录验证 staging 闸门本身仍然会失败 | 纯 shell，不依赖构建产物；`make test` 会先跑它 |
 | `make test-live` | 联网集成测试（全部） | 自动设 `DSH_DESKTOP_LIVE_TESTS=1`：查真实 registry、对比冷/热缓存耗时，并在「PATH 里没有 node」的模拟 GUI 环境下验证 npm 仍可运行 |
 | `make dev` | 运行 debug 版 | 等价 `cargo run --manifest-path src-tauri/Cargo.toml` |
@@ -224,11 +224,11 @@ src-tauri/src/harness.rs        -> src-tauri/src/harness/tests.rs
 已完成并可实机复现，并已**并入 `main`**（2026-09-13 合并 `feat/bundled-runtime`）：
 
 - `make runtime-fetch / runtime-stage / runtime-clean / bundle-bundled` 四个目标全部跑通；
-- staging 自带校验（`scripts/check-runtime-stage.sh`；`scripts/tests/check-runtime-stage-test.sh` 会先用假目录验证闸门本身有效）：必需文件、**悬空符号链接**（会让 `tauri build` 失败）、**绝对符号链接**（会被解引用，把宿主机文件复制进包）、**quarantine 属性**（会带进 .app）、**文件数/体积闸门**（多放 2 万个文件这类残留以前会被静默打包）；
+- staging 自带校验（`scripts/check-runtime-stage.sh`；`scripts/tests/check-runtime-stage-test.sh` 对**每一条闸门**各造一个假目录反例）：必需文件、**可执行位**（tauri 保留 mode，丢 `+x` 的 node/pnpm 会一路进包）、**悬空符号链接**（会让 `tauri build` 失败）、**绝对符号链接**（会被解引用，把宿主机文件复制进包）、**quarantine 属性**（会带进 .app）、**模板内的 pnpm store**、**文件数/体积闸门**（多放 2 万个文件这类残留以前会被静默打包）；
 - profile 模板由真 pnpm 生成（含插件市场 dshmarket，见方案 §2.5）；
 - 实测：`env -i PATH=/usr/bin:/bin` 下自带 node 跑自带 dsh → `0.1.5-rc.2`；
   全新 DSH_HOME + 模板播种 → `dsh web` **6 秒**出 URL、stderr 干净、`.dsh-market` 出现；
-- 实测：`make bundle-bundled` 产出 598 MB 的 `.app`，包内 node 可直接执行、31,090 个文件；
+- 实测：`make bundle-bundled` 产出 598 MB 的 `.app`，包内 node 可直接执行、31,064 个文件；
   macOS 上还会用 `--config` 把 `minimumSystemVersion` 覆盖为 11.0（随包 node 是 `minos 11.0`）；
 - 模板随包钉住打包时的 `DSHMARKET_VERSION`（当前 1.46.1）：新机器首启播种该版本，之后由
   插件市场自动更新跟到 registry 最新。
