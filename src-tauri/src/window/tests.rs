@@ -457,18 +457,22 @@ fn the_compat_layer_stays_es5_and_guards_every_block() {
 /// itself: the UI coalesces streamed output onto animation frames, and the code that would
 /// notice is the code that stopped running.
 #[test]
-fn a_page_that_stops_drawing_is_reloaded_and_then_reported() {
+fn a_page_that_stops_running_is_reloaded_and_then_reported() {
     let drawing = PageState::Drawing;
-    let frozen = PageState::Frozen;
+    let stalled = PageState::Frozen(Scheduling::Stalled);
     let idle = false;
     // One bad probe is a hiccup: the shell waits instead of throwing away the page state.
     assert_eq!(
-        liveness_action(frozen, true, idle, 0, 0),
+        liveness_action(stalled, true, idle, 0, 0),
         LivenessAction::Wait { misses: 1 }
     );
-    // The second one in a row is a page that has stopped drawing.
     assert_eq!(
-        liveness_action(frozen, true, idle, 1, 0),
+        liveness_action(stalled, true, idle, 1, 0),
+        LivenessAction::Wait { misses: 2 }
+    );
+    // The third one in a row is a page that is not coming back on its own.
+    assert_eq!(
+        liveness_action(stalled, true, idle, 2, 0),
         LivenessAction::Reload { attempt: 1 }
     );
     // Anything that draws clears the streak, whatever the reload count was.
@@ -478,73 +482,96 @@ fn a_page_that_stops_drawing_is_reloaded_and_then_reported() {
     );
     // Reloads are budgeted: the shell stops instead of looping over a page that never returns.
     assert_eq!(
-        liveness_action(frozen, true, idle, 1, 1),
+        liveness_action(stalled, true, idle, 2, 1),
         LivenessAction::Reload { attempt: 2 }
     );
     assert_eq!(
-        liveness_action(frozen, true, idle, 1, 3),
+        liveness_action(stalled, true, idle, 2, 3),
         LivenessAction::Report { attempts: 3 }
     );
     // A bad probe mid-recovery does not reset the reload budget.
     assert_eq!(
-        liveness_action(frozen, true, idle, 0, 3),
+        liveness_action(stalled, true, idle, 0, 3),
         LivenessAction::Wait { misses: 1 }
     );
     assert_eq!(
-        liveness_action(frozen, true, idle, 1, u32::MAX),
+        liveness_action(stalled, true, idle, 2, u32::MAX),
         LivenessAction::Report { attempts: u32::MAX }
     );
     // A silent page is broken wherever it is: focus is no excuse for answering nothing.
     assert_eq!(
         liveness_action(PageState::Silent, false, idle, 1, 0),
+        LivenessAction::Wait { misses: 2 }
+    );
+    assert_eq!(
+        liveness_action(PageState::Silent, false, idle, 2, 0),
+        LivenessAction::Reload { attempt: 1 }
+    );
+    // A page whose scheduling could not be classified is treated as stalled: the shell cannot
+    // prove anything is still running, and the reload budget bounds the mistake.
+    assert_eq!(
+        liveness_action(PageState::Frozen(Scheduling::Unknown), true, idle, 2, 0),
         LivenessAction::Reload { attempt: 1 }
     );
 }
 
-/// A window the user is not looking at is one WebKit may legitimately stop drawing, and
-/// reloading it would turn "the user switched away" into a reload loop.
+/// A page WebKit stopped drawing to is not a broken page, and reloading it would throw away a
+/// working session to fix the scheduler. The reported failure is exactly this state — the user
+/// works in another window while the model streams — so it must not spend the reload budget.
 #[test]
-fn a_background_window_is_not_accused_of_being_frozen() {
+fn a_suspended_page_is_named_instead_of_reloaded() {
+    let suspended = PageState::Frozen(Scheduling::Suspended);
     let idle = false;
     assert_eq!(
-        liveness_action(PageState::Frozen, false, idle, 0, 0),
-        LivenessAction::Unattended
+        liveness_action(suspended, false, idle, 0, 0),
+        LivenessAction::SuspendedNotDrawing
     );
-    // Even a long streak of unattended probes stays unattended: no reloads are spent.
+    // Even a long streak of unattended probes stays suspended: no reloads are spent.
     assert_eq!(
-        liveness_action(PageState::Frozen, false, idle, 4, 2),
-        LivenessAction::Unattended
+        liveness_action(suspended, false, idle, 4, 2),
+        LivenessAction::SuspendedNotDrawing
     );
     // Drawing is drawing, attended or not.
     assert_eq!(
         liveness_action(PageState::Drawing, false, idle, 0, 0),
         LivenessAction::Alive
     );
+    // The user came back and the page is still not drawing: the suspension no longer explains
+    // it, so the page joins the streak that earns a reload instead of hinting for ever.
+    assert_eq!(
+        liveness_action(suspended, true, idle, 0, 0),
+        LivenessAction::Wait { misses: 1 }
+    );
+    assert_eq!(
+        liveness_action(suspended, true, idle, 2, 0),
+        LivenessAction::Reload { attempt: 1 }
+    );
 }
 
-/// Reloading is the only recovery for a frozen page, and it is also what discards an unsent
+/// Reloading is the only recovery for a stalled page, and it is also what discards an unsent
 /// prompt. Someone typing in a page that stopped drawing gets another interval first.
 #[test]
 fn a_page_someone_is_typing_in_is_not_reloaded_yet() {
+    let stalled = PageState::Frozen(Scheduling::Stalled);
     // The user is mid-sentence: wait, and keep the streak so the budget is untouched.
     assert_eq!(
-        liveness_action(PageState::Frozen, true, true, 1, 0),
-        LivenessAction::Busy { misses: 2 }
+        liveness_action(stalled, true, true, 2, 0),
+        LivenessAction::Busy { misses: 3 }
     );
     // The moment they stop, the reload the page still needs happens.
     assert_eq!(
-        liveness_action(PageState::Frozen, true, false, 2, 0),
+        liveness_action(stalled, true, false, 3, 0),
         LivenessAction::Reload { attempt: 1 }
     );
     // Typing never spends or restores the reload budget.
     assert_eq!(
-        liveness_action(PageState::Frozen, true, true, 2, 2),
-        LivenessAction::Busy { misses: 3 }
+        liveness_action(stalled, true, true, 3, 2),
+        LivenessAction::Busy { misses: 4 }
     );
     // A page that answers nothing is not "busy": the probe that would say so is the code
     // that stopped running, so silence must still reload rather than wait for ever.
     assert_eq!(
-        liveness_action(PageState::Silent, true, false, 1, 0),
+        liveness_action(PageState::Silent, true, false, 2, 0),
         LivenessAction::Reload { attempt: 1 }
     );
     // And a page that is drawing is alive whether or not anyone is typing.
@@ -574,25 +601,81 @@ fn activity_is_read_as_busy_only_when_someone_is_working() {
     assert!(!page_is_busy(Some("")));
 }
 
+/// A counter report as the page sends it.
+fn counts(frames: u64, timers: u64) -> Frames {
+    Frames {
+        frames,
+        timers,
+        timers_seen: true,
+    }
+}
+
 /// The frame counter is the whole signal, so its algebra has to be exact.
 #[test]
 fn only_a_moving_frame_counter_proves_the_page_is_drawing() {
     // First answer: nothing to compare against, so a number that arrived is progress.
-    assert_eq!(judge_frames(Some(1), None), PageState::Drawing);
-    assert_eq!(judge_frames(Some(0), None), PageState::Drawing);
-    // Same number twice: JavaScript runs and no frame was produced in between.
-    assert_eq!(judge_frames(Some(7), Some(7)), PageState::Frozen);
+    assert_eq!(judge_frames(Some(counts(1, 1)), None), PageState::Drawing);
+    assert_eq!(judge_frames(Some(counts(0, 0)), None), PageState::Drawing);
+    // Same frames twice: JavaScript runs and no frame was produced in between.
+    assert_eq!(
+        judge_frames(Some(counts(7, 3)), Some(counts(7, 2))),
+        PageState::Frozen(Scheduling::Suspended)
+    );
     // A larger number is frames being drawn.
-    assert_eq!(judge_frames(Some(8), Some(7)), PageState::Drawing);
+    assert_eq!(
+        judge_frames(Some(counts(8, 3)), Some(counts(7, 3))),
+        PageState::Drawing
+    );
     // A smaller number is a fresh document, not a fault: a reload starts the count over.
-    assert_eq!(judge_frames(Some(1), Some(40)), PageState::Drawing);
+    assert_eq!(
+        judge_frames(Some(counts(1, 0)), Some(counts(40, 9))),
+        PageState::Drawing
+    );
     // No answer at all is the renderer being gone or wedged.
-    assert_eq!(judge_frames(None, Some(40)), PageState::Silent);
+    assert_eq!(judge_frames(None, Some(counts(40, 9))), PageState::Silent);
     assert_eq!(judge_frames(None, None), PageState::Silent);
 }
 
+/// Frames stopped and timers stopped is a different failure from frames stopped alone, and the
+/// two earn opposite responses: one is a busy or dead main thread, the other is a window WebKit
+/// decided nobody was watching. Only the timer counter can tell them apart.
 #[test]
-fn the_frame_probe_is_es5_and_schedules_at_most_one_frame() {
+fn a_stopped_frame_counter_is_split_by_the_timer_that_keeps_running() {
+    // Frames frozen, timers advanced: the task queue runs, so the page is only not being drawn
+    // to. This is the shape of the reported freeze on a window the user is not looking at.
+    assert_eq!(
+        judge_frames(Some(counts(9, 4)), Some(counts(9, 3))),
+        PageState::Frozen(Scheduling::Suspended)
+    );
+    // Frames frozen *and* timers frozen: nothing ran between the two probes, which is a main
+    // thread that is busy or gone.
+    assert_eq!(
+        judge_frames(Some(counts(9, 3)), Some(counts(9, 3))),
+        PageState::Frozen(Scheduling::Stalled)
+    );
+    // An engine that cannot count timers must not be read as stalled *or* as suspended: it is
+    // simply not saying, and the caller has to decide what an unknown verdict costs.
+    let unseen = Frames {
+        frames: 9,
+        timers: 0,
+        timers_seen: false,
+    };
+    assert_eq!(
+        judge_frames(Some(unseen), Some(unseen)),
+        PageState::Frozen(Scheduling::Unknown)
+    );
+    // One unclassifiable reading is not enough either: the first probe after an upgrade has no
+    // timer baseline, and calling that stalled would reload a page that never stopped drawing.
+    let mut first = unseen;
+    first.timers_seen = true;
+    assert_eq!(
+        judge_frames(Some(counts(9, 1)), Some(first)),
+        PageState::Frozen(Scheduling::Suspended)
+    );
+}
+
+#[test]
+fn the_frame_probe_is_es5_and_schedules_at_most_one_callback_of_each_kind() {
     // The probe runs on every engine this shell supports, including the old WebKits the
     // compat layer exists for.
     for syntax in ["=>", "```", "??", "const ", "let ", "class "] {
@@ -607,16 +690,57 @@ fn the_frame_probe_is_es5_and_schedules_at_most_one_frame() {
         FRAME_PROBE.contains("requestAnimationFrame"),
         "{FRAME_PROBE}"
     );
-    // It has to answer with the count, so the shell can compare two probes.
+    // The timer heartbeat is what separates "not drawn to" from "not running", so both its
+    // scheduling and its own pending guard are load-bearing.
+    assert!(FRAME_PROBE.contains("__dshTimerPending"), "{FRAME_PROBE}");
+    assert!(FRAME_PROBE.contains("setTimeout(bump, 0)"), "{FRAME_PROBE}");
+    assert!(FRAME_PROBE.contains("w.__dshTimers += 1"), "{FRAME_PROBE}");
+    // It has to answer with both counts, so the shell can compare two probes.
     assert!(
-        FRAME_PROBE.contains("return w.__dshFrames"),
+        FRAME_PROBE.contains("frames: w.__dshFrames"),
         "{FRAME_PROBE}"
     );
+    assert!(
+        FRAME_PROBE.contains("timers: w.__dshTimers"),
+        "{FRAME_PROBE}"
+    );
+    // An engine without `setTimeout` cannot say whether it is suspended; it must report that
+    // rather than answering with a counter that never moves and reading as stalled.
+    assert!(
+        FRAME_PROBE.contains("timersSeen: w.__dshTimerSeen === true"),
+        "{FRAME_PROBE}"
+    );
+    // The report has to be JSON, because the Rust side parses it as one struct.
+    assert!(FRAME_PROBE.contains("JSON.stringify"), "{FRAME_PROBE}");
     // The watchdog has to outlast a slow but healthy page, and give up before a user would.
     assert!(LIVENESS_TIMEOUT < LIVENESS_INTERVAL);
     // The budgets are compile-time facts (clippy refuses asserting on constants), so the
     // policy matrix above is what pins their behaviour.
-    assert_eq!((LIVENESS_MISSES, LIVENESS_RELOADS), (2, 3));
+    assert_eq!((LIVENESS_MISSES, LIVENESS_RELOADS), (3, 3));
+}
+
+/// The probe and the parser are two halves of one wire format, and a rename on either side would
+/// turn every answer into "silence" — which the watchdog reads as a dead renderer and reloads for.
+#[test]
+fn the_probe_reports_exactly_the_fields_the_shell_parses() {
+    let sample = r#"{"frames":12,"timers":7,"timersSeen":true}"#;
+    let parsed: Frames = serde_json::from_str(sample).expect("the probe's own shape must parse");
+    assert_eq!(
+        parsed,
+        Frames {
+            frames: 12,
+            timers: 7,
+            timers_seen: true
+        }
+    );
+    // Every key the parser needs is a key the probe emits, spelled the same way.
+    for key in ["frames", "timers", "timersSeen"] {
+        assert!(FRAME_PROBE.contains(key), "探测缺少 {key}：{FRAME_PROBE}");
+    }
+    // A page that answers with something else is silence, not a page with a zero counter:
+    // parsing it as a default would look like a page that never drew a frame.
+    assert!(serde_json::from_str::<Frames>("12").is_err());
+    assert!(serde_json::from_str::<Frames>("not json").is_err());
 }
 
 #[test]

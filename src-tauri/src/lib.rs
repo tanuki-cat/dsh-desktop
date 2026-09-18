@@ -30,6 +30,7 @@ use takeover::{
     resolve_foreign_action, terminal_page, wait_for_handoff, wait_for_port_free, ForeignAction,
     Retry, TerminalPage,
 };
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::{AppHandle, Listener, Manager, RunEvent};
 use update_flow::{
     clear_stale_staging, commit_core_update, confirm_core_update, recover_pending_swap,
@@ -447,6 +448,45 @@ fn shutdown() {
     }
 }
 
+/// The app menu: the default one plus the reload the shell cannot offer any other way.
+///
+/// Tauri builds the standard macOS menu (App / File / Edit / View / Window / Help), and its View
+/// menu holds only fullscreen — there is no reload item, and the page cannot offer one either:
+/// it is remote content with no capability. Without this the only recovery from a page that
+/// stopped drawing is quitting the app and waiting for the Harness to come back, which is exactly
+/// the report this fixes (2026-09-18). Reloading keeps the session: it is the same navigation the
+/// drawing watchdog performs, and the conversation lives in the Harness process.
+fn window_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let menu = Menu::default(app)?;
+    let reload = MenuItem::with_id(
+        app,
+        window::RELOAD_MENU_ID,
+        "重新加载界面",
+        true,
+        Some("CmdOrCtrl+R"),
+    )?;
+    // Into the View menu rather than a new one: that is where a reload belongs on macOS, and the
+    // submenu is found by its text because the id of the default View submenu is not exported.
+    let target = menu
+        .items()?
+        .into_iter()
+        .filter_map(|item| item.as_submenu().cloned())
+        .find(|submenu| submenu.text().map(|text| text == "View").unwrap_or(false));
+    match target {
+        Some(view) => {
+            view.prepend(&reload)?;
+            view.prepend(&PredefinedMenuItem::separator(app)?)?;
+        }
+        // A menu this shell cannot find is a reason to still offer the reload, not to drop it:
+        // a top-level item is worse placement than the View menu and far better than nothing.
+        None => {
+            harness::app_log("默认菜单里没有 View 子菜单，重新加载项放到顶层");
+            menu.append(&reload)?;
+        }
+    }
+    Ok(menu)
+}
+
 pub fn run() {
     let builder = tauri::Builder::default();
     // WebKit kills the WebContent process under memory pressure, and the window it leaves behind
@@ -456,6 +496,12 @@ pub fn run() {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     let builder = builder.on_web_content_process_terminate(window::recover_terminated_webview);
     builder
+        .menu(window_menu)
+        .on_menu_event(|app, event| {
+            if event.id() == window::RELOAD_MENU_ID {
+                window::reload_harness(app);
+            }
+        })
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             for label in [window::HARNESS, window::SPLASH] {
                 if let Some(existing) = app.get_webview_window(label) {

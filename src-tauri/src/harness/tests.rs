@@ -187,6 +187,39 @@ fn open_shares_one_logger_per_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An intermittent freeze is only diagnosable against the crash reports and the memory-pressure
+/// events, all of which are indexed by wall-clock time. A log line without one cannot be placed
+/// against any of them, which is what made the 2026-09-18 field report unreadable.
+#[test]
+fn every_shell_line_is_stamped_with_local_time() {
+    let stamp = local_stamp().expect("this machine has a clock");
+    // `YYYY-MM-DD hh:mm:ss`, the shape a reader can compare against Finder and the reports.
+    assert_eq!(stamp.len(), 19, "{stamp}");
+    let bytes = stamp.as_bytes();
+    assert_eq!(bytes[4], b'-', "{stamp}");
+    assert_eq!(bytes[7], b'-', "{stamp}");
+    assert_eq!(bytes[10], b' ', "{stamp}");
+    assert_eq!(bytes[13], b':', "{stamp}");
+    assert_eq!(bytes[16], b':', "{stamp}");
+    assert!(stamp.starts_with("20"), "年份要能读：{stamp}");
+    let hour: u32 = stamp[11..13].parse().expect("the hour is numeric");
+    assert!(hour < 24, "{stamp}");
+    let minute: u32 = stamp[14..16].parse().expect("the minute is numeric");
+    assert!(minute < 60, "{stamp}");
+
+    // The composed line carries it in front of the shell marker, so one grep still finds every
+    // shell line and each one can be ordered against the system logs.
+    let line = stamped(Some("2026-09-18 14:30:05".to_string()), "Harness stopped");
+    assert_eq!(line, "[2026-09-18 14:30:05] [dsh-desktop] Harness stopped");
+    // A clock that cannot answer costs the stamp and never the line: a diagnostic must not be
+    // the reason a shutdown leaves nothing behind.
+    let unstamped = stamped(None, "Harness stopped");
+    assert_eq!(unstamped, "[dsh-desktop] Harness stopped");
+    // Redaction still happens on the way in, once.
+    let secret = stamped(None, "dsh web: http://127.0.0.1:3080/?token=secret");
+    assert!(!secret.contains("secret"), "{secret}");
+}
+
 #[test]
 fn parses_plain_url() {
     let url = parse_dsh_url("dsh web: http://127.0.0.1:59753/?token=abc", 59753).unwrap();

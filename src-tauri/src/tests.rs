@@ -6,6 +6,29 @@
 use super::*;
 use crate::update_flow::{stop_mode, StopMode};
 
+/// The menu item and the handler that acts on it are bound by a string: a rename on either side
+/// silently drops every click, and the only recovery the user has from a page that stopped
+/// drawing would stop working with no error anywhere.
+#[test]
+fn the_reload_menu_item_is_the_one_the_handler_watches_for() {
+    // Read as source: building a real menu needs a running app and a display server, and the
+    // property under test is which id gets registered against which comparison.
+    let source = include_str!("lib.rs");
+    // Registered under the shell constant rather than a literal, and matched against the same
+    // one: two literals that happen to agree today would drift apart at the next rename.
+    assert_eq!(
+        source.matches("window::RELOAD_MENU_ID").count(),
+        2,
+        "菜单项注册与事件匹配都要用壳常量：{source}"
+    );
+    assert!(
+        source.contains("CmdOrCtrl+R"),
+        "重新加载要有快捷键，否则用户仍然只能退出应用"
+    );
+    // The id has to stay comparable to `MenuEvent::id()`, which `muda` implements for `&str`.
+    assert!(!window::RELOAD_MENU_ID.is_empty());
+    assert!(window::RELOAD_MENU_ID.starts_with("reload"));
+}
 #[test]
 fn self_heal_keeps_a_record_it_can_reuse_and_clears_a_stale_one() {
     let state = |pid: u32, port: u16| process::HarnessState {

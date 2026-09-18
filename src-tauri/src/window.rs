@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::utils::config::BackgroundThrottlingPolicy;
@@ -1033,18 +1033,39 @@ const LIVENESS_INTERVAL: Duration = Duration::from_secs(15);
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Consecutive bad probes that mean "this page is not coming back on its own".
-const LIVENESS_MISSES: u32 = 2;
+///
+/// Three intervals (45 s) rather than two: the page re-parses its tail block on every streamed
+/// delta, so a long reply can keep the main thread busy for tens of seconds at a time. Reloading
+/// there destroys the view and re-mounts the very content that made it slow, which is the one
+/// thing that reliably makes a "stuck" reply worse.
+const LIVENESS_MISSES: u32 = 3;
 
 /// Reloads allowed before the shell stops trying and says so.
 const LIVENESS_RELOADS: u32 = 3;
+
+/// How the page is scheduled, told apart by the timer heartbeat the probe carries.
+///
+/// A frozen page has two very different causes and they need opposite responses, so the shell
+/// asks which one it is looking at instead of guessing from the frame counter alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scheduling {
+    /// Timers still fire: the task queue is alive and only *frames* have stopped, which is what
+    /// WebKit does to a window it decides the user is not looking at.
+    Suspended,
+    /// Neither the frame callback nor the timer callback ran: the main thread is busy, or gone.
+    Stalled,
+    /// The probe could not say (an engine without `setTimeout`, or a counter that never moved).
+    Unknown,
+}
 
 /// What one probe learned about the page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageState {
     /// JavaScript ran and the frame counter moved: the page is drawing.
     Drawing,
-    /// JavaScript ran, but not one frame was produced since the previous probe.
-    Frozen,
+    /// JavaScript ran, but not one frame was produced since the previous probe. `Scheduling`
+    /// says whether the page is merely not being drawn to or has stopped running altogether.
+    Frozen(Scheduling),
     /// Nothing answered at all: the renderer is gone, or its main thread is wedged.
     Silent,
 }
@@ -1054,9 +1075,9 @@ enum PageState {
 enum LivenessAction {
     /// The page is drawing: nothing to do.
     Alive,
-    /// The window is not one the user can be looking at, and WebKit is allowed to stop drawing
-    /// there — so this probe is no evidence either way.
-    Unattended,
+    /// Timers run and only frames have stopped: the page is not broken, it is not being drawn
+    /// to. Nothing on the page can be lost, so a flick of focus is what brings it back.
+    SuspendedNotDrawing,
     /// Nothing conclusive yet: wait for the next probe.
     Wait { misses: u32 },
     /// The page looks dead, but someone is typing in it: reloading would throw that away, so
@@ -1070,19 +1091,29 @@ enum LivenessAction {
 
 /// Pure liveness policy: what one probe means, given the streaks so far.
 ///
-/// Reloading is not free — it throws away whatever the page had in memory — so it is reserved for
-/// a page that has failed [`LIVENESS_MISSES`] probes in a row, and it gives up after
-/// [`LIVENESS_RELOADS`] of them instead of looping for ever.
+/// Reloading is not free — it throws away whatever the page had in memory and re-renders the
+/// content that made it slow — so it is reserved for a page that has failed [`LIVENESS_MISSES`]
+/// probes in a row, and it gives up after [`LIVENESS_RELOADS`] of them instead of looping for ever.
 ///
-/// `attended` is whether the user can be looking at the window. It gates *frozen* only: a window
-/// behind another app is allowed to stop drawing, and judging it would turn "the user switched
-/// away" into a reload loop. A page that answers nothing is broken wherever it is.
+/// The two frozen states are not the same failure and must not share a verdict:
 ///
-/// `busy` is whether the page reports recent typing. A reload is the only recovery for a frozen
-/// page and also the thing that discards an unsent prompt, so a page someone is working in gets
-/// another interval instead. It delays the reload; it does not cancel it — a page that stays dead
-/// while the user keeps typing is still reloaded once they stop, and the streak is preserved so
-/// the retry budget is unaffected.
+/// - [`Scheduling::Suspended`] means the task queue runs and only frames stopped, which is what
+///   WebKit does to a window it believes nobody is watching. Reloading that page throws away a
+///   working session to fix the scheduler, so the shell asks the user for the one gesture that
+///   does fix it instead.
+/// - [`Scheduling::Stalled`] and [`PageState::Silent`] mean nothing is running any more, and a
+///   reload is the only recovery there is.
+///
+/// `attended` is whether the user is looking at the window now. It gates *suspended* only: a
+/// window nobody is watching is one WebKit is allowed to stop drawing, so that verdict is a hint
+/// rather than a fault. A page that is still suspended while the user *is* watching is no longer
+/// explained by that, so it joins the streak that earns a reload — otherwise a scheduler that
+/// never resumes would sit there for ever with a title telling the user to click it.
+///
+/// `busy` is whether the page reports recent typing: a reload would discard an unsent prompt, so
+/// a page someone is working in gets another interval first. It delays the reload rather than
+/// cancelling it, and never spends or restores the budget. `misses` is the frozen streak, kept
+/// across focus changes so the budget restarts from the wake rather than from every flick of focus.
 fn liveness_action(
     state: PageState,
     attended: bool,
@@ -1092,8 +1123,10 @@ fn liveness_action(
 ) -> LivenessAction {
     match state {
         PageState::Drawing => LivenessAction::Alive,
-        PageState::Frozen if !attended => LivenessAction::Unattended,
-        PageState::Frozen | PageState::Silent => {
+        PageState::Frozen(Scheduling::Suspended) if !attended => {
+            LivenessAction::SuspendedNotDrawing
+        }
+        PageState::Frozen(_) | PageState::Silent => {
             let misses = misses.saturating_add(1);
             if misses < LIVENESS_MISSES {
                 return LivenessAction::Wait { misses };
@@ -1112,29 +1145,54 @@ fn liveness_action(
 
 /// What the page's answer says, given the previous answer.
 ///
-/// The probe returns the page's own frame counter. That counter cannot move while frames are
-/// stopped, so any change is proof the page is drawing — including a drop to a smaller number,
-/// which is a freshly loaded document rather than a fault.
-fn judge_frames(answer: Option<u64>, previous: Option<u64>) -> PageState {
-    match answer {
-        None => PageState::Silent,
-        Some(count) => match previous {
-            Some(previous) if previous == count => PageState::Frozen,
-            _ => PageState::Drawing,
-        },
+/// The probe returns the page's own frame counter and timer counter. The frame counter cannot
+/// move while frames are stopped, so any change is proof the page is drawing — including a drop
+/// to a smaller number, which is a freshly loaded document rather than a fault.
+///
+/// When the frames have not moved, the timer counter says which kind of stop this is. A timer
+/// that *did* advance proves the task queue still runs, so the page is healthy and merely not
+/// being drawn to ([`Scheduling::Suspended`]); one that did not proves the main thread is busy or
+/// gone ([`Scheduling::Stalled`]). `previous` holds the two counters from the last probe, so a
+/// page that has never answered twice cannot be classified and reports [`Scheduling::Unknown`].
+fn judge_frames(answer: Option<Frames>, previous: Option<Frames>) -> PageState {
+    let Some(answer) = answer else {
+        return PageState::Silent;
+    };
+    let Some(previous) = previous else {
+        // Nothing to compare against yet: a number that arrived is progress.
+        return PageState::Drawing;
+    };
+    if previous.frames != answer.frames {
+        return PageState::Drawing;
     }
+    let scheduling = if answer.timers != previous.timers {
+        Scheduling::Suspended
+    } else if answer.timers_seen && previous.timers_seen {
+        Scheduling::Stalled
+    } else {
+        Scheduling::Unknown
+    };
+    PageState::Frozen(scheduling)
 }
 
-/// The probe: count animation frames in the page, and report the running total.
+/// The probe: count animation frames in the page, plus the timers that prove it still runs.
 ///
-/// ES5 on purpose, and it schedules at most one frame at a time: a pending callback is itself the
-/// proof that frames are stopped, and it fires the moment they resume.
+/// ES5 on purpose, and it schedules at most one callback of each kind at a time: a pending
+/// callback is itself the proof that its queue has stopped, and it fires the moment that queue
+/// resumes. The two counters are what tell a suspended window (timers run, frames do not) apart
+/// from a busy or dead one (neither runs); `timersSeen` records that this engine could count at
+/// all, because an engine without `setTimeout` would otherwise look busy for ever.
 const FRAME_PROBE: &str = r#"
 (function () {
   var w = window;
   if (typeof w.__dshFrames !== "number") {
     w.__dshFrames = 0;
     w.__dshFramePending = false;
+  }
+  if (typeof w.__dshTimers !== "number") {
+    w.__dshTimers = 0;
+    w.__dshTimerPending = false;
+    w.__dshTimerSeen = typeof w.setTimeout === "function";
   }
   if (!w.__dshFramePending && typeof w.requestAnimationFrame === "function") {
     w.__dshFramePending = true;
@@ -1143,9 +1201,39 @@ const FRAME_PROBE: &str = r#"
       w.__dshFramePending = false;
     });
   }
-  return w.__dshFrames;
+  if (!w.__dshTimerPending && w.__dshTimerSeen) {
+    w.__dshTimerPending = true;
+    var bump = function () {
+      w.__dshTimers += 1;
+      w.__dshTimerPending = false;
+    };
+    w.setTimeout(bump, 0);
+  }
+  return JSON.stringify({
+    frames: w.__dshFrames,
+    timers: w.__dshTimers,
+    timersSeen: w.__dshTimerSeen === true
+  });
 })()
 "#;
+
+/// What [`FRAME_PROBE`] reported back.
+///
+/// `rename_all` is load-bearing: the page writes camelCase, and a mismatch here turns every
+/// answer into a parse failure, which the watchdog reads as a dead renderer and reloads for.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct Frames {
+    /// Animation frames drawn since the page loaded.
+    #[serde(default)]
+    frames: u64,
+    /// Timer callbacks that ran since the page loaded.
+    #[serde(default)]
+    timers: u64,
+    /// Whether this engine could count timers at all.
+    #[serde(default)]
+    timers_seen: bool,
+}
 
 /// Ask the page whether someone is working in it right now.
 ///
@@ -1347,15 +1435,26 @@ pub fn create_harness(
     // From here on the page is on its own: a WebContent process killed under memory pressure, or
     // a main thread wedged by a plugin, leaves a window that looks alive and answers nothing —
     // including the UI's own reconnection logic, which lives in that very process.
+    //
+    // A rendezvous of one: focusing the window is what un-suspends a page WebKit stopped drawing,
+    // and the watchdog would otherwise spend up to a full interval before noticing the user is
+    // back. `try_send` keeps the UI thread free, and the receiver is (re)installed here so the
+    // sender always belongs to the watchdog that is actually running.
+    let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+    *WAKE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(wake_tx);
     let alive_app = window.app_handle().clone();
     let alive_url = url.clone();
-    std::thread::spawn(move || watch_page_liveness(alive_app, alive_url, generation));
+    std::thread::spawn(move || watch_page_liveness(alive_app, alive_url, generation, wake_rx));
 
     // Closing the Harness window quits the app, which stops the supervised process.
     let handle = window.app_handle().clone();
     window.on_window_event(move |event| {
-        if let tauri::WindowEvent::CloseRequested { .. } = event {
-            handle.exit(0);
+        match event {
+            tauri::WindowEvent::CloseRequested { .. } => handle.exit(0),
+            // Registering this listener a second time on the same window does not replace the
+            // first one, so the handler stays a pure dispatch on the event kind.
+            tauri::WindowEvent::Focused(true) => wake_page(),
+            _ => {}
         }
     });
 
@@ -1381,13 +1480,19 @@ pub fn recover_terminated_webview(webview: &Webview) {
         ));
         return;
     }
-    harness::app_log("WebView 渲染进程被系统结束（多为内存压力），正在重新加载页面");
+    // Not "memory pressure": the one report this machine produced for this event was a
+    // JavaScriptCore assertion on the renderer's main thread (2026-09-18), and naming the wrong
+    // cause sends the reader looking at memory instead of at what the page was rendering. The
+    // report itself is named so the next occurrence can be found rather than guessed at.
+    harness::app_log(
+        "WebView 渲染进程已结束（WebKit 崩溃或内存压力；崩溃报告见 ~/Library/Logs/DiagnosticReports），正在重新加载页面",
+    );
     let Some(window) = webview.app_handle().get_webview_window(HARNESS) else {
         harness::app_log("崩溃恢复：harness 窗口已不在，交给存活检查处理");
         return;
     };
     let target = current_url(&window);
-    set_title(&window, "DeepSeek Harness（页面已崩溃，正在重新加载…）");
+    set_title(&window, "DeepSeek Harness（渲染进程已结束，正在重新加载…）");
     if let Err(error) = window.navigate(target.clone()) {
         harness::app_log(&format!("崩溃后重新加载 {target} 失败: {error}"));
     }
@@ -1441,14 +1546,32 @@ fn remember_url(url: &Url) {
 /// page is gone, and the shell loads the URL again — the same thing a user would do by hand, and
 /// the only recovery available for a process the shell cannot restart in place.
 ///
+/// A window the user is not looking at gets probed the same way and is never reloaded for standing
+/// still on its own: WebKit is allowed to stop drawing one. What it no longer gets is silence —
+/// the verdict is logged once per streak, shown in the title, and the focus that follows is judged
+/// against the streak rather than spending a full interval to rediscover it.
+///
 /// The loop ends with the window: a gone window, a window that is no longer the Harness, or a
 /// page that survived [`LIVENESS_RELOADS`] attempts and needs the user to decide.
-fn watch_page_liveness(app: AppHandle, url: Url, generation: u64) {
+fn watch_page_liveness(app: AppHandle, url: Url, generation: u64, wake: Receiver<Wake>) {
     let mut misses = 0;
     let mut reloads = 0;
     let mut frames = None;
+    // Whether the page was already known not to be drawing. The freeze is a state, not an
+    // event, so the loop reloads the page when it has been stuck since before the user looked
+    // away instead of waiting another interval to rediscover what it already knew.
+    let mut stuck = false;
     loop {
-        std::thread::sleep(LIVENESS_INTERVAL);
+        // A timed wait rather than a sleep: a focus event is what makes "the user came back" a
+        // reason to judge the page now instead of up to a full interval later.
+        match wake.recv_timeout(LIVENESS_INTERVAL) {
+            Ok(Wake::Focus) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            // Only reachable after a rebuild replaced the sender, and the disconnect arrives
+            // immediately rather than after the interval — which is why the generation check
+            // below still has to run: it is what ends this iteration and this loop.
+            Err(RecvTimeoutError::Disconnected) => {}
+        }
         if crate::EXITING.load(Ordering::SeqCst) {
             return;
         }
@@ -1466,16 +1589,16 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64) {
         }
         let answer = probe_frames(&window);
         let state = judge_frames(answer, frames);
-        if let Some(count) = answer {
-            frames = Some(count);
+        if let Some(counts) = answer {
+            frames = Some(counts);
         }
         // Only asked once a probe has already failed, and only of a page that still answers: a
         // healthy page needs no second question, and a silent one cannot answer this either —
         // asking it anyway spends the full [`LIVENESS_TIMEOUT`] on every failed cycle, which
         // pushed the whole recovery from ~45 s to ~100 s (review C2). `Silent` is by definition
         // "not busy", so skipping the question changes no decision.
-        let busy =
-            matches!(state, PageState::Frozen) && page_is_busy(probe_activity(&window).as_deref());
+        let busy = matches!(state, PageState::Frozen(_))
+            && page_is_busy(probe_activity(&window).as_deref());
         match liveness_action(state, attended(&window), busy, misses, reloads) {
             LivenessAction::Alive => {
                 if misses > 0 || reloads > 0 {
@@ -1485,19 +1608,41 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64) {
                 }
                 misses = 0;
                 reloads = 0;
-            }
-            LivenessAction::Unattended => {
-                // The user is elsewhere and WebKit may legitimately stop drawing here. Say so
-                // once, then keep the streak as it was: this is not a fault to accumulate.
-                if misses == 0 && reloads == 0 && state == PageState::Frozen {
-                    harness::app_log("窗口不在前台，WebKit 可能已停止绘制，本轮不判定");
+                stuck = false;
+                // Only when this shell put a message there: the document owns the title
+                // otherwise, and overwriting it would fight whatever the page is reporting.
+                if !title_is_default(&window) {
+                    let _ = window.set_title(DEFAULT_TITLE);
                 }
+            }
+            // The task queue runs and only frames stopped, which is what WebKit does to a window
+            // it believes nobody is watching. Reloading would throw away a working session to
+            // fix the scheduler, so the shell says which gesture does fix it and leaves the page
+            // alone. The title is the only place the user can see it without reading the log.
+            LivenessAction::SuspendedNotDrawing => {
+                // Said once per streak: this state lasts as long as the user works elsewhere, and
+                // repeating it every interval would push everything else out of a 5 MB log.
+                if !stuck {
+                    harness::app_log(
+                        "Harness 页面停止绘制：计时器仍在运行，说明是被 WebKit 暂停绘制（多为窗口失去焦点）而非卡死；点击或聚焦窗口即可恢复，不重新加载",
+                    );
+                    set_title_if(&window, NOT_DRAWING_TITLE);
+                }
+                stuck = true;
             }
             LivenessAction::Wait { misses: now } => {
                 misses = now;
-                if misses == 1 {
+                if misses == 1 && stuck {
+                    // The title asked the user to come back to the window, and they did: the
+                    // frames stayed stopped. The hint has been tried, so stop repeating it and
+                    // fall back to the verdict that earns a reload.
+                    harness::app_log(
+                        "Harness 页面在窗口重新获得焦点后仍未恢复绘制，按未响应继续处理",
+                    );
+                    set_title_if(&window, "DeepSeek Harness（页面仍未刷新，继续观察…）");
+                } else if misses == 1 {
                     harness::app_log(match state {
-                        PageState::Frozen => "Harness 页面停止绘制（输入仍有响应），继续观察",
+                        PageState::Frozen(_) => "Harness 页面停止绘制（输入仍有响应），继续观察",
                         _ => "Harness 页面没有响应存活检查，继续观察",
                     });
                 }
@@ -1509,15 +1654,16 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64) {
                 harness::app_log(&format!(
                     "Harness 页面仍未恢复（{}），但检测到正在输入：推迟重新加载，避免丢失未提交的内容",
                     match state {
-                        PageState::Frozen => "停止绘制",
+                        PageState::Frozen(_) => "停止绘制",
                         _ => "无响应",
                     }
                 ));
-                set_title(&window, "DeepSeek Harness（页面已停止刷新，等待输入结束…）");
+                set_title_if(&window, "DeepSeek Harness（页面已停止刷新，等待输入结束…）");
             }
             LivenessAction::Reload { attempt } => {
                 misses = 0;
                 reloads = attempt;
+                stuck = false;
                 // The reload starts a fresh document with a fresh counter, so the old reading
                 // must not be compared against it: that would spend a second probe on a page
                 // that has just been rebuilt.
@@ -1525,7 +1671,7 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64) {
                 harness::app_log(&format!(
                     "Harness 页面连续 {LIVENESS_MISSES} 次未通过存活检查（{}），第 {attempt}/{LIVENESS_RELOADS} 次重新加载 {url}",
                     match state {
-                        PageState::Frozen => "停止绘制",
+                        PageState::Frozen(_) => "停止绘制",
                         _ => "无响应",
                     }
                 ));
@@ -1551,14 +1697,64 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64) {
     }
 }
 
+/// The menu item that reloads the page by hand.
+///
+/// Named here rather than in `lib.rs`, which builds the menu, so the id the item is registered
+/// under and the id the handler matches cannot drift apart.
+pub const RELOAD_MENU_ID: &str = "reload-harness";
+
+/// Load the Harness URL again, on the user's explicit request.
+///
+/// The same navigation the drawing watchdog performs, and the same caveat: it throws away what
+/// the page held in memory (scroll position, an expanded Think row, an unsent draft) but never the
+/// session, which lives in the Harness process. It exists because the watchdog deliberately does
+/// *not* reload a page that is merely suspended — nothing on the page can be lost there, but
+/// nothing can be recovered from it either, and a user who wants a fresh document should not have
+/// to quit the app to get one (review 2026-09-18).
+pub fn reload_harness(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(HARNESS) else {
+        harness::app_log("手动重新加载被忽略：harness 窗口不存在");
+        return;
+    };
+    let target = current_url(&window);
+    harness::app_log(&format!("手动重新加载界面：{target}"));
+    set_title(&window, DEFAULT_TITLE);
+    if let Err(error) = window.navigate(target) {
+        harness::app_log(&format!("手动重新加载失败: {error}"));
+    }
+}
+
 /// The title a healthy window carries.
 const DEFAULT_TITLE: &str = "DeepSeek Harness";
+
+/// What the title says while the page is alive but nothing is being drawn to it.
+///
+/// The page itself cannot say this — it stopped being painted, and the model's output is exactly
+/// what is missing from the screen — so the window frame is the only place the user can learn
+/// that the session is intact and one click away from coming back.
+const NOT_DRAWING_TITLE: &str = "DeepSeek Harness（已暂停绘制：聚焦窗口或重新加载界面即可恢复）";
 
 /// Put a sentence in the window title, so a page that stopped answering is visible without the
 /// log. Best effort: a window that refuses the title is not a reason to stop watching it.
 fn set_title(window: &WebviewWindow, title: &str) {
     if let Err(error) = window.set_title(title) {
         harness::app_log(&format!("设置窗口标题失败: {error}"));
+    }
+}
+
+/// [`set_title`] only when the text is not already there.
+///
+/// The watchdog reaches most of its arms every interval for as long as a condition lasts —
+/// hours, while the user works in another window — and a native title change per interval is a
+/// window-server round trip nobody asked for. Reading the current title is the cheap half of that
+/// trade; a window that will not answer counts as changed, so a message is never skipped.
+fn set_title_if(window: &WebviewWindow, title: &str) {
+    let unchanged = window
+        .title()
+        .map(|current| current == title)
+        .unwrap_or(false);
+    if !unchanged {
+        set_title(window, title);
     }
 }
 
@@ -1570,26 +1766,61 @@ fn title_is_default(window: &WebviewWindow) -> bool {
         .unwrap_or(true)
 }
 
+/// Why the watchdog stopped waiting.
+///
+/// The frame counter says the page is not drawing; it cannot say that the user just came back to
+/// it. That gesture is exactly what un-suspends a page WebKit decided nobody was watching, so it
+/// is a reason to probe now instead of up to a full interval later.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Wake {
+    /// The Harness window was focused.
+    Focus,
+}
+
 /// Whether the user can be looking at the window: visible, not minimised, and focused.
 ///
 /// A window that is none of those is one WebKit is allowed to stop drawing, which is why the
-/// answer gates the *frozen* verdict and not the silent one.
+/// answer gates the *suspended* verdict and not the silent one. It is read at probe time rather
+/// than latched from the focus event: what matters is whether the user is looking at the page
+/// now, and a window that regained focus and lost it again is back to being unattended.
 fn attended(window: &WebviewWindow) -> bool {
     window.is_visible().unwrap_or(true)
         && !window.is_minimized().unwrap_or(false)
         && window.is_focused().unwrap_or(true)
 }
 
-/// Ask the page how many frames it has drawn, and wait a bounded time for the answer.
+/// The watchdog's waiting end, kept for the life of the app.
+///
+/// A rendezvous of one, not a queue: the signal is "judge the page now", and a burst of focus
+/// events means the same thing as a single one. The sender is a static rather than a handle every
+/// window callback has to capture, and it is deliberately never dropped — a disconnected channel
+/// would end the watchdog's wait early and make the loop spin.
+static WAKE: Mutex<Option<SyncSender<Wake>>> = Mutex::new(None);
+
+/// Tell the watchdog to judge the page now, because the user just came back to it.
+///
+/// Best effort: a window with no watchdog (a startup before one exists, or one that already gave
+/// up) has nothing to wake. `try_send` never blocks the UI thread that calls this, and a full
+/// rendezvous already carries the same message.
+pub fn wake_page() {
+    let guard = WAKE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(sender) = guard.as_ref() {
+        let _ = sender.try_send(Wake::Focus);
+    }
+}
+
+/// Ask the page what its frame and timer counters say, and wait a bounded time for the answer.
 ///
 /// `eval_with_callback` answers from WebKit's completion handler, so a wedged or dead renderer
-/// never calls it: `None` is that silence. A number that has not moved is the other failure —
-/// the page runs, takes input, and draws nothing.
-fn probe_frames(window: &WebviewWindow) -> Option<u64> {
+/// never calls it: `None` is that silence. Counters that have not moved are the other failure —
+/// the page runs, takes input, and draws nothing. An answer this shell cannot parse is silence
+/// too: the probe is the only thing producing it, so a shape it does not recognise means the
+/// page is not the page the shell thinks it is watching.
+fn probe_frames(window: &WebviewWindow) -> Option<Frames> {
     let (tx, rx) = mpsc::channel();
     window
         .eval_with_callback(FRAME_PROBE, move |answer| {
-            let _ = tx.send(answer.trim().parse::<u64>().ok());
+            let _ = tx.send(serde_json::from_str::<Frames>(answer.trim()).ok());
         })
         .ok()?;
     rx.recv_timeout(LIVENESS_TIMEOUT).ok().flatten()

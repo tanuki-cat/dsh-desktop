@@ -894,7 +894,7 @@ pub fn init_app_log(path: &Path) {
     *APP_LOGGER.lock().unwrap() = Some(Logger::open(path));
 }
 
-/// Append a shell-side line (navigation blocks, downloads) to the same log, redacted.
+/// Append a shell-side line (navigation blocks, downloads) to the same log, stamped and redacted.
 ///
 /// Redaction happens before the lock is taken: it is the one step here that can panic on hostile
 /// input, and a panic while holding `APP_LOGGER` would poison the mutex so that *every* later
@@ -902,10 +902,94 @@ pub fn init_app_log(path: &Path) {
 /// poison-tolerantly for the same reason: a poisoned logger must still be writable, because the
 /// lines it carries are how a failed exit becomes visible at all.
 pub fn app_log(line: &str) {
-    let safe = format!("[dsh-desktop] {}", redact(line));
+    // Timestamped: an intermittent freeze is only diagnosable against the crash reports, the
+    // memory-pressure events and what the user was doing, and every one of those is indexed by
+    // wall-clock time. Without the stamp the shell's own lines cannot be ordered against them.
+    let safe = stamped(local_stamp(), line);
     if let Some(logger) = lock_logger() {
         logger.write(&safe);
     }
+}
+
+/// One log line: the stamp when the clock answered, the shell marker, and the redacted text.
+///
+/// Redaction is part of composing the line rather than a step of its own so that the one place
+/// that can panic on hostile input stays on the way in, before the logger lock is taken.
+fn stamped(stamp: Option<String>, line: &str) -> String {
+    let text = redact(line);
+    match stamp {
+        Some(stamp) => format!("[{stamp}] [dsh-desktop] {text}"),
+        None => format!("[dsh-desktop] {text}"),
+    }
+}
+
+/// `YYYY-MM-DD hh:mm:ss` in the machine's local time, or `None` when the clock cannot be read.
+///
+/// Local rather than UTC: this log is read next to Finder timestamps and crash reports, both of
+/// which are local. A clock that cannot answer costs the stamp, never the line — the callers here
+/// include the shutdown path, which must not fail over a diagnostic.
+fn local_stamp() -> Option<String> {
+    let (year, month, day, hour, minute, second) = local_parts()?;
+    Some(format!(
+        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"
+    ))
+}
+
+#[cfg(unix)]
+fn local_parts() -> Option<(i32, u32, u32, u32, u32, u32)> {
+    // Fully qualified: the Unix and Windows spellings share this module, and only one of them
+    // may import these at the top.
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let seconds = seconds as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `tm` is a live, writable `libc::tm` and `seconds` outlives the call; `localtime_r`
+    // fills the struct and answers with the same pointer, or null when it refuses.
+    let filled = unsafe { !libc::localtime_r(&seconds, &mut tm).is_null() };
+    if !filled {
+        return None;
+    }
+    Some((
+        tm.tm_year + 1900,
+        (tm.tm_mon + 1) as u32,
+        tm.tm_mday as u32,
+        tm.tm_hour as u32,
+        tm.tm_min as u32,
+        tm.tm_sec as u32,
+    ))
+}
+
+#[cfg(windows)]
+fn local_parts() -> Option<(i32, u32, u32, u32, u32, u32)> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTimeParts {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLocalTime(time: *mut SystemTimeParts);
+    }
+    let mut parts = SystemTimeParts::default();
+    // SAFETY: `parts` is a live, writable struct of exactly the layout `GetLocalTime` fills.
+    unsafe { GetLocalTime(&mut parts) };
+    Some((
+        i32::from(parts.year),
+        u32::from(parts.month),
+        u32::from(parts.day),
+        u32::from(parts.hour),
+        u32::from(parts.minute),
+        u32::from(parts.second),
+    ))
 }
 
 /// The shared app logger, ignoring a poisoned lock rather than propagating the panic.
