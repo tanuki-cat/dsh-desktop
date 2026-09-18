@@ -36,7 +36,13 @@ fn live_check_reports_the_registry_head() {
     let node = path_lookup("node").expect("node must be on PATH for this test");
     let npm = update::npm_for(&node).expect("npm must be resolvable from node");
     use_private_npm_cache();
-    let tags = vec!["latest".to_string(), "next".to_string()];
+    // The tags the shell actually consults by default, so this test answers "does the shipped
+    // configuration find the newest build?" rather than "does an arbitrary list work?".
+    let tags = update::default_tags();
+    assert!(
+        tags.iter().any(|tag| tag == "alpha"),
+        "the shipped default must consult the alpha tag: {tags:?}"
+    );
 
     // Any real published version outranks 0.0.1, so this must report an update.
     match update::check(&npm, update::PACKAGE, &tags, "0.0.1") {
@@ -46,6 +52,14 @@ fn live_check_reports_the_registry_head() {
         }
         other => panic!("expected UpdateAvailable from 0.0.1, got {other:?}"),
     }
+
+    // The registry's own tags, printed so a human can see what the default resolved to and
+    // whether a newer alpha existed at the time. Not asserted: the tags move without notice.
+    let published = update::fetch_dist_tags(&npm, update::PACKAGE)
+        .expect("the registry must answer with its dist-tags");
+    let mut names: Vec<&str> = published.iter().map(|(name, _)| name.as_str()).collect();
+    names.sort_unstable();
+    println!("published dist-tags = {names:?}");
 
     // And an impossible version is already "newer" than the registry.
     match update::check(&npm, update::PACKAGE, &tags, "99.0.0") {
@@ -64,7 +78,7 @@ fn cache_short_circuits_the_second_query() {
     let node = path_lookup("node").expect("node must be on PATH for this test");
     let npm = update::npm_for(&node).expect("npm must be resolvable from node");
     use_private_npm_cache();
-    let tags = vec!["latest".to_string(), "next".to_string()];
+    let tags = update::default_tags();
     let dir = test_dir("dsh-desktop-live-cache-test");
     let _ = std::fs::remove_dir_all(&dir);
 

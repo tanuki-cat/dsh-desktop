@@ -425,12 +425,13 @@ TCC 归因仍待验证。
 
 - 版本比较：自实现 semver（含 prerelease 排序），纯函数、6 个单测覆盖
   （`1.2.10 > 1.2.9`、`1.0.0 > 1.0.0-rc.1`、`rc.2 > rc.1 > alpha.2`、畸形输入拒绝）。
-- 取版本：`npm view <pkg> dist-tags --json` → 在配置的 tag 列表里取最高版本（默认 `latest,next`），从不降级。
+- 取版本：`npm view <pkg> dist-tags --json` → 在配置的 tag 列表里取最高版本（默认值见本节末修正注），从不降级。
 - 安装：`npm install -g --no-fund --no-audit <pkg>@<具体版本>`；npm 从 node 同目录解析（GUI 无 Homebrew PATH），
   并在 npm 全局前缀 ≠ CLI 实际位置时带 `--prefix` —— 与启动脚本一致。
 - 时序：**更新在探测之前**；更新成功则强制重启实例（否则复用旧进程仍跑旧二进制）。
 - 可见性：检查/安装/失败都写进 `logs/harness.log`；splash 显示"正在检查 dsh 更新…/发现新版本…"。
-- 配置：`auto_update`（默认 true）、`update_tags`（默认 `["latest","next"]`）。
+- 配置：`auto_update`（默认 true）、`update_tags`（当时默认 `["latest","next"]`；后经两次修正，
+  现为 `["latest","alpha"]` —— 见本节末两条修正注）。
 
 > **2026-09-15 修正（默认值收敛）**：`update_tags` 默认改为 **`["latest"]`** —— 预发布渠道 `next` 不该是
 > 桌面用户的默认目标。同轮一并收敛的还有：`auto_update_plugins` 默认 **`false`**（profile 是用户数据）、
@@ -441,6 +442,23 @@ TCC 归因仍待验证。
 >
 > 另外 `require_tested_dsh` 默认改为 `true` 后，安装与启动必须受同一区间约束，否则会自锁（装上一个
 > 随后拒绝启动的版本），因此新增 `update::may_install()`。见 `docs/dsh-desktop-v0.4.1-code-review.md` 第 2 项。
+
+> **2026-09-18 再次修正（alpha 纳入范围）**：`update_tags` 默认改为 **`["latest","alpha"]`**，
+> **推翻上面那次"只留 `latest`"的收敛**。理由：上游的 `alpha` 标签会领先 `latest` —— 实测当天
+> registry 返回 `{"latest":"0.1.5-rc.2","next":"0.1.5-rc.2","alpha":"0.1.6-alpha.2"}`，只读 `latest`
+> 的壳永远看不到 `0.1.6-alpha.2`。`next` 仍排除在外：它当时与 `latest` 同版本，不提供额外信息。
+>
+> 上面那次收敛的理由是"预发布渠道不该是桌面用户的默认目标"，这条**对 `next` 仍然成立**，但对
+> `alpha` 不成立：`alpha` 是上游发布最新构建的渠道，而 `require_tested_dsh`（默认开）仍然把
+> 安装范围限制在已测试区间内 —— 区间外的 alpha 只报告、不安装，所以"默认跟 alpha"不会把用户
+> 静默推上未测试的版本。想只跟正式版写 `["latest"]` 即可。
+>
+> 随之新增：`update::default_tags()`（默认值的唯一定义，配置默认值与联网集成测试共用）、
+> `Cache::tags`（缓存条目记下是哪组标签问出来的，换标签即视为换问题、旧答案不复用，因此默认值
+> 改动下次启动生效而非等一个缓存周期；旧缓存文件没有该字段，反序列化为空列表，同样判为不新鲜）。
+>
+> 验证：单测 192 → **194**；联网集成测试改用 `update::default_tags()` 并打印 registry 实际标签，
+> 实测 `live registry head = 0.1.6-alpha.2 (dist-tags: ["latest", "alpha"])`（改动前为 `0.1.5-rc.2`）。
 
 验证：`cargo test` **12 passed**（6 原有 + 6 版本比较）；另加一个联网集成测试
 `tests/update_live.rs`（默认跳过，设 `DSH_DESKTOP_LIVE_TESTS=1` 才跑），实测本机 registry head =

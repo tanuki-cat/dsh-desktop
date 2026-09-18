@@ -176,6 +176,26 @@ fn collected(rx: Option<mpsc::Receiver<Captured>>) -> Captured {
         .unwrap_or_else(Captured::empty)
 }
 
+/// The dist-tags this shell follows by default: the release channel plus `alpha`.
+///
+/// `latest` alone is what this shell shipped with, and it is not enough: upstream publishes
+/// ahead of it. Measured 2026-09-18, the registry answered `{"latest":"0.1.5-rc.2",
+/// "alpha":"0.1.6-alpha.2"}` — the alpha tag held the newest version on the registry and the
+/// shell never looked at it. `next` stays out: it tracked the same version as `latest` and
+/// carries no information `latest` does not.
+///
+/// A tag the registry does not publish is not a failure as long as one of the others matches
+/// (see [`check`]), which is what lets one list serve both the CLI and the plugin market:
+/// `dshmarket` publishes no `alpha`, so it is simply filtered out there.
+///
+/// This reverses the 2026-09-15 convergence to `["latest"]`; the original rationale and why it
+/// no longer holds are in §13.4 of the design document. `require_tested_dsh` is unchanged and
+/// still bounds what may be installed: an alpha outside the tested range is reported, not
+/// installed.
+pub fn default_tags() -> Vec<String> {
+    vec!["latest".to_string(), "alpha".to_string()]
+}
+
 /// The CLI this shell supervises.
 pub const PACKAGE: &str = "@deepseek-ai/dsh";
 
@@ -719,6 +739,15 @@ pub struct Cache {
     pub installed: String,
     /// Newest version seen, or None when the query failed.
     pub latest: Option<String>,
+    /// The dist-tags this answer was produced from.
+    ///
+    /// A different set of tags is a different question — an answer built from `latest` alone says
+    /// nothing about whether `alpha` has moved — so the entry may not be reused across a change.
+    /// Absent in cache files written before this field existed, which reads as "some other set of
+    /// tags" and is what makes a changed default take effect on the next launch rather than after
+    /// the interval expires.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Latest version whose install was already attempted while the supervised CLI stayed put
     /// (npm wrote the package somewhere this shell does not run it from). Suppresses a second
     /// install of the same answer; newer than existing cache files, hence optional on the wire.
@@ -739,8 +768,17 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub fn is_fresh(&self, now: u64, installed: &str, interval_minutes: u64) -> bool {
+    pub fn is_fresh(
+        &self,
+        now: u64,
+        installed: &str,
+        tags: &[String],
+        interval_minutes: u64,
+    ) -> bool {
         if self.installed != installed {
+            return false;
+        }
+        if self.tags.as_slice() != tags {
             return false;
         }
         // A failed query is retried quickly instead of being trusted for the whole interval.
@@ -882,7 +920,7 @@ fn check_cached_at(
     let now = now_secs();
     let previous = read_cache_at(cache_file);
     if let Some(cache) = previous.as_ref() {
-        if cache.is_fresh(now, current, interval_minutes) {
+        if cache.is_fresh(now, current, wanted_tags, interval_minutes) {
             let status = match cache.latest.as_deref() {
                 Some(latest) => judge(latest, current),
                 None => Status::Failed {
@@ -913,6 +951,7 @@ fn check_cached_at(
         checked_at: now,
         installed: current.to_string(),
         latest,
+        tags: wanted_tags.to_vec(),
         attempted,
         failed: failed.as_ref().map(|marker| marker.version.clone()),
         failed_at: failed.as_ref().map(|marker| marker.at).unwrap_or(0),

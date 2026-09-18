@@ -162,6 +162,8 @@ DSH Desktop.app/Contents/Resources/runtime/
   > 同轮一并收敛：`auto_update_plugins` 默认 `false`（profile 是用户数据；这也消解了
   > `design-task-fix-v0-2-0-post-merge-audit.md` 的 A3「两个更新开关策略不一致」），
   > `update_tags` 默认 `["latest"]`。见 `docs/dsh-desktop-v0.4.1-code-review.md` 第 2 项。
+  > **2026-09-18 后续**：该默认值已改为 `["latest","alpha"]`（上游 `alpha` 领先 `latest`），
+  > 理由与边界见 `design-task-feat-dsh-tauri-desktop-shell.md` §13.4 的第二条修正注。
 - **决策要稳定且可见**：系统运行时依赖登录 shell 探测，rc 文件改动或导入失败都会让结果在两次启动之间翻转。
   因此：探测一次后把结论与版本写进配置/诊断，并保留手动 `runtime: system | bundled | auto` 覆盖；
   启动日志与状态页显示 `runtime: system (node 22.23.2 / dsh 0.1.5-rc.2)` 这类信息。

@@ -92,8 +92,13 @@ pub struct Config {
     /// Check the npm registry before every start and install a newer CLI when there is one.
     #[serde(default = "default_auto_update")]
     pub auto_update: bool,
-    /// Dist-tags consulted in auto mode; the highest version among them wins. Only `latest` by
-    /// default: a prerelease channel is not something to move a desktop user onto unasked.
+    /// Dist-tags consulted in auto mode; the highest version among them wins.
+    ///
+    /// Defaults to `latest` plus `alpha` — upstream publishes ahead of `latest`, so following
+    /// only the release tag means never seeing the newest build. A tag the registry does not
+    /// publish is ignored while another one matches, which is why this list is also usable for the
+    /// plugin market (`dshmarket` publishes no `alpha`). Narrow it to `["latest"]` to stay on
+    /// release versions only.
     #[serde(default = "default_update_tags")]
     pub update_tags: Vec<String>,
     /// Trust a successful registry answer for this many minutes (0 = query on every start).
@@ -274,10 +279,10 @@ fn default_update_interval() -> u64 {
     60
 }
 
-/// Only the release channel: `next` is a prerelease tag, and following it by default would move
-/// a desktop user onto an untested build without them asking.
+/// The tags the config falls back to. Defined in [`update`] beside the code that consumes them,
+/// so the shipped default and the live registry test cannot drift apart.
 fn default_update_tags() -> Vec<String> {
-    vec!["latest".to_string()]
+    update::default_tags()
 }
 
 impl Config {

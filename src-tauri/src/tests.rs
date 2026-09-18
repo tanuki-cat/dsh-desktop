@@ -363,8 +363,13 @@ fn defaults_do_not_take_over_foreign_state() {
 
     // Killing whatever holds the port is the user's call, not a startup path's.
     assert!(!config.take_over_existing);
-    // A prerelease channel is not a default target for a desktop user.
-    assert_eq!(config.update_tags, vec!["latest".to_string()]);
+    // The release tag plus `alpha`, because upstream publishes ahead of `latest`: measured
+    // 2026-09-18, `alpha` was the newest version on the registry (0.1.6-alpha.2) while `latest`
+    // was still 0.1.5-rc.2. `next` stays out — it tracked `latest` and adds nothing.
+    assert_eq!(
+        config.update_tags,
+        vec!["latest".to_string(), "alpha".to_string()]
+    );
     // A profile is user data; keeping its plugin tree current is opt-in.
     assert!(!config.auto_update_plugins);
     // The shell parses the CLI's startup line, so an untested version is refused by default.

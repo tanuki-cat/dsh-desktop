@@ -57,7 +57,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 - CSP：本地 splash 页面走 `tauri.conf.json` 的 `app.security.csp`（无 `unsafe-inline`/`unsafe-eval`，Tauri 为页面内联脚本自动补 sha256、为样式补 nonce）。**作用范围仅限本地资产**：harness 窗口加载的是 `http://127.0.0.1:<port>/`，Tauri 不参与该请求，也就无法给它加 CSP —— 那一边靠的是零 capability + 导航围栏。
 - 下载：`on_download` 落盘到 `~/Downloads`，同名文件自动加 `-1`/`-2` 后缀（不静默覆盖）；
   附件上传由 wry 的 `runOpenPanel` 原生处理
-- **升级**：每次启动查 registry（默认只取 `latest`）—— dsh 核心有新版、且**在已测试区间内**时才装并重启实例；
+- **升级**：每次启动查 registry（默认取 `latest` + `alpha` 中最高者）—— dsh 核心有新版、且**在已测试区间内**时才装并重启实例；
   用户自己装的那棵树默认只提示（`system_updates: notify`）。profile 里的插件市场 `dshmarket` 走同一套机制
   （自己的缓存窗口，装完同样重启让新插件生效），但默认关闭（`auto_update_plugins: false`）；
   npm 子进程显式带上 node 所在目录的 PATH（否则 GUI 启动下 `#!/usr/bin/env node` 必然 exit 127），
@@ -87,7 +87,9 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   且 `plugin-check.json` 与核心的 `update-check.json` 各自独立（时间戳与内容互不影响）。
 - 离线测试：`cargo test` **188 passed**，另有 **7 个集成用例**（在真实 node 引擎里跑兼容层与探测脚本）。单测覆盖：URL 解析含 LAN 后缀、凭据脱敏（`Bearer`/`api_key`/`Cookie` 等）、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
-  缓存落盘往返与旧缓存文件兼容、"装到别处 → 同窗口与跨窗口都不重复安装"、npm PATH 前缀、端口探针超时（沉默对端与持续发送对端两类）、
+  缓存落盘往返与旧缓存文件兼容（含新增的 tags 字段缺失时判为不新鲜）、"装到别处 → 同窗口与跨窗口都不重复安装"、
+  **标签选择**（alpha 可以是最新版本、alpha 落后时 latest 仍胜出、registry 没有该标签时只要另一个匹配就不算失败）、
+  npm PATH 前缀、端口探针超时（沉默对端与持续发送对端两类）、
   package.json 版本解析、部分/损坏 config.json 处理、workspace / dsh_path 回退不改文件、HOME 缺失不回落 `/`、
   进程组终止与僵尸进程识别、外链 scheme 白名单、页面加载重试判定矩阵、自愈三分支与
   "Keep ⇒ 进程组终止"的组合断言、孤儿残留的 `ps` 判定与父进程分类（launchd / `systemd --user` / 父进程已消失 / 活着的会话）、
@@ -307,7 +309,7 @@ src-tauri/src/harness.rs        -> src-tauri/src/harness/tests.rs
 | `take_over_existing` | `false` | **没答复时**怎么处理（不是「是否询问」）。端口被**外部** Harness（不是本应用启动的）占用、且该进程命令行确实像 `dsh web` 时，**一定会弹面板**让你当场选：接管 / 保留并用浏览器打开 / 保留并让本应用换端口 / 什么都不做。面板写明对方 pid、完整命令行与本应用将要使用的 workspace。**120 秒没有选择才按本项决定**：`false`（默认）= 用系统浏览器打开，`true` = 终止并接管 |
 | `auto_update` | `true` | 启动时检查并安装 dsh 新版本（自带/影子运行时总是更新自己的树） |
 | `auto_update_plugins` | `false` | 是否把 profile 里的插件市场（`dshmarket`）也更新到 registry 上的最新版。默认关：它会改写你 profile 的 `package.json`/锁文件，而 profile 是用户数据 |
-| `update_tags` | `["latest"]` | 取其中最高版本。默认只跟正式版；想跟预发布再加 `"next"` |
+| `update_tags` | `["latest","alpha"]` | 取其中最高版本。默认跟**正式版 + alpha**：实测上游的 `alpha` 标签会领先 `latest`（2026-09-18 registry 上是 `latest=0.1.5-rc.2`、`alpha=0.1.6-alpha.2`），只读 `latest` 就永远看不到最新的构建。registry 上没有的标签只要还有一个匹配就不算失败（插件市场 `dshmarket` 就没有 `alpha`）。**想只跟正式版就写 `["latest"]`**；`require_tested_dsh` 仍然管住安装范围，区间外的 alpha 只报告不安装 |
 | `update_check_interval_minutes` | `60` | 一次成功的查询结果缓存多久（0 = 每次启动都查）。查询实测约 1.2–1.9 s，缓存命中 0 ms |
 | `import_shell_env` | `true` | 启动时导入登录 shell 的环境变量（见下节）。`false` 则只用 App 自身环境 |
 | `require_tested_dsh` | `true` | CLI 版本落在已测试区间外时是否拒绝启动。默认拒绝：本壳靠解析 CLI 的启动行工作，区间外可能以看不懂的方式失败。设 `false` 则只告警并继续（状态页标注「未测试版本」）。它同时约束**自动安装**：会被拒绝启动的版本也不会被装上 |
@@ -412,10 +414,11 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 ## dsh 核心升级
 
 0. **先看缓存**：`<app-data>/update-check.json` 里的结论在 `update_check_interval_minutes`（默认 60）内且已安装版本未变 → 直接沿用，不联网（实测 0 ms vs 1.2 s）。查询失败也会缓存，但只缓存 5 分钟，离线时不至于每次启动都干等；
-1. 需要联网时：`npm view @deepseek-ai/dsh dist-tags --json` → 在 `update_tags` 里取版本号最高者
+1. 需要联网时：`npm view @deepseek-ai/dsh dist-tags --json` → 在 `update_tags`（默认 `latest` + `alpha`）里取版本号最高者。
+   缓存条目记下**是哪组标签问出来的**：换过 `update_tags` 就等于换了一个问题，旧答案不再复用，默认值改动下次启动即生效而不是等一个缓存周期
    （fetch 超时压到 **8 s**，且整个 npm 子进程有**进程级超时** —— `--fetch-timeout` 只管单次请求，
    代理挂起、锁等待、生命周期脚本都可能让 npm 永远不返回；超时后连同其子进程一起清理）；
-2. 与已安装版本做 semver 比较（`rc.2 > rc.1 > alpha.2`，正式版高于同号预发布版），**从不降级**；
+2. 与已安装版本做 semver 比较（`0.1.6-alpha.2 > 0.1.5-rc.2`，因为先比数字段；同号时正式版高于预发布版，`rc.2 > rc.1 > alpha.2`），**从不降级**；
 3. **先装进暂存目录，不碰正在用的那棵树**：有新版则
    `npm install -g --no-fund --no-audit --cache <app-data>/runtime/npm-cache --prefix <app-data>/runtime/staging/staging-<版本>/prefix @deepseek-ai/dsh@<解析出的具体版本>`；
    npm 取自 node 同目录；`runtime/{prefix,tools,npm-cache,staging,rollback,profile-backup}` 在启动时幂等创建。

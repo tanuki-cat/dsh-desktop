@@ -74,6 +74,52 @@ fn picks_newest_among_dist_tags() {
     assert_eq!(newest_tagged(&filtered).unwrap().to_string(), "0.1.5-rc.2");
 }
 
+/// The reason `alpha` is consulted at all: upstream publishes ahead of `latest`, so a shell that
+/// only reads the release tag never sees the newest build. Measured 2026-09-18, the registry
+/// answered `{"latest":"0.1.5-rc.2","alpha":"0.1.6-alpha.2"}` — and `0.1.6-alpha.2` outranks
+/// `0.1.5-rc.2` under semver even though its prerelease identifier sorts below `rc`.
+#[test]
+fn the_alpha_tag_can_be_the_newest_version_on_the_registry() {
+    let tags = vec![
+        ("latest".to_string(), "0.1.5-rc.2".to_string()),
+        ("alpha".to_string(), "0.1.6-alpha.2".to_string()),
+    ];
+    // A patch release ahead of the release tag wins on the numeric segments alone.
+    assert_eq!(newest_tagged(&tags).unwrap().to_string(), "0.1.6-alpha.2");
+    // And it is an upgrade the shell would act on, not a downgrade.
+    assert_eq!(
+        judge("0.1.6-alpha.2", "0.1.5-rc.2"),
+        Status::UpdateAvailable {
+            from: "0.1.5-rc.2".into(),
+            to: "0.1.6-alpha.2".into()
+        }
+    );
+    // The alpha tag is not always ahead: when it is the older line, the release tag still wins.
+    let behind = vec![
+        ("latest".to_string(), "0.1.5-rc.2".to_string()),
+        ("alpha".to_string(), "0.1.5-alpha.2".to_string()),
+    ];
+    assert_eq!(newest_tagged(&behind).unwrap().to_string(), "0.1.5-rc.2");
+}
+
+/// One tag list serves both the CLI and the plugin market, so a tag the registry does not publish
+/// must not fail the check: `dshmarket` has no `alpha` tag at all.
+#[test]
+fn a_tag_the_registry_does_not_publish_is_ignored_while_another_matches() {
+    // `dshmarket` today: `{"beta":…,"dev":…,"latest":"1.47.0"}` — no `alpha`.
+    let market = vec![
+        ("beta".to_string(), "1.19.0-beta.4".to_string()),
+        ("latest".to_string(), "1.47.0".to_string()),
+    ];
+    let wanted = ["latest".to_string(), "alpha".to_string()];
+    let selected: Vec<(String, String)> = market
+        .into_iter()
+        .filter(|(name, _)| wanted.iter().any(|w| w == name))
+        .collect();
+    assert_eq!(selected.len(), 1, "only the published tag is selected");
+    assert_eq!(newest_tagged(&selected).unwrap().to_string(), "1.47.0");
+}
+
 #[test]
 fn rejects_malformed_versions() {
     assert!(Version::parse("not-a-version").is_none());
@@ -112,28 +158,96 @@ fn judge_reports_updates_and_up_to_date() {
     ));
 }
 
+/// The tags a cached answer was produced from, spelled out so the assertions below read as
+/// questions about a real configuration rather than about an opaque list.
+fn release_tags() -> Vec<String> {
+    vec!["latest".to_string()]
+}
+
+fn release_and_alpha_tags() -> Vec<String> {
+    vec!["latest".to_string(), "alpha".to_string()]
+}
+
 #[test]
-fn cache_freshness_follows_interval_and_installed_version() {
-    let entry = |latest: Option<&str>, installed: &str| Cache {
+fn cache_freshness_follows_interval_installed_version_and_tags() {
+    let entry = |latest: Option<&str>, installed: &str, tags: Vec<String>| Cache {
         checked_at: 1_000,
         installed: installed.to_string(),
         latest: latest.map(|text| text.to_string()),
+        tags,
         attempted: None,
         failed: None,
         failed_at: 0,
         failures: 0,
     };
-    // Inside the window, same installed version -> fresh.
-    assert!(entry(Some("0.1.5-rc.2"), "0.1.5-rc.1").is_fresh(1_000 + 59 * 60, "0.1.5-rc.1", 60));
+    let release = release_tags();
+    // Inside the window, same installed version, same question -> fresh.
+    assert!(
+        entry(Some("0.1.5-rc.2"), "0.1.5-rc.1", release.clone()).is_fresh(
+            1_000 + 59 * 60,
+            "0.1.5-rc.1",
+            &release,
+            60
+        )
+    );
     // Past the window -> stale.
-    assert!(!entry(Some("0.1.5-rc.2"), "0.1.5-rc.1").is_fresh(1_000 + 61 * 60, "0.1.5-rc.1", 60));
+    assert!(
+        !entry(Some("0.1.5-rc.2"), "0.1.5-rc.1", release.clone()).is_fresh(
+            1_000 + 61 * 60,
+            "0.1.5-rc.1",
+            &release,
+            60
+        )
+    );
     // Manual upgrade changed the installed version -> stale.
-    assert!(!entry(Some("0.1.5-rc.2"), "0.1.5-rc.1").is_fresh(1_000 + 60, "0.1.6", 60));
+    assert!(
+        !entry(Some("0.1.5-rc.2"), "0.1.5-rc.1", release.clone()).is_fresh(
+            1_000 + 60,
+            "0.1.6",
+            &release,
+            60
+        )
+    );
     // Interval 0 disables caching entirely.
-    assert!(!entry(Some("0.1.5-rc.2"), "0.1.5-rc.1").is_fresh(1_000, "0.1.5-rc.1", 0));
+    assert!(
+        !entry(Some("0.1.5-rc.2"), "0.1.5-rc.1", release.clone()).is_fresh(
+            1_000,
+            "0.1.5-rc.1",
+            &release,
+            0
+        )
+    );
     // A failed query is retried after the short window, not the full interval.
-    assert!(!entry(None, "0.1.5-rc.1").is_fresh(1_000 + 6 * 60, "0.1.5-rc.1", 360));
-    assert!(entry(None, "0.1.5-rc.1").is_fresh(1_000 + 4 * 60, "0.1.5-rc.1", 360));
+    assert!(!entry(None, "0.1.5-rc.1", release.clone()).is_fresh(
+        1_000 + 6 * 60,
+        "0.1.5-rc.1",
+        &release,
+        360
+    ));
+    assert!(entry(None, "0.1.5-rc.1", release.clone()).is_fresh(
+        1_000 + 4 * 60,
+        "0.1.5-rc.1",
+        &release,
+        360
+    ));
+    // A different set of tags is a different question: an answer built from `latest` alone says
+    // nothing about whether `alpha` has moved, so it must not be reused once the default grows.
+    assert!(
+        !entry(Some("0.1.5-rc.2"), "0.1.5-rc.1", release.clone()).is_fresh(
+            1_000 + 60,
+            "0.1.5-rc.1",
+            &release_and_alpha_tags(),
+            60
+        )
+    );
+    // An entry written before the field existed carries no tags, which reads as "some other
+    // question" — that is what makes a changed default take effect on the next launch.
+    let legacy: Cache = serde_json::from_str(
+        r#"{"checked_at":1000,"installed":"0.1.5-rc.1","latest":"0.1.5-rc.2"}"#,
+    )
+    .expect("a cache file from an older shell must still parse");
+    assert!(legacy.tags.is_empty());
+    assert!(!legacy.is_fresh(1_000 + 60, "0.1.5-rc.1", &release_and_alpha_tags(), 60));
 }
 
 #[test]
@@ -144,6 +258,7 @@ fn cache_round_trips_on_disk() {
         checked_at: 42,
         installed: "0.1.5-rc.1".into(),
         latest: Some("0.1.5-rc.2".into()),
+        tags: release_and_alpha_tags(),
         attempted: Some("0.1.5-rc.2".into()),
         failed: None,
         failed_at: 0,
@@ -179,6 +294,7 @@ fn carried_attempt_follows_the_registry_answer() {
         checked_at: 42,
         installed: "0.1.5-rc.1".into(),
         latest: latest.map(str::to_string),
+        tags: release_tags(),
         attempted: attempted.map(str::to_string),
         failed: None,
         failed_at: 0,
@@ -230,6 +346,7 @@ fn an_expired_window_does_not_reopen_an_ineffective_install() {
         checked_at: window_ago,
         installed: "0.1.5-rc.1".into(),
         latest: Some(latest.into()),
+        tags: release_tags(),
         attempted: Some("0.1.5-rc.2".into()),
         failed: None,
         failed_at: 0,
@@ -278,6 +395,7 @@ fn an_ineffective_install_is_not_retried_inside_the_window() {
             checked_at: now_secs(),
             installed: "0.1.5-rc.1".into(),
             latest: Some("0.1.5-rc.2".into()),
+            tags: tags.clone(),
             attempted: None,
             failed: None,
             failed_at: 0,
@@ -315,6 +433,7 @@ fn an_ineffective_install_is_not_retried_inside_the_window() {
             checked_at: now_secs(),
             installed: "0.1.5-rc.1".into(),
             latest: Some("0.1.5-rc.3".into()),
+            tags: tags.clone(),
             attempted: Some("0.1.5-rc.2".into()),
             failed: None,
             failed_at: 0,
@@ -343,6 +462,7 @@ fn a_failed_install_only_suppresses_its_short_window() {
         checked_at: now,
         installed: "1.45.1".into(),
         latest: Some("1.46.1".into()),
+        tags: tags.clone(),
         attempted: None,
         failed: Some("1.46.1".into()),
         failed_at,
@@ -388,6 +508,7 @@ fn a_failed_attempt_is_remembered_past_its_retry_window() {
         checked_at: at,
         installed: "1.45.1".into(),
         latest: Some("1.46.1".into()),
+        tags: release_tags(),
         attempted: None,
         failed: Some("1.46.1".into()),
         failed_at: at,
@@ -453,6 +574,7 @@ fn repeated_failures_of_one_version_back_off() {
         checked_at: now_secs(),
         installed: "0.1.5".into(),
         latest: Some("0.1.6".into()),
+        tags: release_tags(),
         attempted: None,
         failed: None,
         failed_at: 0,
@@ -523,6 +645,7 @@ fn the_plugin_check_keeps_its_own_cache_window() {
             checked_at: now_secs(),
             installed: "0.1.5-rc.1".into(),
             latest: Some("0.1.5-rc.2".into()),
+            tags: release_tags(),
             attempted: None,
             failed: None,
             failed_at: 0,
@@ -538,6 +661,7 @@ fn the_plugin_check_keeps_its_own_cache_window() {
             checked_at: now_secs(),
             installed: "1.45.1".into(),
             latest: Some("1.46.1".into()),
+            tags: release_tags(),
             attempted: None,
             failed: None,
             failed_at: 0,
@@ -608,6 +732,17 @@ fn a_version_that_would_not_be_run_is_not_installed() {
     // Inside the tested range: install normally.
     assert!(may_install("0.1.5-rc.2", true));
     assert!(may_install("0.1.9", true));
+    // The alpha line the shell now follows by default: 0.1.6-alpha.2 is inside
+    // [TESTED_MIN, TESTED_MAX_EXCLUSIVE), so following the tag does not trip the gate.
+    assert!(may_install("0.1.6-alpha.2", true));
+    // The gate is about the tested *range*, not about prerelease status — a prerelease of the
+    // boundary version sorts below it, so it is admitted, exactly like a release inside the range.
+    // Recorded rather than asserted as desirable: 0.2.0-alpha.1 previews the untested 0.2.0 line,
+    // and an exclusive upper bound does not exclude it.
+    assert!(may_install("0.2.0-alpha.1", true));
+    // Past the boundary either way, prerelease or not: refused.
+    assert!(!may_install("0.2.0", true));
+    assert!(!may_install("0.2.1-rc.1", true));
     // Past it: the startup check would refuse, so the install must not happen either.
     assert!(!may_install("0.2.0", true));
     assert!(!may_install("1.0.0", true));
