@@ -11,11 +11,33 @@ fn test_dir(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
 }
 
+/// `name` on this process's PATH, with the extensions Windows appends to a bare name.
+///
+/// A bare join finds nothing there: the toolchain installs `node.exe`, and `is_file()` does not
+/// consult `PATHEXT`, so every case needing node reported "node must be on PATH" instead of
+/// running (the library's own lookup learned this first).
 fn path_lookup(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join(name))
-        .find(|c| c.is_file())
+    std::env::split_paths(&paths).find_map(|dir| {
+        candidate_names(name)
+            .into_iter()
+            .map(|candidate| dir.join(candidate))
+            .find(|path| path.is_file())
+    })
+}
+
+/// The file names a bare program name may stand for, command extensions first.
+#[cfg(windows)]
+fn candidate_names(name: &str) -> Vec<String> {
+    [".exe", ".cmd", ".bat", ""]
+        .iter()
+        .map(|extension| format!("{name}{extension}"))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn candidate_names(name: &str) -> Vec<String> {
+    vec![name.to_string()]
 }
 
 /// Keep the live queries off the user npm cache: npm refuses to run when that cache is not
