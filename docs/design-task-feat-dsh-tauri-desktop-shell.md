@@ -1170,3 +1170,41 @@ stdout/stderr、登录 shell 的输出）此前都是"读多少留多少"，而�
   第三方 client 插件（`dsh-dream-skin`、`dsh-better-sidebar`）都在主 React 树里。壳这一侧只能减少误重载、
   提供手动重载，根治要走上游。
 
+### 13.20 「只提示不安装」的提示其实没人看得到（2026-09-18）
+
+**发现方式**：`update_tags` 纳入 `alpha` 之后（§13.4 第二条修正注），用户反馈"没有向我报告有可以更新的版本"。
+核查后确认：**检测到了、也"提示"了，但那条提示活不过启动**。
+
+**链路**（一次真实启动，2026-09-18 16:09:24–16:09:30）：
+
+1. 更新检查跑在 **Harness 窗口建好之前**（`start()` 里更新步骤早于 `create_harness`），命中的是
+   `system_updates: notify` 分支：`lib.rs` 调 `set_status("有新版本 v0.1.6-alpha.2（system_updates=notify，未自动更新）")`。
+2. 同一函数随后在启动 Harness 前又调 `set_status("正在启动 Harness…", …)` —— **覆盖**。
+3. `create_harness` 末尾 `splash.destroy()` —— **连窗口一起销毁**。
+
+壳里当时没有任何持久提示面，`notify` 实际上等于"写进用户不会看的日志"。该缺陷引入于 `e0079a1`（2026-09-13），
+但**直到 §13.4 的 alpha 改动才第一次显形**：改动前 `latest` 与已安装版本相同 → `UpToDate` → 根本不需要提示。
+
+**修法**：复用壳已有的"窗口知道页面说不出口的事"这个面 —— **Harness 窗口标题**。
+
+- 新增 `window::PENDING_UPDATE`（进程内状态）与 `announce_update` / `clear_update_notice`；
+- 新增纯函数 `compose_title(notice, not_drawing)` 统一合成标题：**停画优先**（页面不画是当下就看不见输出，
+  新版本只是下次启动可能更好）；两者共用一个槽位，因此看护恢复绘制时**重新合成**而不是重置为默认标题，
+  否则会抹掉更新提示；
+- `lib.rs` 在 `create_harness` 成功后 `announce_update`（此时窗口已存在且会活下去）；
+- 启动时清空：`pending_update_notice` 是 `start()` 的局部变量，而自动重启会在同一进程里再次进入 `start()`，
+  因此上一轮的提示不会残留。安装成功的分支用 `core_swapped`（而不是 `just_updated` —— 后者插件市场也会置位）清除。
+
+**为什么不是别的面**：状态页（splash）在 Harness 窗口起来后就销毁，要做常驻就得新做一个面；
+系统通知要引新依赖。标题是本壳已有的先例（§13.19 的停画提示就是这么做的），且经源码核对**页面无法覆盖它**：
+wry 只在注册了 `document_title_changed_handler` 时才转发 `document.title`，本壳没有注册。
+
+**验证**：单测 194 → **196**（标题合成的四种组合与"停画优先"、恢复绘制后保留提示、清空后不残留）。
+
+**同轮配置变更**：用户的 `config.json` 加了 `"system_updates": "install"`（该文件在工作区之外，
+由用户授权后修改）—— 那棵树是用户自己的全局安装，改为就地升级后不再走 notify 分支。
+
+**真机验证待做**：装上 0.1.6-alpha.2 后确认实例跑的是新版本；以及把 `system_updates` 临时改回 `notify` 时，
+Harness 窗口标题确实出现"有新版本 … 可用（未自动安装）"。
+
+

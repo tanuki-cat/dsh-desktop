@@ -1381,9 +1381,7 @@ pub fn create_harness(
                 load_signals.finished.store(true, Ordering::SeqCst);
                 // A load that finished is the proof the page is back: undo the "unresponsive"
                 // title a recovery put there, so the window never lies about its own state.
-                if !title_is_default(&window) {
-                    let _ = window.set_title(DEFAULT_TITLE);
-                }
+                set_title_if(&window, &compose_title(pending_notice().as_deref(), false));
             }
         })
         // Downloads land in the user's Downloads folder instead of vanishing.
@@ -1422,6 +1420,15 @@ pub fn create_harness(
     // touching anything: a rebuild bumps it, which is how an old thread learns that the label
     // now answers with somebody else window.
     let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+
+    // A notice belongs to the window that carried it. This is a new window, so it starts with
+    // nothing to say; the caller announces a still-current version immediately after this
+    // returns. Without the reset, a notice from a previous window would survive in the static
+    // and be resurrected by the next watchdog title write (an auto-restart re-enters the startup
+    // path in this same process).
+    *PENDING_UPDATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
     // A first navigation that never renders used to leave a blank window with nothing in the
     // log. The token URL is safe to revisit (measured: it is not single-use), so retry it.
@@ -1609,11 +1616,9 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64, wake: Receiver
                 misses = 0;
                 reloads = 0;
                 stuck = false;
-                // Only when this shell put a message there: the document owns the title
-                // otherwise, and overwriting it would fight whatever the page is reporting.
-                if !title_is_default(&window) {
-                    let _ = window.set_title(DEFAULT_TITLE);
-                }
+                // Recomposed rather than reset: a pending update notice is the other thing
+                // this title carries, and clearing the drawing message must not erase it.
+                set_title_if(&window, &compose_title(pending_notice().as_deref(), false));
             }
             // The task queue runs and only frames stopped, which is what WebKit does to a window
             // it believes nobody is watching. Reloading would throw away a working session to
@@ -1626,7 +1631,7 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64, wake: Receiver
                     harness::app_log(
                         "Harness 页面停止绘制：计时器仍在运行，说明是被 WebKit 暂停绘制（多为窗口失去焦点）而非卡死；点击或聚焦窗口即可恢复，不重新加载",
                     );
-                    set_title_if(&window, NOT_DRAWING_TITLE);
+                    set_title_if(&window, &compose_title(None, true));
                 }
                 stuck = true;
             }
@@ -1639,7 +1644,10 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64, wake: Receiver
                     harness::app_log(
                         "Harness 页面在窗口重新获得焦点后仍未恢复绘制，按未响应继续处理",
                     );
-                    set_title_if(&window, "DeepSeek Harness（页面仍未刷新，继续观察…）");
+                    set_title_if(
+                        &window,
+                        &format!("{DEFAULT_TITLE}（页面仍未刷新，继续观察…）"),
+                    );
                 } else if misses == 1 {
                     harness::app_log(match state {
                         PageState::Frozen(_) => "Harness 页面停止绘制（输入仍有响应），继续观察",
@@ -1658,7 +1666,10 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64, wake: Receiver
                         _ => "无响应",
                     }
                 ));
-                set_title_if(&window, "DeepSeek Harness（页面已停止刷新，等待输入结束…）");
+                set_title_if(
+                    &window,
+                    &format!("{DEFAULT_TITLE}（页面已停止刷新，等待输入结束…）"),
+                );
             }
             LivenessAction::Reload { attempt } => {
                 misses = 0;
@@ -1718,7 +1729,9 @@ pub fn reload_harness(app: &AppHandle) {
     };
     let target = current_url(&window);
     harness::app_log(&format!("手动重新加载界面：{target}"));
-    set_title(&window, DEFAULT_TITLE);
+    // Recomposed, not reset: reloading the page says nothing about whether a newer version is
+    // still out there, so a pending notice survives it.
+    set_title_if(&window, &compose_title(pending_notice().as_deref(), false));
     if let Err(error) = window.navigate(target) {
         harness::app_log(&format!("手动重新加载失败: {error}"));
     }
@@ -1733,6 +1746,82 @@ const DEFAULT_TITLE: &str = "DeepSeek Harness";
 /// what is missing from the screen — so the window frame is the only place the user can learn
 /// that the session is intact and one click away from coming back.
 const NOT_DRAWING_TITLE: &str = "DeepSeek Harness（已暂停绘制：聚焦窗口或重新加载界面即可恢复）";
+
+/// A newer CLI the registry has and this shell did not install, waiting to be told to the user.
+///
+/// The splash page cannot carry this: the update check runs before the Harness window is built,
+/// so the only place the sentence is ever drawn is a window that is destroyed seconds later (and
+/// whose status line is overwritten on the way there). A notice nobody can read is the same as no
+/// notice, which is how a user ends up never learning that a newer version exists at all
+/// (reported 2026-09-18).
+///
+/// The title is the surface this shell already uses for "the window knows something the page
+/// cannot say", and it outlives the splash, so the notice lives there until the version it names
+/// stops being the newest one — or until the user acts on it.
+static PENDING_UPDATE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Remember the version the user has not been told about yet, and say it in the title.
+///
+/// Called once the Harness window exists, so the message lands on a window that stays: the splash
+/// that drew the same sentence is destroyed moments after this point.
+pub fn announce_update(app: &AppHandle, to: &str) {
+    let text = format!("有新版本 v{to} 可用（未自动安装）");
+    {
+        let mut pending = PENDING_UPDATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *pending = Some(text.clone());
+    }
+    let Some(window) = app.get_webview_window(HARNESS) else {
+        return;
+    };
+    set_title_if(&window, &compose_title(Some(&text), false));
+}
+
+/// Forget the notice: the version it named is installed, so there is nothing left to tell.
+///
+/// The title is only rewritten when a notice was actually showing, so an ordinary launch does not
+/// touch a window whose title the shell is not responsible for.
+pub fn clear_update_notice(app: &AppHandle) {
+    let had = PENDING_UPDATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .is_some();
+    if !had {
+        return;
+    }
+    let Some(window) = app.get_webview_window(HARNESS) else {
+        return;
+    };
+    set_title_if(&window, &compose_title(None, false));
+}
+
+/// What the window title should read, given the two things the shell may have to say.
+///
+/// One slot, two messages, and the drawing problem wins: a page that is not painting hides the
+/// model's output *now*, while a newer version only means the next launch could be better. Both
+/// are the shell's own sentences — the page's `document.title` never reaches this window, because
+/// wry only forwards it when a handler is registered and this shell registers none — so
+/// composing them here cannot fight the document.
+fn compose_title(notice: Option<&str>, not_drawing: bool) -> String {
+    if not_drawing {
+        return NOT_DRAWING_TITLE.to_string();
+    }
+    match notice {
+        Some(text) => format!("{DEFAULT_TITLE}（{text}）"),
+        None => DEFAULT_TITLE.to_string(),
+    }
+}
+
+/// The notice currently held, if any. Read by the title paths so they re-compose rather than
+/// overwrite whatever the other one had to say.
+fn pending_notice() -> Option<String> {
+    PENDING_UPDATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
 
 /// Put a sentence in the window title, so a page that stopped answering is visible without the
 /// log. Best effort: a window that refuses the title is not a reason to stop watching it.
@@ -1756,14 +1845,6 @@ fn set_title_if(window: &WebviewWindow, title: &str) {
     if !unchanged {
         set_title(window, title);
     }
-}
-
-/// Whether the window is already showing the plain title (no recovery message to undo).
-fn title_is_default(window: &WebviewWindow) -> bool {
-    window
-        .title()
-        .map(|title| title == DEFAULT_TITLE)
-        .unwrap_or(true)
 }
 
 /// Why the watchdog stopped waiting.

@@ -937,3 +937,59 @@ fn a_watcher_stops_acting_once_its_window_was_rebuilt() {
     assert!(!may_act(8, 7));
     assert!(!may_act(0, 1));
 }
+
+/// One title, two messages, and the drawing problem wins.
+///
+/// A page that is not painting hides the model output *now*; a newer version only means the next
+/// launch could be better. Composing them in one place is also what keeps the two paths from
+/// overwriting each other: the watchdog recomposes when it recovers, which must not erase a
+/// notice the update check left behind (reported 2026-09-18 — the notice used to live only on a
+/// splash window that was destroyed seconds later).
+#[test]
+fn the_title_carries_the_update_notice_without_losing_the_drawing_message() {
+    let notice = "有新版本 v0.1.6-alpha.2 可用（未自动安装）";
+    // The ordinary case: nothing to say.
+    assert_eq!(compose_title(None, false), "DeepSeek Harness");
+    // A notice, with the plain title as its prefix so the window is still identifiable.
+    assert_eq!(
+        compose_title(Some(notice), false),
+        format!("DeepSeek Harness（{notice}）")
+    );
+    // Not drawing outranks the notice, and says so instead of merging the two sentences.
+    assert_eq!(compose_title(None, true), NOT_DRAWING_TITLE);
+    assert_eq!(compose_title(Some(notice), true), NOT_DRAWING_TITLE);
+    // Recovering from a stopped page keeps a pending notice rather than resetting to the plain
+    // title — that is the composition the watchdog Alive arm performs.
+    assert_eq!(
+        compose_title(Some(notice), false),
+        format!("DeepSeek Harness（{notice}）")
+    );
+}
+
+/// The notice is process-wide state, so a launch that finds nothing to report must not inherit
+/// the previous one's. An auto-restart re-enters `start()` in the same process.
+#[test]
+fn a_cleared_notice_stays_cleared() {
+    let seed = "有新版本 v9.9.9 可用（未自动安装）".to_string();
+    {
+        let mut pending = PENDING_UPDATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *pending = Some(seed);
+    }
+    assert!(pending_notice().is_some());
+    assert!(compose_title(pending_notice().as_deref(), false).contains("v9.9.9"));
+    // `clear_update_notice` needs a real window to retitle, so the state is cleared here exactly
+    // as it does; the assertion is about the state, which is what the next launch reads.
+    {
+        let mut pending = PENDING_UPDATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *pending = None;
+    }
+    assert_eq!(pending_notice(), None);
+    assert_eq!(
+        compose_title(pending_notice().as_deref(), false),
+        "DeepSeek Harness"
+    );
+}

@@ -252,7 +252,8 @@ src-tauri/src/harness.rs        -> src-tauri/src/harness/tests.rs
 - 自带时：首启播种 profile 模板（含插件市场）、PATH 前置自带工具目录、注入 `npm_config_prefix`／
   `PNPM_HOME` 指向可写前缀；核心更新只落到 `app-data/runtime/prefix`；
 - 用系统安装时：**默认只提示不升级**（`system_updates: notify`）—— 那棵树是用户自己装的，
-  `npm install -g` 会改动机器上别的工具也在用的全局前缀；想让壳就地升级就写 `system_updates: install`；
+  `npm install -g` 会改动机器上别的工具也在用的全局前缀；想让壳就地升级就写 `system_updates: install`。
+  提示写在 **Harness 窗口标题**上（见行为表），不是只写日志；
 - **node 与 dsh 分开解析**：系统装了 node 但没装 dsh 时，可以「系统 node + 自带 dsh」混用（方案 §2.4 的那一格以前不可达）；
 - **只有本壳自己的树才算「自带」**：seed（包内）与影子前缀（`app-data/runtime/prefix`）会得到 PATH 前置、
   `npm_config_prefix`／`PNPM_HOME` 注入与首启播种；`DSH_DESKTOP_DSH`／`DSH_DESKTOP_RUNTIME` 指向的树按**用户的**处理 ——
@@ -374,6 +375,7 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | 端口上是**别人**启动的 Harness（CLI / Automator） | 先做两道身份校验（401 特征 + 该 PID 命令行像 `dsh web`，`plugin` 子命令不算）；都通过就**弹面板询问**（与 `take_over_existing` 无关，那一项只决定 120 秒无答复时怎么办）：**接管**（对该 PID 发 SIGTERM，只发单进程不碰它的进程组 → 等端口释放 → 自启拿新 token）／**保留并用系统浏览器打开**（本应用退出，页面**不带**重启按钮）／**保留并换端口**（本应用改用配置端口之上的第一个空闲端口启动，对方不受影响；仅当找到空闲端口时出现）／**什么都不做退出**。面板写明对方 pid、完整命令行、端口，以及**接管后会改用本应用配置的 workspace**（不会继续对方的工作目录）；并说明**浏览器里那个旧标签页不用手动关**（刷新就会连到重启后的实例 —— cookie 的签名密钥对同一 `dsh_home` 稳定，实测接管后旧 cookie 仍返回 200），唯一的例外是那个实例用了另一个 `dsh_home`，此时会看到 `authentication required`，需在启动它的终端里重新打开它打印的 URL |
 | 启动前发现新版 dsh | 先升级 CLI（splash 显示进度），随后重启实例跑新版本。用户自己装的那棵树默认**只提示不升级**（`system_updates: notify`）；新版本若超出已测试区间，在 `require_tested_dsh` 默认开启时**不安装**（装了也会被拒绝启动） |
 | 启动前发现新版插件市场 | 先停实例 → `dsh plugin --profile web add dshmarket@<版本>` → 重启实例。默认**不做**（`auto_update_plugins: false`），设为 `true` 才开启 |
+| 有新版本但本次不安装 | 写进 **Harness 窗口标题**：`DeepSeek Harness（有新版本 vX.Y.Z 可用（未自动安装））`。**只有标题能承载它**：更新检查跑在 Harness 窗口建好之前，splash 上那句话几秒后既被"正在启动 Harness…"覆盖、又随 splash 一起销毁，用户等于永远看不到（2026-09-18 实测）。标题与停画提示共用一个槽位，**停画优先**（页面不画是当下就看不到输出，新版本只是下次启动可能更好）；页面恢复绘制后重新合成，不会抹掉更新提示 |
 | WebView 缺可补的 API（如 `Iterator`） | 向 harness 窗口注入兼容层（ES5、逐块自守卫、只装缺的那些）后照常开原生窗口，日志记 `WebView 缺少 …：已注入兼容层`；`webkit_compat: false` 时改成"未注入"并走浏览器 |
 | WebView 缺补不了的能力（目前只有 `class static block` 语法） | 不打开 harness 窗口：改用默认浏览器 + 状态窗口写明缺什么、界面需要 Safari 16.4 及以上 |
 | 端口被别的程序占用（不是 Harness 协议） | 错误页，提示改 `config.json` 的端口。**普通 HTTP 服务（含返回 200 的 Vite/Node/Java）走这一条**：401 认证栅栏是唯一的 Harness 判据 |

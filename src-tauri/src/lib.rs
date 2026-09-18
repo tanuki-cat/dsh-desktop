@@ -1549,6 +1549,23 @@ fn startup(app: AppHandle) {
     }
 }
 
+/// Say on the Harness window what the splash could only say for a few seconds.
+///
+/// The update check runs before that window exists, so the sentence it draws lands on a splash
+/// that is overwritten and destroyed moments later — a notice nobody can read. Called wherever the
+/// Harness window becomes ready: the reuse branch returns early, and reusing an instance says
+/// nothing about whether a newer version exists.
+fn announce_pending_update(app: &AppHandle, pending: Option<&str>, core_swapped: bool) {
+    match pending {
+        Some(to) => window::announce_update(app, to),
+        // A core swap installed the version a previous notice would have named. `just_updated` is
+        // not the test for that: the plugin-market step sets it too, for a version that has
+        // nothing to do with the CLI.
+        None if core_swapped => window::clear_update_notice(app),
+        None => {}
+    }
+}
+
 fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
     harness::init_app_log(&data_dir.join("logs").join("harness.log"));
 
@@ -1745,6 +1762,12 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
         ));
     }
     let mut just_updated = false;
+    // A version worth telling the user about that this launch will not install. Announced on the
+    // Harness window once it exists: the splash that shows it now does not outlive startup.
+    //
+    // An auto-restart runs this function again in the same process, so the notice starts empty
+    // each time and is dropped with the window the previous run announced it on.
+    let mut pending_update_notice: Option<String> = None;
     // Held until the moment the new tree is actually booted: everything between here and the
     // spawn can still decide not to start a Harness at all (a busy port, a foreign instance,
     // a rejected version), and a swap made for a launch that never happens is a rollback the
@@ -1753,6 +1776,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
     // Separate from `just_updated`: the plugin step sets that one too, and only a core swap
     // has a rollback record to confirm or undo.
     let mut core_swapped = false;
+
     if config.auto_update && may_update {
         match update::npm_for(&resolved.node) {
             None => harness::app_log("找不到 npm，跳过更新检查"),
@@ -1813,6 +1837,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
                                 &format!("有新版本 v{to}（system_updates=notify，未自动更新）"),
                                 &format!("v{from} -> v{to}"),
                             );
+                            // The splash above is destroyed moments from now, so the notice is
+                            // carried on the Harness window instead (see PENDING_UPDATE).
+                            pending_update_notice = Some(to.clone());
                         } else if !update::may_install(&to, config.require_tested_dsh) {
                             // Installing a version the startup check below would refuse to boot
                             // leaves the user with a CLI this shell just wrote and will not run,
@@ -1826,6 +1853,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
                                 &format!("有新版本 v{to}（超出已测试区间，未自动安装）"),
                                 &format!("v{from} -> v{to}；如需使用请在 config.json 里设置 \"require_tested_dsh\": false"),
                             );
+                            pending_update_notice = Some(to.clone());
                         } else {
                             harness::app_log(&format!(
                                 "update available: {from} -> {to}, installing"
@@ -2051,6 +2079,12 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
                         let compat = harness_compat(&config);
                         window::create_harness(app, &url, port, compat.as_deref())
                             .map_err(|e| e.to_string())?;
+                        // This branch returns without reaching the announcement below.
+                        announce_pending_update(
+                            app,
+                            pending_update_notice.as_deref(),
+                            core_swapped,
+                        );
                         // There is no `Child` for a reused instance, so liveness is polled:
                         // without it the window would stay on a page that can never connect
                         // again, which is exactly what the automatic recovery exists to avoid.
@@ -2376,6 +2410,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
     if let Err(error) = window::create_harness(app, &url, actual_port, compat.as_deref()) {
         return abort_start(pid, error.to_string());
     }
+    announce_pending_update(app, pending_update_notice.as_deref(), core_swapped);
 
     // The CLI outlives this function, so hand the child to a watchdog: an unexpected exit
     // must be visible rather than leaving the window on a dead page.
