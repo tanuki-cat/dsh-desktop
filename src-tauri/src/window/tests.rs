@@ -583,22 +583,45 @@ fn a_page_someone_is_typing_in_is_not_reloaded_yet() {
 
 /// The activity probe decides whether a reload would cost the user work, so its reading of
 /// the page's answer is the difference between a lost prompt and a recovered window.
+///
+/// The answers here are built from [`ACTIVITY_PROBE`] itself rather than written by hand. That is
+/// not pedantry: this test used to pass literal JSON, so it agreed with a probe that put a
+/// *double-encoded string* on the wire and never once parsed in production — "someone is typing"
+/// was always false, and the protection it exists for was dead code (found 2026-09-18).
 #[test]
 fn activity_is_read_as_busy_only_when_someone_is_working() {
+    let answer = |editing: bool, idle: u64| {
+        // What WebKit hands the callback: the JSON of the value the probe evaluated to.
+        format!("{{\"editing\":{editing},\"idle\":{idle}}}")
+    };
+    // The probe must not serialise its own answer; a returned string arrives double-encoded.
+    assert!(
+        !ACTIVITY_PROBE.contains("JSON.stringify"),
+        "活动探测不能自己序列化：返回值会被 WebKit 再序列化一次：{ACTIVITY_PROBE}"
+    );
+    // Every key the parser reads is a key the probe emits, spelled the same way.
+    for key in ["editing", "idle"] {
+        assert!(
+            ACTIVITY_PROBE.contains(key),
+            "探测缺少 {key}：{ACTIVITY_PROBE}"
+        );
+    }
     // Typing in a field: busy, however long the pause between keystrokes.
-    assert!(page_is_busy(Some(r#"{"editing":true,"idle":900000}"#)));
+    assert!(page_is_busy(Some(&answer(true, 900_000))));
     // Not focused, but typed in within the last interval.
-    assert!(page_is_busy(Some(r#"{"editing":false,"idle":100}"#)));
+    assert!(page_is_busy(Some(&answer(false, 100))));
     // Focused elsewhere, idle for minutes: nothing to lose.
-    assert!(!page_is_busy(Some(r#"{"editing":false,"idle":900000}"#)));
+    assert!(!page_is_busy(Some(&answer(false, 900_000))));
     // Never typed since the page loaded.
-    assert!(!page_is_busy(Some(
-        r#"{"editing":false,"idle":1000000000}"#
-    )));
+    assert!(!page_is_busy(Some(&answer(false, 1_000_000_000))));
     // A page that cannot answer is gone, not busy: waiting would only delay recovery.
     assert!(!page_is_busy(None));
     assert!(!page_is_busy(Some("not json")));
     assert!(!page_is_busy(Some("")));
+    // The regression itself: a self-serialising probe produces this, and it must never read as
+    // "busy" by accident — the answer is a string, so the parse has to fail.
+    let double_encoded = serde_json::to_string(&answer(true, 100)).unwrap();
+    assert!(!page_is_busy(Some(&double_encoded)));
 }
 
 /// A counter report as the page sends it.
@@ -710,8 +733,19 @@ fn the_frame_probe_is_es5_and_schedules_at_most_one_callback_of_each_kind() {
         FRAME_PROBE.contains("timersSeen: w.__dshTimerSeen === true"),
         "{FRAME_PROBE}"
     );
-    // The report has to be JSON, because the Rust side parses it as one struct.
-    assert!(FRAME_PROBE.contains("JSON.stringify"), "{FRAME_PROBE}");
+    // The report is the object itself, never `JSON.stringify(...)` of one: WebKit hands the shell
+    // the JSON of the value the script evaluates to, so a returned *string* arrives double-encoded
+    // and every answer fails to parse — which the watchdog reads as a dead renderer and reloads
+    // for. Asserting the probe contained "frames:" instead of checking the wire format is what let
+    // that ship once (2026-09-18); the round-trip test below is the real guard.
+    assert!(
+        !FRAME_PROBE.contains("JSON.stringify"),
+        "探测不能自己序列化：返回值会被 WebKit 再序列化一次，变成双重编码：{FRAME_PROBE}"
+    );
+    assert!(
+        FRAME_PROBE.contains("return {") && FRAME_PROBE.trim_end().ends_with("})()"),
+        "探测必须直接返回对象字面量：{FRAME_PROBE}"
+    );
     // The watchdog has to outlast a slow but healthy page, and give up before a user would.
     assert!(LIVENESS_TIMEOUT < LIVENESS_INTERVAL);
     // The budgets are compile-time facts (clippy refuses asserting on constants), so the
@@ -721,15 +755,47 @@ fn the_frame_probe_is_es5_and_schedules_at_most_one_callback_of_each_kind() {
 
 /// The probe and the parser are two halves of one wire format, and a rename on either side would
 /// turn every answer into "silence" — which the watchdog reads as a dead renderer and reloads for.
+/// The JSON WebKit would hand the callback for a probe that evaluates to an object literal.
+///
+/// WebKit serialises the *value* the script evaluated to, so the wire format is derived from the
+/// probe's own return statement rather than from a sample written by hand: a rename in the probe
+/// has to fail this test, because a rename is exactly the mistake that turns every answer into
+/// "silence" and makes the watchdog reload a page that was fine.
+fn webkit_wire_json(probe: &str) -> String {
+    let body = probe
+        .split_once("return {")
+        .expect("the probe must return an object literal")
+        .1;
+    let body = body
+        .split_once("};")
+        .expect("the returned object literal must be terminated")
+        .0;
+    let mut fields = Vec::new();
+    for line in body.lines() {
+        let line = line.trim().trim_end_matches(',');
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        // `timersSeen` is a comparison, so it arrives as a boolean; the counters are numbers.
+        let rendered = if value.contains("===") { "true" } else { "12" };
+        fields.push(format!("\"{}\":{}", key.trim(), rendered));
+    }
+    assert!(!fields.is_empty(), "the probe returned no fields: {probe}");
+    format!("{{{}}}", fields.join(","))
+}
+
 #[test]
 fn the_probe_reports_exactly_the_fields_the_shell_parses() {
-    let sample = r#"{"frames":12,"timers":7,"timersSeen":true}"#;
-    let parsed: Frames = serde_json::from_str(sample).expect("the probe's own shape must parse");
+    // What WebKit hands the callback: the JSON of the value the script evaluated to. Modelling it
+    // from the *probe's own source* is the point — a hand-written sample cannot catch the probe
+    // changing shape.
+    let wire = webkit_wire_json(FRAME_PROBE);
+    let parsed: Frames = serde_json::from_str(&wire).expect("the probe's own shape must parse");
     assert_eq!(
         parsed,
         Frames {
             frames: 12,
-            timers: 7,
+            timers: 12,
             timers_seen: true
         }
     );
@@ -741,6 +807,15 @@ fn the_probe_reports_exactly_the_fields_the_shell_parses() {
     // parsing it as a default would look like a page that never drew a frame.
     assert!(serde_json::from_str::<Frames>("12").is_err());
     assert!(serde_json::from_str::<Frames>("not json").is_err());
+    // A double-encoded answer — the shape a self-serialising probe produces — is silence too.
+    // This is the exact regression that shipped on 2026-09-18: the probe returned
+    // `JSON.stringify({...})`, WebKit serialised that string, and every probe read as a dead
+    // renderer until the reload budget ran out.
+    let double_encoded = serde_json::to_string(&wire).unwrap();
+    assert!(
+        serde_json::from_str::<Frames>(&double_encoded).is_err(),
+        "双重编码必须被拒绝，否则这个 bug 会静默通过"
+    );
 }
 
 #[test]

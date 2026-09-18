@@ -1182,6 +1182,11 @@ fn judge_frames(answer: Option<Frames>, previous: Option<Frames>) -> PageState {
 /// resumes. The two counters are what tell a suspended window (timers run, frames do not) apart
 /// from a busy or dead one (neither runs); `timersSeen` records that this engine could count at
 /// all, because an engine without `setTimeout` would otherwise look busy for ever.
+///
+/// It returns an **object**, not `JSON.stringify(...)` of one. WebKit hands the shell the JSON of
+/// whatever the script evaluates to, so a returned string arrives double-encoded and every answer
+/// fails to parse — which the watchdog reads as a dead renderer and reloads for. That mistake
+/// shipped once (2026-09-18) and cost three reloads before giving up on a page that was fine.
 const FRAME_PROBE: &str = r#"
 (function () {
   var w = window;
@@ -1209,11 +1214,11 @@ const FRAME_PROBE: &str = r#"
     };
     w.setTimeout(bump, 0);
   }
-  return JSON.stringify({
+  return {
     frames: w.__dshFrames,
     timers: w.__dshTimers,
     timersSeen: w.__dshTimerSeen === true
-  });
+  };
 })()
 "#;
 
@@ -1259,11 +1264,19 @@ const ACTIVITY_PROBE: &str = r#"
     editing = tag === "input" || tag === "textarea" || active.isContentEditable === true;
   }
   var idle = w.__dshLastInput === 0 ? 1e9 : Date.now() - w.__dshLastInput;
-  return JSON.stringify({ editing: editing, idle: idle });
+  // The object itself, never a stringified copy of one: WebKit serialises the value the script
+  // evaluates to, so a returned string arrives double-encoded and never parses. That mistake sat
+  // here undetected — its tests fed `page_is_busy` hand-written JSON, so "someone is typing" was
+  // never once true and the reload protection it exists for was dead code (found 2026-09-18 while
+  // fixing the same mistake in the frame probe).
+  return { editing: editing, idle: idle };
 })()
 "#;
 
 /// What the activity probe reported.
+///
+/// Both field names are single words, so unlike [`Frames`] there is no case mapping to get wrong
+/// here; the wire format is pinned by the probe's own test instead.
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 struct Activity {
     /// The focused element takes typed text.
