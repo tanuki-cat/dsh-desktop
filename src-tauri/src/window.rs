@@ -1043,6 +1043,133 @@ const LIVENESS_MISSES: u32 = 3;
 /// Reloads allowed before the shell stops trying and says so.
 const LIVENESS_RELOADS: u32 = 3;
 
+/// Extra intervals a page someone is typing in may hold the reload off for.
+///
+/// Bounded on purpose. The grace exists so a reload does not throw away a half-typed prompt, but
+/// an unbounded one is not a delay, it is a veto: the page has stopped drawing, so the user
+/// cannot see what they are typing either, and the only way out of that window was to quit the
+/// app. Two intervals is long enough to finish a sentence and short enough that a page nobody
+/// can read still recovers on its own.
+const LIVENESS_BUSY_GRACE: u32 = 2;
+
+/// How long a page may wait for an animation frame before the fallback stands in for one.
+///
+/// WebKit stops scheduling frames for a window it considers not visible — an occluded window, a
+/// minimised one, a hidden app — while timers keep running (measured 2026-09-18 on macOS 27:
+/// `document.visibilityState` flips to `hidden` at the same instant the frame counter freezes,
+/// while a visible-but-unfocused window keeps drawing). The Harness UI coalesces every streamed
+/// update onto a frame, so that state is exactly the reported "render stall": the session keeps
+/// producing while the screen stops updating.
+///
+/// 250 ms is the measured floor that keeps a streamed reply visually current (about 4 fps), and
+/// it is only ever spent while the page reports itself hidden.
+const RENDER_FALLBACK_MS: u64 = 250;
+
+/// Stand-in animation frames for a page WebKit has stopped drawing.
+///
+/// This wraps `requestAnimationFrame` rather than replacing it: a native frame that arrives in
+/// time always wins, and the fallback fires only while the page reports itself `hidden` and no
+/// frame has come. On a visible page the wrapper adds no timer at all.
+///
+/// Three details are load-bearing and were measured, not guessed:
+///
+/// - The stamp is `performance.now()`, with `Date.now()` only as a fallback. Page animations
+///   interpolate against the stamp they are handed, and epoch milliseconds would send them to
+///   nonsense values.
+/// - The `settled` latch covers both paths. Clearing the timer alone is not enough: a native
+///   frame can still land after the fallback fired, and delivering the callback twice runs a
+///   component effect cleanup and its animation an extra time.
+/// - Every in-flight request is held, not just the ones made while hidden, and
+///   `visibilitychange` arms the rest. The frame queued a moment *before* the window was covered
+///   is the common case — the user switches conversation and then looks at their editor — and
+///   the first version of this shim, which only looked at `visibilityState` at request time,
+///   left exactly that frame with no fallback at all. The page's flush is a chain of frames, so
+///   one missing link stops the whole stream (measured 2026-09-18: 60 s hidden, zero links).
+///
+/// The unwrapped scheduler stays reachable as `__dshNativeRaf`, because [`FRAME_PROBE`] has to
+/// count frames this wrapper cannot supply: a probe driven through the wrapper is bumped by the
+/// fallback itself and reports a healthy page while the screen is frozen.
+///
+/// ES5 on purpose, like the probes: this runs on the engines the compat layer exists for.
+const RENDER_FALLBACK_SCRIPT: &str = r#"
+(function () {
+  var w = window;
+  if (typeof w.requestAnimationFrame !== "function") return;
+  if (w.__dshRafFallback === true) return;
+  w.__dshRafFallback = true;
+  var nativeRaf = w.requestAnimationFrame;
+  var nativeCancel = w.cancelAnimationFrame;
+  w.__dshNativeRaf = nativeRaf;
+  w.__dshNativeCancel = nativeCancel;
+  w.__dshFallbackFrames = 0;
+  var clock = (w.performance && typeof w.performance.now === "function")
+    ? function () { return w.performance.now(); }
+    : function () { return Date.now(); };
+  var canTime = typeof w.setTimeout === "function";
+  var pending = {};
+  var covered = function () {
+    return !!w.document && w.document.visibilityState === "hidden";
+  };
+  var arm = function (request) {
+    if (!canTime || request.settled || request.timer !== undefined) return;
+    request.timer = w.setTimeout(function () {
+      if (request.settled) return;
+      request.settled = true;
+      delete pending[request.id];
+      w.__dshFallbackFrames += 1;
+      if (typeof nativeCancel === "function") nativeCancel.call(w, request.id);
+      request.callback(clock());
+    }, %FALLBACK_MS%);
+  };
+  var disarm = function (request) {
+    if (request.timer === undefined) return;
+    w.clearTimeout(request.timer);
+    request.timer = undefined;
+  };
+  w.requestAnimationFrame = function (callback) {
+    var request = { id: 0, settled: false, timer: undefined, callback: callback };
+    var id = nativeRaf.call(w, function (stamp) {
+      if (request.settled) return;
+      request.settled = true;
+      disarm(request);
+      delete pending[request.id];
+      callback(stamp);
+    });
+    request.id = id;
+    pending[id] = request;
+    if (covered()) arm(request);
+    return id;
+  };
+  w.cancelAnimationFrame = function (id) {
+    var request = pending[id];
+    if (request !== undefined) {
+      request.settled = true;
+      disarm(request);
+      delete pending[id];
+    }
+    if (typeof nativeCancel === "function") nativeCancel.call(w, id);
+  };
+  if (w.document && typeof w.document.addEventListener === "function") {
+    w.document.addEventListener("visibilitychange", function () {
+      var hide = covered();
+      for (var id in pending) {
+        if (!Object.prototype.hasOwnProperty.call(pending, id)) continue;
+        if (hide) arm(pending[id]);
+        else disarm(pending[id]);
+      }
+    }, false);
+  }
+})()
+"#;
+
+/// The fallback with its interval substituted in.
+///
+/// The script stays a constant so the tests can read it, and the interval stays a constant so
+/// the number appears in exactly one place.
+pub fn render_fallback_script() -> String {
+    RENDER_FALLBACK_SCRIPT.replace("%FALLBACK_MS%", &RENDER_FALLBACK_MS.to_string())
+}
+
 /// How the page is scheduled, told apart by the timer heartbeat the probe carries.
 ///
 /// A frozen page has two very different causes and they need opposite responses, so the shell
@@ -1110,10 +1237,12 @@ enum LivenessAction {
 /// explained by that, so it joins the streak that earns a reload — otherwise a scheduler that
 /// never resumes would sit there for ever with a title telling the user to click it.
 ///
-/// `busy` is whether the page reports recent typing: a reload would discard an unsent prompt, so
-/// a page someone is working in gets another interval first. It delays the reload rather than
-/// cancelling it, and never spends or restores the budget. `misses` is the frozen streak, kept
-/// across focus changes so the budget restarts from the wake rather than from every flick of focus.
+/// `busy` is whether the page reports someone typing in it right now: a reload would discard an
+/// unsent prompt, so a page someone is working in gets [`LIVENESS_BUSY_GRACE`] more intervals
+/// first. It delays the reload rather than cancelling it — the grace has an end, because a page
+/// that has stopped drawing is one the typist cannot read either. `misses` is the frozen streak,
+/// kept across focus changes so the budget restarts from the wake rather than from every flick
+/// of focus.
 fn liveness_action(
     state: PageState,
     attended: bool,
@@ -1131,7 +1260,7 @@ fn liveness_action(
             if misses < LIVENESS_MISSES {
                 return LivenessAction::Wait { misses };
             }
-            if busy {
+            if busy && misses < LIVENESS_MISSES + LIVENESS_BUSY_GRACE {
                 return LivenessAction::Busy { misses };
             }
             let attempt = reloads.saturating_add(1);
@@ -1183,6 +1312,16 @@ fn judge_frames(answer: Option<Frames>, previous: Option<Frames>) -> PageState {
 /// from a busy or dead one (neither runs); `timersSeen` records that this engine could count at
 /// all, because an engine without `setTimeout` would otherwise look busy for ever.
 ///
+/// It counts through `__dshNativeRaf` — the unwrapped scheduler [`RENDER_FALLBACK_SCRIPT`] keeps
+/// for exactly this — and not through `window.requestAnimationFrame`, which that shim replaces.
+/// A counter driven through the wrapper is bumped by the shim's own timer, so it keeps rising on
+/// a window WebKit has not painted for minutes and the watchdog reports a healthy page while the
+/// user looks at a frozen one. That is what shipped in the first version of the shim, and it made
+/// the whole liveness check blind (found by replaying both scripts together, 2026-09-18).
+///
+/// `fallbacks` is how many frames the shim has stood in for, so the log can tell "the engine is
+/// drawing" apart from "the shim is carrying it".
+///
 /// It returns an **object**, not `JSON.stringify(...)` of one. WebKit hands the shell the JSON of
 /// whatever the script evaluates to, so a returned string arrives double-encoded and every answer
 /// fails to parse — which the watchdog reads as a dead renderer and reloads for. That mistake
@@ -1199,9 +1338,13 @@ const FRAME_PROBE: &str = r#"
     w.__dshTimerPending = false;
     w.__dshTimerSeen = typeof w.setTimeout === "function";
   }
-  if (!w.__dshFramePending && typeof w.requestAnimationFrame === "function") {
+  if (typeof w.__dshFallbackFrames !== "number") {
+    w.__dshFallbackFrames = 0;
+  }
+  var raf = typeof w.__dshNativeRaf === "function" ? w.__dshNativeRaf : w.requestAnimationFrame;
+  if (!w.__dshFramePending && typeof raf === "function") {
     w.__dshFramePending = true;
-    w.requestAnimationFrame(function () {
+    raf.call(w, function () {
       w.__dshFrames += 1;
       w.__dshFramePending = false;
     });
@@ -1217,7 +1360,9 @@ const FRAME_PROBE: &str = r#"
   return {
     frames: w.__dshFrames,
     timers: w.__dshTimers,
-    timersSeen: w.__dshTimerSeen === true
+    timersSeen: w.__dshTimerSeen === true,
+    hidden: w.document ? w.document.visibilityState === "hidden" : false,
+    fallbacks: w.__dshFallbackFrames
   };
 })()
 "#;
@@ -1238,6 +1383,25 @@ struct Frames {
     /// Whether this engine could count timers at all.
     #[serde(default)]
     timers_seen: bool,
+    /// Whether the page says it is not being drawn to at all.
+    ///
+    /// This is the first-hand evidence for "WebKit is not painting this window": measured
+    /// 2026-09-18, `document.visibilityState` flips to `hidden` on an occluded window at the same
+    /// instant the frame counter freezes, while a visible-but-unfocused window keeps drawing. The
+    /// window-level check in [`attended`] answers a different question and gets both cases wrong.
+    ///
+    /// `false` when the page could not say (an engine without `document.visibilityState`), which
+    /// keeps the older window-level behaviour rather than inventing a verdict.
+    #[serde(default)]
+    hidden: bool,
+    /// Frames the render fallback has stood in for since this document loaded.
+    ///
+    /// Only ever read as a difference between two probes, and only to say which of the two
+    /// explanations a still-running page has: the engine is drawing it, or the shim is. `0` when
+    /// the fallback is switched off, which is also the reading that says "nothing is carrying
+    /// this page".
+    #[serde(default)]
+    fallbacks: u64,
 }
 
 /// Ask the page whether someone is working in it right now.
@@ -1289,13 +1453,21 @@ struct Activity {
 
 /// Whether the page says someone is working in it right now.
 ///
+/// Both halves are required. `editing` on its own is not evidence of anything: the Harness gives
+/// its message box the caret on load and nothing takes it away, so a page where nobody has
+/// touched the keyboard for an hour still reports it — and a reload protection that is always on
+/// is a reload protection that never ends (this half was dead code until the probe's
+/// double-encoding was fixed on 2026-09-18, which is why it had never been seen to misfire).
+/// `idle` on its own would count a click in the conversation list, where a reload costs nothing.
+/// Together they mean what the grace is for: a caret in a text box that was typed into just now.
+///
 /// A page that cannot answer is not busy: it is gone, and waiting for it would only delay the
 /// recovery. The idle window is one probe interval, so "typed since the last check" counts.
 fn page_is_busy(answer: Option<&str>) -> bool {
     let Some(activity) = answer.and_then(|raw| serde_json::from_str::<Activity>(raw).ok()) else {
         return false;
     };
-    activity.editing || activity.idle < LIVENESS_INTERVAL.as_millis() as u64
+    activity.editing && activity.idle < LIVENESS_INTERVAL.as_millis() as u64
 }
 
 /// Ask the page whether it is being used, with the same bounded wait as the frame probe.
@@ -1326,14 +1498,15 @@ struct LoadSignals {
 /// The Harness page is remote content: it gets no capability, and navigation is fenced
 /// to the current loopback authority. Everything else opens in the system browser.
 ///
-/// `compat` is the legacy-WebKit shim from [`needed_compat_script`], when this engine needs it.
-/// It is injected by the shell into the webview rather than by the page, so the remote document
-/// still receives nothing it could call back with.
+/// `scripts` are injected into the webview by the shell, in order, before the document is
+/// parsed: the legacy-WebKit shim from [`needed_compat_script`] when this engine needs it, and
+/// always the render fallback from [`RENDER_FALLBACK_SCRIPT`]. Injecting them here rather than
+/// from the page means the remote document still receives nothing it could call back with.
 pub fn create_harness(
     app: &AppHandle,
     url: &Url,
     port: u16,
-    compat: Option<&str>,
+    scripts: &[&str],
 ) -> tauri::Result<()> {
     // Remembered before the window exists: the crash-recovery path reloads this URL, and asking
     // WebKit for the current one is exactly what failed.
@@ -1424,8 +1597,10 @@ pub fn create_harness(
             }
             true
         });
-    if let Some(script) = compat {
-        builder = builder.initialization_script(script);
+    // Registered in order, and wry injects them in that order before the document is parsed, so
+    // the compat layer runs first and the render fallback wraps whatever it found.
+    for script in scripts {
+        builder = builder.initialization_script(*script);
     }
     let window = builder.build()?;
 
@@ -1513,6 +1688,7 @@ pub fn recover_terminated_webview(webview: &Webview) {
     };
     let target = current_url(&window);
     set_title(&window, "DeepSeek Harness（渲染进程已结束，正在重新加载…）");
+    note_external_reload();
     if let Err(error) = window.navigate(target.clone()) {
         harness::app_log(&format!("崩溃后重新加载 {target} 失败: {error}"));
     }
@@ -1561,8 +1737,9 @@ fn remember_url(url: &Url) {
 /// Watch the Harness page for as long as the window exists.
 ///
 /// One probe per [`LIVENESS_INTERVAL`]: evaluate a tiny expression and wait (bounded by
-/// [`LIVENESS_TIMEOUT`]) for the answer. WebKit evaluates JavaScript through the *UI* process, so
-/// an answer means both halves are working; no answer across [`LIVENESS_MISSES`] probes means the
+/// [`LIVENESS_TIMEOUT`]) for the answer. WebKit runs the script in the *web content* process and
+/// answers from the UI process, so an answer means both halves are working; no answer across
+/// [`LIVENESS_MISSES`] probes means the
 /// page is gone, and the shell loads the URL again — the same thing a user would do by hand, and
 /// the only recovery available for a process the shell cannot restart in place.
 ///
@@ -1577,6 +1754,7 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64, wake: Receiver
     let mut misses = 0;
     let mut reloads = 0;
     let mut frames = None;
+    let mut seen_reloads = EXTERNAL_RELOADS.load(Ordering::SeqCst);
     // Whether the page was already known not to be drawing. The freeze is a state, not an
     // event, so the loop reloads the page when it has been stuck since before the user looked
     // away instead of waiting another interval to rediscover what it already knew.
@@ -1607,11 +1785,28 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64, wake: Receiver
             harness::app_log("页面存活检查结束：harness 窗口已被重建");
             return;
         }
+        // A reload somebody else started leaves this loop holding a reading from a document that
+        // no longer exists. Same reset the automatic reload arm does, for the same reason.
+        let reloaded = EXTERNAL_RELOADS.load(Ordering::SeqCst);
+        if reloaded != seen_reloads {
+            seen_reloads = reloaded;
+            frames = None;
+            misses = 0;
+            stuck = false;
+        }
+        let previous = frames;
         let answer = probe_frames(&window);
-        let state = judge_frames(answer, frames);
+        let state = judge_frames(answer, previous);
         if let Some(counts) = answer {
             frames = Some(counts);
         }
+        // What the fallback carried since the last probe. The only thing that tells "WebKit is
+        // painting this window" apart from "the shim is standing in for the frames it will not
+        // schedule", now that the probe deliberately counts only the native ones.
+        let stood_in = match (answer, previous) {
+            (Some(now), Some(before)) => now.fallbacks.saturating_sub(before.fallbacks),
+            _ => 0,
+        };
         // Only asked once a probe has already failed, and only of a page that still answers: a
         // healthy page needs no second question, and a silent one cannot answer this either —
         // asking it anyway spends the full [`LIVENESS_TIMEOUT`] on every failed cycle, which
@@ -1619,7 +1814,8 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64, wake: Receiver
         // "not busy", so skipping the question changes no decision.
         let busy = matches!(state, PageState::Frozen(_))
             && page_is_busy(probe_activity(&window).as_deref());
-        match liveness_action(state, attended(&window), busy, misses, reloads) {
+        let attended = page_attended(answer.map(|counts| counts.hidden), attended(&window));
+        match liveness_action(state, attended, busy, misses, reloads) {
             LivenessAction::Alive => {
                 if misses > 0 || reloads > 0 {
                     harness::app_log(&format!(
@@ -1641,9 +1837,9 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64, wake: Receiver
                 // Said once per streak: this state lasts as long as the user works elsewhere, and
                 // repeating it every interval would push everything else out of a 5 MB log.
                 if !stuck {
-                    harness::app_log(
-                        "Harness 页面停止绘制：计时器仍在运行，说明是被 WebKit 暂停绘制（多为窗口失去焦点）而非卡死；点击或聚焦窗口即可恢复，不重新加载",
-                    );
+                    harness::app_log(&format!(
+                        "Harness 页面停止绘制：计时器仍在运行，说明是被 WebKit 暂停绘制（窗口被遮挡、最小化或不在前台）而非卡死；露出窗口即可恢复，不重新加载（本轮渲染兜底顶起 {stood_in} 帧）"
+                    ));
                     set_title_if(&window, &compose_title(None, true));
                 }
                 stuck = true;
@@ -1651,19 +1847,20 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64, wake: Receiver
             LivenessAction::Wait { misses: now } => {
                 misses = now;
                 if misses == 1 && stuck {
-                    // The title asked the user to come back to the window, and they did: the
-                    // frames stayed stopped. The hint has been tried, so stop repeating it and
-                    // fall back to the verdict that earns a reload.
-                    harness::app_log(
-                        "Harness 页面在窗口重新获得焦点后仍未恢复绘制，按未响应继续处理",
-                    );
+                    // The page said it was hidden and now says it is visible, and the frames are
+                    // still stopped. The "nothing is being drawn to it" explanation no longer
+                    // covers this, so stop hinting and fall back to the verdict that earns a
+                    // reload.
+                    harness::app_log("Harness 页面在重新可见后仍未恢复绘制，按未响应继续处理");
                     set_title_if(
                         &window,
                         &format!("{DEFAULT_TITLE}（页面仍未刷新，继续观察…）"),
                     );
                 } else if misses == 1 {
                     harness::app_log(match state {
-                        PageState::Frozen(_) => "Harness 页面停止绘制（输入仍有响应），继续观察",
+                        PageState::Frozen(_) => {
+                            "Harness 页面停止绘制（JavaScript 仍在响应），继续观察"
+                        }
                         _ => "Harness 页面没有响应存活检查，继续观察",
                     });
                 }
@@ -1742,6 +1939,7 @@ pub fn reload_harness(app: &AppHandle) {
     };
     let target = current_url(&window);
     harness::app_log(&format!("手动重新加载界面：{target}"));
+    note_external_reload();
     // Recomposed, not reset: reloading the page says nothing about whether a newer version is
     // still out there, so a pending notice survives it.
     set_title_if(&window, &compose_title(pending_notice().as_deref(), false));
@@ -1758,7 +1956,8 @@ const DEFAULT_TITLE: &str = "DeepSeek Harness";
 /// The page itself cannot say this — it stopped being painted, and the model's output is exactly
 /// what is missing from the screen — so the window frame is the only place the user can learn
 /// that the session is intact and one click away from coming back.
-const NOT_DRAWING_TITLE: &str = "DeepSeek Harness（已暂停绘制：聚焦窗口或重新加载界面即可恢复）";
+const NOT_DRAWING_TITLE: &str =
+    "DeepSeek Harness（已暂停绘制：露出窗口即可恢复，或用 ⌘R 重新加载界面）";
 
 /// A newer CLI the registry has and this shell did not install, waiting to be told to the user.
 ///
@@ -1871,12 +2070,29 @@ pub enum Wake {
     Focus,
 }
 
-/// Whether the user can be looking at the window: visible, not minimised, and focused.
+/// Whether to treat the page as one nobody is watching, given what the page itself said.
 ///
-/// A window that is none of those is one WebKit is allowed to stop drawing, which is why the
-/// answer gates the *suspended* verdict and not the silent one. It is read at probe time rather
-/// than latched from the focus event: what matters is whether the user is looking at the page
-/// now, and a window that regained focus and lost it again is back to being unattended.
+/// The page's own answer wins whenever it gave one, because it is the answer that matches the
+/// measured behaviour: WebKit stops scheduling frames for an **occluded** window and keeps
+/// scheduling them for a visible-but-unfocused one, while [`attended`] says the opposite in both
+/// cases. `None` means the page could not say (it did not answer, or the engine has no
+/// `document.visibilityState`), and the window-level answer stands in — which is exactly what
+/// this shell did before the field existed.
+fn page_attended(hidden: Option<bool>, window_attended: bool) -> bool {
+    match hidden {
+        Some(hidden) => !hidden,
+        None => window_attended,
+    }
+}
+
+/// Whether the window itself looks like one somebody is looking at: visible, not minimised, and
+/// focused.
+///
+/// This is the fallback for a page that cannot answer ([`page_attended`]); on its own it is a
+/// poor proxy for "WebKit is painting this", which is why the page is asked first. It is read at
+/// probe time rather than latched from the focus event: what matters is whether the user is
+/// looking at the page now, and a window that regained focus and lost it again is back to being
+/// unattended.
 fn attended(window: &WebviewWindow) -> bool {
     window.is_visible().unwrap_or(true)
         && !window.is_minimized().unwrap_or(false)
@@ -1922,6 +2138,21 @@ fn probe_frames(window: &WebviewWindow) -> Option<Frames> {
 
 /// Bumped every time the window is rebuilt, so an old watchdog can tell it lost its subject.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Bumped by every navigation the liveness watchdog did not start itself.
+///
+/// A new document starts its counters at zero, so the reading taken from the old one is not
+/// something the next probe may be compared against — the automatic reload arm resets for exactly
+/// this reason, and the manual reload, the crash recovery and the first-load retry are the same
+/// event seen from somewhere else. Without it a hand-driven ⌘R was judged against the document it
+/// replaced, which is where "页面停止绘制" appeared nine seconds after a reload that had worked
+/// (seen in the field log, 2026-09-18).
+static EXTERNAL_RELOADS: AtomicU64 = AtomicU64::new(0);
+
+/// Tell the watchdog that the page underneath it was replaced by someone else.
+fn note_external_reload() {
+    EXTERNAL_RELOADS.fetch_add(1, Ordering::SeqCst);
+}
 
 /// How long a rebuilt window waits for the previous one to leave the window table.
 ///
@@ -2037,6 +2268,7 @@ fn watch_first_load(
                     "navigation never started, retrying {url} (attempt {}/{LOAD_ATTEMPTS})",
                     attempt + 1
                 ));
+                note_external_reload();
                 if let Err(error) = window.navigate(url.clone()) {
                     harness::app_log(&format!("retry navigation failed: {error}"));
                 }

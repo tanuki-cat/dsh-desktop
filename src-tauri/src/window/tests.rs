@@ -548,6 +548,39 @@ fn a_suspended_page_is_named_instead_of_reloaded() {
     );
 }
 
+/// The page's own visibility decides whether a stopped frame counter means "nobody is drawing to
+/// it" or "it cannot draw". The window-level check is the fallback, and the two disagree exactly
+/// where the field reports come from: WebKit stops painting an occluded window (which the window
+/// check calls attended, because it is visible and focused) and keeps painting a visible-but-
+/// unfocused one (which the window check calls unattended).
+#[test]
+fn the_page_own_visibility_outranks_the_window_state() {
+    // An occluded page: the page says hidden, the window says visible and focused.
+    assert!(!page_attended(Some(true), true));
+    // A visible but unfocused page: the page says visible, the window says unattended. The page
+    // is right — it is still drawing, so a stopped counter there is a real fault.
+    assert!(page_attended(Some(false), false));
+    // A page that could not answer keeps whatever the window said, in both directions: an engine
+    // without `visibilityState` must behave exactly as it did before this field existed.
+    assert!(page_attended(None, true));
+    assert!(!page_attended(None, false));
+    // And the combination that matters for the reload budget: hidden beats attended, so a page
+    // that says it is not being drawn to never spends the budget, however the window looks.
+    let suspended = PageState::Frozen(Scheduling::Suspended);
+    let attended = page_attended(Some(true), true);
+    assert_eq!(
+        liveness_action(suspended, attended, false, 4, 0),
+        LivenessAction::SuspendedNotDrawing
+    );
+    // The reverse: visible page, stopped frames, unattended window — this is the fault the reload
+    // exists for, so the window state must not excuse it.
+    let attended = page_attended(Some(false), false);
+    assert_eq!(
+        liveness_action(suspended, attended, false, 2, 0),
+        LivenessAction::Reload { attempt: 1 }
+    );
+}
+
 /// Reloading is the only recovery for a stalled page, and it is also what discards an unsent
 /// prompt. Someone typing in a page that stopped drawing gets another interval first.
 #[test]
@@ -606,10 +639,16 @@ fn activity_is_read_as_busy_only_when_someone_is_working() {
             "探测缺少 {key}：{ACTIVITY_PROBE}"
         );
     }
-    // Typing in a field: busy, however long the pause between keystrokes.
-    assert!(page_is_busy(Some(&answer(true, 900_000))));
-    // Not focused, but typed in within the last interval.
-    assert!(page_is_busy(Some(&answer(false, 100))));
+    // A caret in a text box, typed into within the last interval: this is the one reading that
+    // costs the user something to reload.
+    assert!(page_is_busy(Some(&answer(true, 100))));
+    // The caret is in the message box and has been for an hour. The Harness puts it there on
+    // load and nothing takes it away, so reading this as "someone is typing" made the grace
+    // permanent and left quitting the app as the only way out of a page that stopped drawing.
+    assert!(!page_is_busy(Some(&answer(true, 900_000))));
+    // Clicked in the conversation list a moment ago, caret nowhere it could hold a draft: a
+    // reload costs nothing here, so it must not be held off.
+    assert!(!page_is_busy(Some(&answer(false, 100))));
     // Focused elsewhere, idle for minutes: nothing to lose.
     assert!(!page_is_busy(Some(&answer(false, 900_000))));
     // Never typed since the page loaded.
@@ -624,12 +663,14 @@ fn activity_is_read_as_busy_only_when_someone_is_working() {
     assert!(!page_is_busy(Some(&double_encoded)));
 }
 
-/// A counter report as the page sends it.
+/// A counter report as the page sends it, from a page that says it is being drawn to.
 fn counts(frames: u64, timers: u64) -> Frames {
     Frames {
         frames,
         timers,
         timers_seen: true,
+        hidden: false,
+        fallbacks: 0,
     }
 }
 
@@ -679,9 +720,8 @@ fn a_stopped_frame_counter_is_split_by_the_timer_that_keeps_running() {
     // An engine that cannot count timers must not be read as stalled *or* as suspended: it is
     // simply not saying, and the caller has to decide what an unknown verdict costs.
     let unseen = Frames {
-        frames: 9,
-        timers: 0,
         timers_seen: false,
+        ..counts(9, 0)
     };
     assert_eq!(
         judge_frames(Some(unseen), Some(unseen)),
@@ -694,6 +734,366 @@ fn a_stopped_frame_counter_is_split_by_the_timer_that_keeps_running() {
     assert_eq!(
         judge_frames(Some(counts(9, 1)), Some(first)),
         PageState::Frozen(Scheduling::Suspended)
+    );
+}
+
+/// The fallback is the difference between "the model output stops appearing" and "it keeps
+/// appearing while the window is behind another one", so its behaviour is checked in a real
+/// engine rather than by reading the source.
+///
+/// The driver below is a window whose native frames never arrive (exactly the occluded case) and
+/// whose timers can be advanced by hand, so every branch is reachable without a browser.
+#[test]
+fn the_render_fallback_stands_in_for_frames_the_page_will_not_get() {
+    // The stub comes first: `run_shim` runs the block, then the probe, and the probe is where the
+    // fallback itself has to be evaluated so that it wraps this window rather than node global.
+    let stub = r#"
+      var clock = 0;
+      var timers = [];
+      var nativeCancels = [];
+      var nativeCalls = 0;
+      var nativeSinks = {};
+      function advance(to) {
+        clock = to;
+        for (var i = 0; i < timers.length; i++) {
+          if (!timers[i].dead && timers[i].at <= clock) timers[i].fn();
+        }
+      }
+      global.window = {
+        performance: { now: function () { return clock; } },
+        document: { visibilityState: "hidden" },
+        setTimeout: function (fn, ms) { timers.push({ fn: fn, at: clock + ms, dead: false }); return timers.length; },
+        clearTimeout: function (id) { if (timers[id - 1]) timers[id - 1].dead = true; },
+        requestAnimationFrame: function (cb) { nativeCalls += 1; nativeSinks[1000 + nativeCalls] = cb; return 1000 + nativeCalls; },
+        cancelAnimationFrame: function (id) { nativeCancels.push(id); }
+      };
+    "#;
+    let probe = r#"
+      var w = window;
+      var fired = [];
+      // 1) Hidden and no native frame: the fallback delivers once, with a clock stamp.
+      var id = w.requestAnimationFrame(function (stamp) { fired.push(stamp); });
+      advance(300);
+      var afterFallback = fired.slice();
+      // 2) The native frame that finally arrives must not deliver the same callback twice.
+      nativeSinks[id](999999);
+      var afterLateNative = fired.slice();
+      // 3) A cancelled request must never fire through either path.
+      var cancelledFired = false;
+      w.cancelAnimationFrame(w.requestAnimationFrame(function () { cancelledFired = true; }));
+      advance(1000);
+      // 4) A visible page gets no fallback timer at all.
+      w.document.visibilityState = "visible";
+      var before = timers.length;
+      w.requestAnimationFrame(function () {});
+      var timersVisible = timers.length - before;
+      // 5) A native frame that arrives in time cancels the fallback: one delivery, not two.
+      w.document.visibilityState = "hidden";
+      var id4 = w.requestAnimationFrame(function () { fired.push("native"); });
+      nativeSinks[id4](4242);
+      advance(2000);
+      var nativeDeliveries = 0;
+      for (var j = 0; j < fired.length; j++) { if (fired[j] === "native") nativeDeliveries += 1; }
+      process.stdout.write(JSON.stringify({
+        afterFallback: afterFallback,
+        afterLateNative: afterLateNative,
+        cancelledFired: cancelledFired,
+        timersVisible: timersVisible,
+        nativeDeliveries: nativeDeliveries,
+        cancelled: nativeCancels.length
+      }));
+    "#;
+    let out = run_shim(stub, &format!("{}\n{}", render_fallback_script(), probe));
+    // The stamp is the page's own clock, not the epoch: animations interpolate against it.
+    assert_eq!(
+        out,
+        r#"{"afterFallback":[300],"afterLateNative":[300],"cancelledFired":false,"timersVisible":0,"nativeDeliveries":1,"cancelled":2}"#
+    );
+}
+
+/// The fallback runs on the same engines the compat layer exists for, and a second injection must
+/// not stack a second wrapper on top of the first.
+#[test]
+fn the_render_fallback_stays_es5_and_wraps_once() {
+    let script = render_fallback_script();
+    for syntax in ["=>", "`", "??", "const ", "let ", "class "] {
+        assert!(
+            !script.contains(syntax),
+            "渲染兜底必须保持 ES5，发现 {syntax:?}"
+        );
+    }
+    // The guard is what makes a second injection a no-op, and it is read before anything is
+    // replaced, so a page that already carries the wrapper keeps the one it has.
+    assert!(script.contains("__dshRafFallback === true"), "{script}");
+    // Only a hidden page pays for a fallback timer.
+    assert!(
+        script.contains(r#"document.visibilityState === "hidden""#),
+        "{script}"
+    );
+    // The interval comes from the constant, not from a number typed into the script twice.
+    assert!(
+        script.contains(&RENDER_FALLBACK_MS.to_string()),
+        "兜底间隔必须来自 RENDER_FALLBACK_MS：{script}"
+    );
+    assert!(
+        !script.contains("%FALLBACK_MS%"),
+        "占位符必须被替换掉：{script}"
+    );
+    // Wrapping twice would deliver every callback twice, so the guard has to be real: run the
+    // script against a stub window twice and check the wrapper is the same function object.
+    let probe = r#"
+      var stub = {
+        document: { visibilityState: "hidden" },
+        setTimeout: function () { return 1; },
+        clearTimeout: function () {},
+        requestAnimationFrame: function () { return 1; },
+        cancelAnimationFrame: function () {}
+      };
+      global.window = stub;
+      __SCRIPT__
+      var first = stub.requestAnimationFrame;
+      __SCRIPT__
+      process.stdout.write(stub.requestAnimationFrame === first ? "once" : "twice");
+    "#
+    .replace("__SCRIPT__", &script);
+    assert_eq!(run_shim("", &probe), "once");
+}
+
+/// The probe has to measure the engine, not the shim that stands in for it.
+///
+/// This is the regression that made the whole liveness check blind: the probe counted through
+/// `window.requestAnimationFrame`, the fallback replaces that function, and so the counter was
+/// bumped by the fallback's own timer. A window WebKit had not painted for eighteen minutes
+/// reported a rising frame count, the watchdog called it healthy, and the user was left reloading
+/// by hand and finally quitting the app (field log, 2026-09-18 21:02).
+#[test]
+fn the_frame_probe_counts_native_frames_only() {
+    // An occluded window: native frames are accepted and never delivered, timers keep running.
+    let stub = r#"
+      var clock = 0;
+      var timers = [];
+      var nativeId = 0;
+      global.window = {
+        performance: { now: function () { return clock; } },
+        document: { visibilityState: "hidden", addEventListener: function () {} },
+        setTimeout: function (fn, ms) { timers.push({ fn: fn, at: clock + ms, dead: false }); return timers.length; },
+        clearTimeout: function (id) { if (timers[id - 1]) timers[id - 1].dead = true; },
+        requestAnimationFrame: function () { nativeId += 1; return nativeId; },
+        cancelAnimationFrame: function () {}
+      };
+      global.advance = function (to) {
+        // One fallback interval at a time: a chain queues its next link from inside the
+        // callback, so a single sweep to the target time would only ever run the first one.
+        while (clock < to) {
+          clock += 50;
+          for (var i = 0; i < timers.length; i++) {
+            if (!timers[i].dead && timers[i].at <= clock) { timers[i].dead = true; timers[i].fn(); }
+          }
+        }
+      };
+    "#;
+    let probe = format!(
+        r#"
+      {fallback}
+      // The page's own render chain: each frame asks for the next one, which is what the Harness
+      // does to flush streamed output.
+      var painted = 0;
+      var chain = function () {{ painted += 1; window.requestAnimationFrame(chain); }};
+      window.requestAnimationFrame(chain);
+      var first = {probe};
+      advance(300);
+      var second = {probe};
+      advance(900);
+      var third = {probe};
+      process.stdout.write(JSON.stringify({{
+        painted: painted,
+        frames: [first.frames, second.frames, third.frames],
+        fallbacks: [first.fallbacks, second.fallbacks, third.fallbacks],
+        hidden: third.hidden
+      }}));
+    "#,
+        fallback = render_fallback_script(),
+        probe = FRAME_PROBE.trim()
+    );
+    let out = run_shim(stub, &probe);
+    let seen: serde_json::Value = serde_json::from_str(&out).expect("the probe must answer JSON");
+    // The fallback is carrying the page: its chain advances while the engine draws nothing.
+    assert!(
+        seen["painted"].as_u64().unwrap() >= 3,
+        "兜底必须在页面被遮挡时继续推进渲染链：{out}"
+    );
+    assert!(
+        seen["fallbacks"][2].as_u64().unwrap() >= 3,
+        "兜底顶起的帧数必须被上报：{out}"
+    );
+    // And the probe says so: not one native frame was produced, however busy the fallback was.
+    // A probe that counted through the wrapper would report the fallback's own count here.
+    assert_eq!(
+        seen["frames"],
+        serde_json::json!([0, 0, 0]),
+        "帧计数只能来自原生调度器，否则看护会把停画的页面判成健康：{out}"
+    );
+    assert_eq!(seen["hidden"], serde_json::json!(true), "{out}");
+}
+
+/// The frame queued a moment before the window was covered.
+///
+/// The first version of the shim read `visibilityState` only when the request was made, so a
+/// frame asked for while the page was still visible got no fallback at all — and the Harness
+/// flushes through a chain of frames, so that one missing link stops the stream. It is the
+/// common case, not a corner: the user switches conversation and then looks at their editor.
+#[test]
+fn the_render_fallback_covers_frames_queued_before_the_page_hid() {
+    let stub = r#"
+      var clock = 0;
+      var timers = [];
+      var listeners = [];
+      var nativeId = 0;
+      global.window = {
+        performance: { now: function () { return clock; } },
+        document: {
+          visibilityState: "visible",
+          addEventListener: function (name, fn) { if (name === "visibilitychange") listeners.push(fn); }
+        },
+        setTimeout: function (fn, ms) { timers.push({ fn: fn, at: clock + ms, dead: false }); return timers.length; },
+        clearTimeout: function (id) { if (timers[id - 1]) timers[id - 1].dead = true; },
+        // Visible: frames are accepted. Once covered, WebKit delivers none of them, including
+        // the ones it already accepted.
+        requestAnimationFrame: function () { nativeId += 1; return nativeId; },
+        cancelAnimationFrame: function () {}
+      };
+      global.cover = function () {
+        window.document.visibilityState = "hidden";
+        for (var i = 0; i < listeners.length; i++) listeners[i]();
+      };
+      global.uncover = function () {
+        window.document.visibilityState = "visible";
+        for (var i = 0; i < listeners.length; i++) listeners[i]();
+      };
+      global.advance = function (to) {
+        // One fallback interval at a time: a chain queues its next link from inside the
+        // callback, so a single sweep to the target time would only ever run the first one.
+        while (clock < to) {
+          clock += 50;
+          for (var i = 0; i < timers.length; i++) {
+            if (!timers[i].dead && timers[i].at <= clock) { timers[i].dead = true; timers[i].fn(); }
+          }
+        }
+      };
+    "#;
+    let probe = format!(
+        r#"
+      {fallback}
+      // Three chained frames, the shape the conversation view flushes through.
+      var links = 0;
+      var chain = function () {{ links += 1; if (links < 3) window.requestAnimationFrame(chain); }};
+      window.requestAnimationFrame(chain);   // asked for while the window is still visible
+      cover();                                // and now it is behind the editor
+      advance(10000);
+      var covered = links;
+      // A fresh request while still covered arms a stand-in of its own...
+      window.requestAnimationFrame(function () {{}});
+      var armedWhileCovered = 0;
+      for (var i = 0; i < timers.length; i++) if (!timers[i].dead) armedWhileCovered += 1;
+      // ...and uncovering stands it down again: the engine draws now, so the native frame is the
+      // better one and the page must not get both.
+      uncover();
+      var armed = 0;
+      for (var i = 0; i < timers.length; i++) if (!timers[i].dead) armed += 1;
+      process.stdout.write(JSON.stringify({{
+        covered: covered,
+        armedWhileCovered: armedWhileCovered,
+        armed: armed
+      }}));
+    "#,
+        fallback = render_fallback_script()
+    );
+    let seen: serde_json::Value =
+        serde_json::from_str(&run_shim(stub, &probe)).expect("the shim must answer JSON");
+    // The whole chain ran. Reading `visibilityState` only at request time leaves this at 0.
+    assert_eq!(
+        seen["covered"],
+        serde_json::json!(3),
+        "被遮挡前排队的帧必须也能被兜底补上"
+    );
+    // Back in view, nothing is left ticking: the engine draws again, so the stand-ins stand down.
+    assert_eq!(
+        seen["armedWhileCovered"],
+        serde_json::json!(1),
+        "被遮挡时新排的帧必须挂上兜底"
+    );
+    assert_eq!(
+        seen["armed"],
+        serde_json::json!(0),
+        "页面重新可见后不应留下未触发的兜底定时器"
+    );
+}
+
+/// The grace for a page someone is typing in has to end.
+///
+/// It is there so a reload does not discard a half-typed prompt. Unbounded, it is not a delay but
+/// a veto — and the page it vetoes the recovery of is one that stopped drawing, so the typist
+/// cannot see their own prompt either. That combination left quitting the app as the only way out.
+#[test]
+fn a_busy_page_is_reloaded_after_the_grace_runs_out() {
+    let stalled = PageState::Frozen(Scheduling::Stalled);
+    // The streak reaches the reload point, and typing holds it off — keeping the streak, not
+    // resetting it, so the grace is spent rather than restarted.
+    assert_eq!(
+        liveness_action(stalled, true, true, LIVENESS_MISSES - 1, 0),
+        LivenessAction::Busy {
+            misses: LIVENESS_MISSES
+        }
+    );
+    // Every interval of the grace, still held off.
+    for spent in 0..LIVENESS_BUSY_GRACE - 1 {
+        assert_eq!(
+            liveness_action(stalled, true, true, LIVENESS_MISSES + spent, 0),
+            LivenessAction::Busy {
+                misses: LIVENESS_MISSES + spent + 1
+            }
+        );
+    }
+    // And then it is over: the page is reloaded even though the caret is still in the box.
+    assert_eq!(
+        liveness_action(
+            stalled,
+            true,
+            true,
+            LIVENESS_MISSES + LIVENESS_BUSY_GRACE - 1,
+            0
+        ),
+        LivenessAction::Reload { attempt: 1 }
+    );
+    // The budget is spent from there like any other reload, so a page that keeps failing still
+    // ends up reported rather than reloaded for ever.
+    assert_eq!(
+        liveness_action(
+            stalled,
+            true,
+            true,
+            LIVENESS_MISSES + LIVENESS_BUSY_GRACE - 1,
+            LIVENESS_RELOADS
+        ),
+        LivenessAction::Report {
+            attempts: LIVENESS_RELOADS
+        }
+    );
+}
+
+/// A navigation the watchdog did not start leaves it holding a reading from a document that no
+/// longer exists — and the new document counts frames from zero, so the very next probe reads as
+/// "stopped drawing". The automatic reload arm resets in place; every other navigation has to say
+/// so. Checked against the source because the mistake is a missing call, not a wrong value.
+#[test]
+fn every_reload_that_is_not_the_watchdogs_own_announces_itself() {
+    let source = include_str!("../window.rs");
+    let navigations = source.matches(".navigate(").count();
+    let announcements = source.matches("note_external_reload();").count();
+    assert_eq!(
+        navigations,
+        announcements + 1,
+        "除看护自己的重载外，每处 navigate 都要调用 note_external_reload()，否则新文档会被拿旧读数判定"
     );
 }
 
@@ -796,13 +1196,22 @@ fn the_probe_reports_exactly_the_fields_the_shell_parses() {
         Frames {
             frames: 12,
             timers: 12,
-            timers_seen: true
+            timers_seen: true,
+            hidden: true,
+            fallbacks: 12,
         }
     );
     // Every key the parser needs is a key the probe emits, spelled the same way.
-    for key in ["frames", "timers", "timersSeen"] {
+    for key in ["frames", "timers", "timersSeen", "hidden", "fallbacks"] {
         assert!(FRAME_PROBE.contains(key), "探测缺少 {key}：{FRAME_PROBE}");
     }
+    // The wire format is modelled from the probe, and `hidden` is the field the whole verdict now
+    // hangs on: the derivation above can only produce `true` for it, so this pins that the
+    // comparison really is the one that answers "is this page being drawn to".
+    assert!(
+        FRAME_PROBE.contains("visibilityState === \"hidden\""),
+        "探测必须用 visibilityState 判断是否被绘制：{FRAME_PROBE}"
+    );
     // A page that answers with something else is silence, not a page with a zero counter:
     // parsing it as a default would look like a page that never drew a frame.
     assert!(serde_json::from_str::<Frames>("12").is_err());

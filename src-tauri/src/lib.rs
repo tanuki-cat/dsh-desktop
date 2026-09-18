@@ -142,6 +142,16 @@ pub struct Config {
     /// older behaviour, which is the switch to reach for when a compat shim itself misbehaves.
     #[serde(default = "default_webkit_compat")]
     pub webkit_compat: bool,
+    /// Stand in for animation frames while WebKit is not painting the window (see
+    /// `window::RENDER_FALLBACK_SCRIPT`). On by default: without it a window that is merely
+    /// occluded stops showing streamed output until the user uncovers it. Off restores the older
+    /// behaviour, for comparing against it or for a page the wrapper disagrees with.
+    #[serde(default = "default_render_fallback")]
+    pub render_fallback: bool,
+}
+
+fn default_render_fallback() -> bool {
+    true
 }
 
 fn default_port() -> u16 {
@@ -318,6 +328,7 @@ impl Config {
             system_updates: default_system_updates(),
             auto_update_plugins: false,
             webkit_compat: default_webkit_compat(),
+            render_fallback: default_render_fallback(),
         };
         // The same repair a loaded file gets, so the value seeded here is already usable
         // (a `HOME` that is relative or gone would otherwise become the workspace).
@@ -2076,8 +2087,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
                         // Adopted, but still ours: quitting must stop it rather than leave an
                         // orphan.
                         adopt(pid, data_dir);
-                        let compat = harness_compat(&config);
-                        window::create_harness(app, &url, port, compat.as_deref())
+                        let scripts = harness_scripts(&config);
+                        let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
+                        window::create_harness(app, &url, port, &scripts)
                             .map_err(|e| e.to_string())?;
                         // This branch returns without reaching the announcement below.
                         announce_pending_update(
@@ -2389,7 +2401,14 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
     // probe, and reading the slot earlier returned `None` for a report that had simply not arrived
     // yet — which silently opened an unpatched window and blamed it on `webkit_compat`
     // (found by running the built app, 2026-09-15).
-    let compat = harness_compat(&config);
+    let scripts = harness_scripts(&config);
+    // Whether the compat half actually made it in. The render fallback is always there when it is
+    // enabled, so it cannot answer this question.
+    let compat = config
+        .webkit_compat
+        .then(window::needed_compat_script)
+        .flatten()
+        .is_some();
     if let Some(report) = window::report().filter(|report| report.needs_compat()) {
         // The reason has to name the real one. `compat` is decided before the spawn, and the
         // report arrives while the CLI boots, so a missing script can also mean the probe was
@@ -2398,7 +2417,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
         harness::app_log(&format!(
             "WebView 缺少 {}：{}",
             report.missing.join("、"),
-            if compat.is_some() {
+            if compat {
                 "已注入兼容层"
             } else if config.webkit_compat {
                 "探测未在上报窗口内到达，未注入兼容层"
@@ -2407,7 +2426,8 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
             }
         ));
     }
-    if let Err(error) = window::create_harness(app, &url, actual_port, compat.as_deref()) {
+    let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
+    if let Err(error) = window::create_harness(app, &url, actual_port, &scripts) {
         return abort_start(pid, error.to_string());
     }
     announce_pending_update(app, pending_update_notice.as_deref(), core_swapped);
@@ -2464,12 +2484,23 @@ fn hand_the_gui_to_the_browser(
     true
 }
 
-/// The compat script the Harness window may carry, when the shell is allowed to install it.
-fn harness_compat(config: &Config) -> Option<String> {
-    config
-        .webkit_compat
-        .then(window::needed_compat_script)
-        .flatten()
+/// Every script the Harness window carries, in injection order.
+///
+/// The compat layer comes first: it supplies engine capabilities, and the render fallback wraps
+/// `requestAnimationFrame`, so it has to see whatever that layer installed. Both are shell-owned
+/// scripts injected before the document is parsed, which is why the remote page gains no
+/// capability from either.
+fn harness_scripts(config: &Config) -> Vec<String> {
+    let mut scripts = Vec::new();
+    if config.webkit_compat {
+        if let Some(compat) = window::needed_compat_script() {
+            scripts.push(compat);
+        }
+    }
+    if config.render_fallback {
+        scripts.push(window::render_fallback_script());
+    }
+    scripts
 }
 
 /// A per-process temporary directory for tests.
