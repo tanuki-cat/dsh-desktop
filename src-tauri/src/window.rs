@@ -1102,11 +1102,21 @@ const RENDER_FALLBACK_SCRIPT: &str = r#"
   w.__dshNativeRaf = nativeRaf;
   w.__dshNativeCancel = nativeCancel;
   w.__dshFallbackFrames = 0;
+  // How many frames the page is still waiting on. Diagnostics only (FRAME_PROBE reports it):
+  // a page frozen with requests outstanding is waiting for a frame that is not coming, and a
+  // page frozen with none is stopped somewhere else entirely.
+  w.__dshPendingFrames = 0;
   var clock = (w.performance && typeof w.performance.now === "function")
     ? function () { return w.performance.now(); }
     : function () { return Date.now(); };
   var canTime = typeof w.setTimeout === "function";
   var pending = {};
+  // The one place a request leaves the table, so the outstanding count cannot drift from it.
+  var forget = function (id) {
+    if (pending[id] === undefined) return;
+    delete pending[id];
+    w.__dshPendingFrames -= 1;
+  };
   var covered = function () {
     return !!w.document && w.document.visibilityState === "hidden";
   };
@@ -1115,7 +1125,7 @@ const RENDER_FALLBACK_SCRIPT: &str = r#"
     request.timer = w.setTimeout(function () {
       if (request.settled) return;
       request.settled = true;
-      delete pending[request.id];
+      forget(request.id);
       w.__dshFallbackFrames += 1;
       if (typeof nativeCancel === "function") nativeCancel.call(w, request.id);
       request.callback(clock());
@@ -1132,11 +1142,12 @@ const RENDER_FALLBACK_SCRIPT: &str = r#"
       if (request.settled) return;
       request.settled = true;
       disarm(request);
-      delete pending[request.id];
+      forget(request.id);
       callback(stamp);
     });
     request.id = id;
     pending[id] = request;
+    w.__dshPendingFrames += 1;
     if (covered()) arm(request);
     return id;
   };
@@ -1145,7 +1156,7 @@ const RENDER_FALLBACK_SCRIPT: &str = r#"
     if (request !== undefined) {
       request.settled = true;
       disarm(request);
-      delete pending[id];
+      forget(id);
     }
     if (typeof nativeCancel === "function") nativeCancel.call(w, id);
   };
@@ -1168,6 +1179,183 @@ const RENDER_FALLBACK_SCRIPT: &str = r#"
 /// the number appears in exactly one place.
 pub fn render_fallback_script() -> String {
     RENDER_FALLBACK_SCRIPT.replace("%FALLBACK_MS%", &RENDER_FALLBACK_MS.to_string())
+}
+
+/// Keep the focus still while a menu popup is clicked, which is what lets the click happen.
+///
+/// On macOS, mousedown on a `<button>` does not focus it — Chrome and Firefox do, and front ends
+/// are written against that. WebKit still *blurs* whatever held the focus, so a popup that closes
+/// when focus leaves it (dsh's `ModelSelect.onBlur`, against a `relatedTarget` of `null`) unmounts
+/// itself between the mousedown and the mouseup, and the `click` never happens. The switch then
+/// silently does nothing: no request, no error, and the menu closes as if it had worked. Measured
+/// 2026-09-19 — the same window switches models fine from the keyboard, and Firefox switches fine
+/// with the mouse.
+///
+/// Suppressing the default action of that mousedown is the whole fix: the focus stays exactly
+/// where it was, so nothing blurs, the popup stays mounted, and the mouseup lands on the item it
+/// was pressed on. `preventDefault` on mousedown suppresses focus, text selection and drag start
+/// — not the `click` that follows.
+///
+/// Giving the item the focus instead (what Chrome does) was tried first and is worse: the row a
+/// press lands on is often the one React is about to unmount — `drill("effort")` replaces the
+/// whole pane — and unmounting the focused node produces the very `relatedTarget: null` blur this
+/// exists to avoid. It moved the failure from the second pane to the first (measured 2026-09-19).
+///
+/// The reach is menu popups (`menu`, `menubar`, `listbox`) and never an editable target: a
+/// combobox with a filter field inside its popup must still take the caret on a click.
+///
+/// Capture phase, because it has to run before the page's own `mousedown` handling.
+///
+/// ES5 on purpose, like the other injected scripts.
+const MENU_FOCUS_GUARD_SCRIPT: &str = r#"
+(function () {
+  var w = window;
+  if (w.__dshMenuFocusGuard === true) return;
+  w.__dshMenuFocusGuard = true;
+  var d = w.document;
+  if (!d || typeof d.addEventListener !== "function") return;
+  var popups = { menu: 1, menubar: 1, listbox: 1 };
+  var editable = { INPUT: 1, TEXTAREA: 1, SELECT: 1 };
+  var inPopup = function (node) {
+    while (node && node.nodeType === 1) {
+      // An editable target owns the caret, so its own focus has to win over this guard.
+      if (editable[node.tagName] === 1 || node.isContentEditable === true) return false;
+      if (typeof node.getAttribute === "function") {
+        var role = node.getAttribute("role");
+        if (role !== null && popups[role] === 1) return true;
+      }
+      node = node.parentNode;
+    }
+    return false;
+  };
+  d.addEventListener("mousedown", function (event) {
+    // Secondary buttons open context menus, and a handler that already called preventDefault
+    // has said what this press means.
+    if (event.button !== 0 || event.defaultPrevented) return;
+    if (!inPopup(event.target)) return;
+    event.preventDefault();
+  }, true);
+})();
+"#;
+
+/// The menu focus guard. A plain constant today; it stays behind a function so callers do not
+/// depend on whether it needs substitution, like the other two.
+pub fn menu_focus_guard_script() -> String {
+    MENU_FOCUS_GUARD_SCRIPT.to_string()
+}
+
+/// Most recent page notes the probe may carry back at once.
+///
+/// The ring drops its oldest entry rather than growing: a page erroring in a loop must not turn
+/// one probe's answer into an unbounded payload, and the newest lines are the ones that describe
+/// what the user just did.
+const PAGE_NOTE_LIMIT: usize = 50;
+
+/// Longest single note, in characters. Long enough for a stack's first frames, short enough that
+/// fifty of them stay a log entry rather than a file.
+const PAGE_NOTE_CHARS: usize = 500;
+
+/// Collect what the Harness page says about itself, for [`FRAME_PROBE`] to carry back.
+///
+/// The Harness window has no console and no capabilities, so a fault inside the page has until
+/// now left nothing behind at all: every WebView-only report in this repo's history
+/// (`Failed to load plugins`, the render stall, the shim that blinded the probe) was diagnosed by
+/// asking the user to reproduce it again under an attached inspector. The shell already runs a
+/// script in that page every [`LIVENESS_INTERVAL`], so the evidence can simply ride along.
+///
+/// It observes and never replaces: the two listeners are additional, and the console wrappers
+/// call the original first. Nothing here can change what the page does — a diagnostic that
+/// decides anything is the mistake this file has already made once (2026-09-18).
+///
+/// **Only strings enter the ring.** A page value could be a prompt, a file, or a credential, and
+/// this buffer is on its way into a log file. `text()` is therefore the single entry point, and
+/// `harness::app_log`'s own redaction still runs at the exit.
+///
+/// ES5 on purpose, like the probe and the compat layer: it has to run on the engines those exist
+/// for.
+const PAGE_DIAGNOSTICS_SCRIPT: &str = r#"
+(function () {
+  var w = window;
+  if (w.__dshPageNotes !== undefined) return;
+  try {
+    var notes = [];
+    w.__dshPageNotes = notes;
+    var clock = (w.performance && typeof w.performance.now === "function")
+      ? function () { return w.performance.now(); }
+      : function () { return 0; };
+    var start = clock();
+    var text = function (value) {
+      var out;
+      try {
+        out = typeof value === "string" ? value : String(value);
+      } catch (error) {
+        out = "<unprintable>";
+      }
+      return out.length > %CHARS% ? out.slice(0, %CHARS%) + " ..." : out;
+    };
+    var note = function (kind, parts) {
+      var words = [];
+      for (var i = 0; i < parts.length; i++) words.push(text(parts[i]));
+      notes.push(Math.round(clock() - start) + "ms " + kind + ": " + words.join(" "));
+      while (notes.length > %LIMIT%) notes.shift();
+    };
+    if (typeof w.addEventListener === "function") {
+      w.addEventListener("error", function (event) {
+        if (!event) return;
+        // A failed subresource fires here too, with no message: the URL is the whole report.
+        if (event.message === undefined || event.message === null) {
+          var target = event.target;
+          var src = target ? (target.src || target.href) : undefined;
+          note("resource", [src === undefined ? "<unknown>" : src]);
+          return;
+        }
+        var stack = event.error && event.error.stack;
+        note("error", [
+          event.message,
+          "@" + (event.filename || "?") + ":" + (event.lineno || 0),
+          stack === undefined || stack === null ? "" : stack
+        ]);
+      // Capture, not bubble: a subresource that fails to load fires an error event that does
+      // not bubble, so the branch above it would never run on the phase the page sees.
+      }, true);
+      w.addEventListener("unhandledrejection", function (event) {
+        var reason = event ? event.reason : undefined;
+        var stack = reason && reason.stack;
+        note("rejection", [
+          reason && reason.message !== undefined ? reason.message : reason,
+          stack === undefined || stack === null ? "" : stack
+        ]);
+      }, false);
+    }
+    var wrap = function (level) {
+      var target = w.console;
+      if (!target || typeof target[level] !== "function") return;
+      var original = target[level];
+      target[level] = function () {
+        try {
+          original.apply(target, arguments);
+        } catch (error) {}
+        try {
+          note(level, arguments);
+        } catch (error) {}
+      };
+    };
+    // The client says why its control stream died through console.error, which is the line this
+    // whole script exists to catch; warn is next to it because a degraded stream reports there.
+    wrap("error");
+    wrap("warn");
+  } catch (error) {
+    // A diagnostic that breaks the page it diagnoses is worse than no diagnostic.
+    w.__dshPageNotes = [];
+  }
+})()
+"#;
+
+/// The diagnostics script with its two bounds substituted in.
+pub fn page_diagnostics_script() -> String {
+    PAGE_DIAGNOSTICS_SCRIPT
+        .replace("%LIMIT%", &PAGE_NOTE_LIMIT.to_string())
+        .replace("%CHARS%", &PAGE_NOTE_CHARS.to_string())
 }
 
 /// How the page is scheduled, told apart by the timer heartbeat the probe carries.
@@ -1322,6 +1510,11 @@ fn judge_frames(answer: Option<Frames>, previous: Option<Frames>) -> PageState {
 /// `fallbacks` is how many frames the shim has stood in for, so the log can tell "the engine is
 /// drawing" apart from "the shim is carrying it".
 ///
+/// `pending` and `notes` are for the log only and reach no verdict (see [`PageProbe`]): the
+/// outstanding frame count, and whatever [`PAGE_DIAGNOSTICS_SCRIPT`] has collected since the last
+/// probe. `notes` is **drained**, so each line is reported once and an unprobed page cannot grow
+/// an unbounded buffer.
+///
 /// It returns an **object**, not `JSON.stringify(...)` of one. WebKit hands the shell the JSON of
 /// whatever the script evaluates to, so a returned string arrives double-encoded and every answer
 /// fails to parse — which the watchdog reads as a dead renderer and reloads for. That mistake
@@ -1357,12 +1550,19 @@ const FRAME_PROBE: &str = r#"
     };
     w.setTimeout(bump, 0);
   }
+  // Drained, not read: each note is reported once, and a page nobody probes cannot grow a log.
+  var notes = [];
+  if (Object.prototype.toString.call(w.__dshPageNotes) === "[object Array]") {
+    notes = w.__dshPageNotes.splice(0, w.__dshPageNotes.length);
+  }
   return {
     frames: w.__dshFrames,
     timers: w.__dshTimers,
     timersSeen: w.__dshTimerSeen === true,
     hidden: w.document ? w.document.visibilityState === "hidden" : false,
-    fallbacks: w.__dshFallbackFrames
+    fallbacks: w.__dshFallbackFrames,
+    pending: typeof w.__dshPendingFrames === "number" ? w.__dshPendingFrames : -1,
+    notes: notes
   };
 })()
 "#;
@@ -1402,6 +1602,34 @@ struct Frames {
     /// this page".
     #[serde(default)]
     fallbacks: u64,
+}
+
+/// One probe answer: the counters the liveness policy judges, plus what the page had to say.
+///
+/// The two halves are deliberately separate types. [`Frames`] is everything
+/// [`liveness_action`] is allowed to see, and nothing in this struct's own fields may reach it —
+/// a diagnostic that decides something is exactly how the render fallback blinded this probe
+/// once already (2026-09-18). `notes` and `pending` are written to the log and nowhere else.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageProbe {
+    /// The counters, under the same names the page has always written.
+    #[serde(flatten)]
+    frames: Frames,
+    /// Lines the diagnostics script collected since the previous probe drained it. Empty when
+    /// `page_diagnostics` is off, and empty on a page that had nothing to report.
+    #[serde(default)]
+    notes: Vec<String>,
+    /// Animation frames the page is still waiting on, or `-1` where nothing counts them (the
+    /// render fallback is what maintains it). A frozen page with requests outstanding is waiting
+    /// for a frame that is not coming; a frozen page with none is stopped somewhere else.
+    #[serde(default = "unknown_pending")]
+    pending: i64,
+}
+
+/// What `pending` reads as when the page has no counter for it.
+fn unknown_pending() -> i64 {
+    -1
 }
 
 /// Ask the page whether someone is working in it right now.
@@ -1795,7 +2023,11 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64, wake: Receiver
             stuck = false;
         }
         let previous = frames;
-        let answer = probe_frames(&window);
+        let probe = probe_frames(&window);
+        // How many frames the page is still waiting on, for the stall lines below. Log-only: the
+        // verdict is computed from the counters alone (see `PageProbe`).
+        let waiting = probe.as_ref().map_or(-1, |probe| probe.pending);
+        let answer = probe.map(|probe| probe.frames);
         let state = judge_frames(answer, previous);
         if let Some(counts) = answer {
             frames = Some(counts);
@@ -1838,7 +2070,7 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64, wake: Receiver
                 // repeating it every interval would push everything else out of a 5 MB log.
                 if !stuck {
                     harness::app_log(&format!(
-                        "Harness 页面停止绘制：计时器仍在运行，说明是被 WebKit 暂停绘制（窗口被遮挡、最小化或不在前台）而非卡死；露出窗口即可恢复，不重新加载（本轮渲染兜底顶起 {stood_in} 帧）"
+                        "Harness 页面停止绘制：计时器仍在运行，说明是被 WebKit 暂停绘制（窗口被遮挡、最小化或不在前台）而非卡死；露出窗口即可恢复，不重新加载（本轮渲染兜底顶起 {stood_in} 帧，页面仍在等 {waiting} 帧）"
                     ));
                     set_title_if(&window, &compose_title(None, true));
                 }
@@ -2126,14 +2358,36 @@ pub fn wake_page() {
 /// the page runs, takes input, and draws nothing. An answer this shell cannot parse is silence
 /// too: the probe is the only thing producing it, so a shape it does not recognise means the
 /// page is not the page the shell thinks it is watching.
-fn probe_frames(window: &WebviewWindow) -> Option<Frames> {
+fn probe_frames(window: &WebviewWindow) -> Option<PageProbe> {
     let (tx, rx) = mpsc::channel();
     window
         .eval_with_callback(FRAME_PROBE, move |answer| {
-            let _ = tx.send(serde_json::from_str::<Frames>(answer.trim()).ok());
+            let _ = tx.send(serde_json::from_str::<PageProbe>(answer.trim()).ok());
         })
         .ok()?;
-    rx.recv_timeout(LIVENESS_TIMEOUT).ok().flatten()
+    let probe = rx.recv_timeout(LIVENESS_TIMEOUT).ok().flatten()?;
+    report_page_notes(&probe);
+    Some(probe)
+}
+
+/// Write what the page reported into this shell's log, one line per note.
+///
+/// Separate from the judging path on purpose: this runs for its reader, and returns nothing the
+/// watchdog could act on. The frame count rides along on the first line so a stalled page's
+/// evidence — "frozen, and still waiting on N frames" — is one entry rather than two.
+fn report_page_notes(probe: &PageProbe) {
+    if probe.notes.is_empty() {
+        return;
+    }
+    harness::app_log(&format!(
+        "page: {} 条页面记录（挂起帧 {}，兜底 {}）",
+        probe.notes.len(),
+        probe.pending,
+        probe.frames.fallbacks
+    ));
+    for note in &probe.notes {
+        harness::app_log(&format!("page: {note}"));
+    }
 }
 
 /// Bumped every time the window is rebuilt, so an old watchdog can tell it lost its subject.

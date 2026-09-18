@@ -1477,3 +1477,297 @@ fn a_cleared_notice_stays_cleared() {
         "DeepSeek Harness"
     );
 }
+
+/// The diagnostics script runs on the same engines the compat layer exists for, and a second
+/// injection must not stack a second console wrapper (which would double every line).
+#[test]
+fn the_page_diagnostics_script_stays_es5_and_installs_once() {
+    let script = page_diagnostics_script();
+    for syntax in ["=>", "`", "??", "const ", "let ", "class "] {
+        assert!(
+            !script.contains(syntax),
+            "页面诊断必须保持 ES5，发现 {syntax:?}"
+        );
+    }
+    // The guard is read before anything is installed, so a replayed injection is a no-op.
+    assert!(script.contains("__dshPageNotes !== undefined"), "{script}");
+    // Both bounds come from the constants, not from numbers typed into the script.
+    assert!(script.contains(&PAGE_NOTE_LIMIT.to_string()), "{script}");
+    assert!(script.contains(&PAGE_NOTE_CHARS.to_string()), "{script}");
+    assert!(!script.contains("%LIMIT%"), "占位符必须被替换掉：{script}");
+    assert!(!script.contains("%CHARS%"), "占位符必须被替换掉：{script}");
+    // Capture phase: a subresource `error` event does not bubble, so the bubble phase would
+    // never see the one branch that reports a plugin bundle that failed to load.
+    assert!(
+        script.contains(r#"addEventListener("error", function (event) {"#),
+        "{script}"
+    );
+    assert!(
+        script.contains("}, true);"),
+        "error 监听必须走捕获阶段：{script}"
+    );
+
+    let probe = r#"
+      var calls = 0;
+      var stub = {
+        addEventListener: function () {},
+        console: { error: function () { calls += 1; }, warn: function () {} }
+      };
+      global.window = stub;
+      __SCRIPT__
+      var first = stub.console.error;
+      __SCRIPT__
+      stub.console.error("x");
+      process.stdout.write((stub.console.error === first ? "once" : "twice") + ":" + calls);
+    "#
+    .replace("__SCRIPT__", &script);
+    // One wrapper, and the original still ran exactly once underneath it.
+    assert_eq!(run_shim("", &probe), "once:1");
+}
+
+/// The whole point of the script: a fault inside the page has to survive as a line the shell can
+/// log. Run it in a real engine and drive each of the four sources.
+#[test]
+fn the_page_diagnostics_script_records_every_kind_of_page_fault() {
+    let probe = r#"
+      var listeners = {};
+      var printed = [];
+      var stub = {
+        performance: { now: function () { return 0; } },
+        addEventListener: function (type, fn) { listeners[type] = fn; },
+        console: {
+          error: function (m) { printed.push(m); },
+          warn: function (m) { printed.push(m); }
+        }
+      };
+      global.window = stub;
+      __SCRIPT__
+      listeners.error({ message: "boom", filename: "a.js", lineno: 7, error: { stack: "at f" } });
+      // A failed subresource arrives on the same event with no message at all.
+      listeners.error({ target: { src: "http://127.0.0.1:3080/plugin.js" } });
+      listeners.unhandledrejection({ reason: { message: "stream died", stack: "at g" } });
+      stub.console.error("[session-controller] control stream failed:", "closed");
+      stub.console.warn("degraded");
+      process.stdout.write(JSON.stringify({
+        notes: stub.__dshPageNotes,
+        passedThrough: printed
+      }));
+    "#
+    .replace("__SCRIPT__", &page_diagnostics_script());
+    let out = run_shim("", &probe);
+    // Each source is labelled, and the console wrapper still called the original first.
+    for expected in [
+        "error: boom @a.js:7 at f",
+        "resource: http://127.0.0.1:3080/plugin.js",
+        "rejection: stream died at g",
+        "error: [session-controller] control stream failed: closed",
+        "warn: degraded",
+    ] {
+        assert!(out.contains(expected), "缺少 {expected:?}：{out}");
+    }
+    assert!(
+        out.contains(
+            r#""passedThrough":["[session-controller] control stream failed:","degraded"]"#
+        ),
+        "原 console 实现必须照常执行：{out}"
+    );
+}
+
+/// A page erroring in a loop must not turn one probe's answer into an unbounded payload, and a
+/// single huge value must not carry a whole document into the log.
+#[test]
+fn the_page_diagnostics_ring_is_bounded_in_both_directions() {
+    let probe = r#"
+      var listeners = {};
+      var stub = {
+        performance: { now: function () { return 0; } },
+        addEventListener: function (type, fn) { listeners[type] = fn; },
+        console: { error: function () {}, warn: function () {} }
+      };
+      global.window = stub;
+      __SCRIPT__
+      for (var i = 0; i < %OVERFLOW%; i++) stub.console.error("line" + i);
+      var long = "";
+      for (var j = 0; j < 4000; j++) long += "x";
+      stub.console.error(long);
+      var notes = stub.__dshPageNotes;
+      process.stdout.write(JSON.stringify({
+        kept: notes.length,
+        oldest: notes[0],
+        longest: notes[notes.length - 1].length
+      }));
+    "#
+    .replace("__SCRIPT__", &page_diagnostics_script())
+    .replace("%OVERFLOW%", &(PAGE_NOTE_LIMIT + 10).to_string());
+    let out = run_shim("", &probe);
+    assert!(
+        out.contains(&format!(r#""kept":{PAGE_NOTE_LIMIT}"#)),
+        "环形缓冲必须封顶在 PAGE_NOTE_LIMIT：{out}"
+    );
+    // The oldest were dropped, not the newest. `+ 1` is the long note pushed after the loop, so
+    // the first survivor is however many the ring had to give up.
+    let dropped = PAGE_NOTE_LIMIT + 10 + 1 - PAGE_NOTE_LIMIT;
+    assert!(
+        out.contains(&format!(r#""oldest":"0ms error: line{dropped}""#)),
+        "丢的必须是最旧的：{out}"
+    );
+    // Truncation leaves the note a log line rather than a file: the 4000-character value comes
+    // back as the cap plus this script's own short prefix and ellipsis, never the whole thing.
+    let longest: usize = out
+        .split(r#""longest":"#)
+        .nth(1)
+        .and_then(|rest| rest.trim_end_matches('}').parse().ok())
+        .unwrap_or_else(|| panic!("探针必须报出最长记录长度：{out}"));
+    assert!(
+        longest > PAGE_NOTE_CHARS && longest < PAGE_NOTE_CHARS + 64,
+        "超长记录必须被截断到常量附近，实测 {longest}：{out}"
+    );
+}
+
+/// The probe carries the notes back and leaves the page's buffer empty, so no line is reported
+/// twice and an unprobed page cannot grow one without bound.
+#[test]
+fn the_frame_probe_drains_the_page_notes_and_reports_pending_frames() {
+    let probe = r#"
+      var stub = {
+        __dshPageNotes: ["0ms error: boom"],
+        __dshPendingFrames: 3,
+        document: { visibilityState: "visible" },
+        setTimeout: function (fn) { return 1; },
+        requestAnimationFrame: function () { return 1; }
+      };
+      global.window = stub;
+      var answer = __PROBE__;
+      process.stdout.write(JSON.stringify({
+        reported: answer.notes,
+        pending: answer.pending,
+        leftOnPage: stub.__dshPageNotes
+      }));
+    "#
+    .replace("__PROBE__", FRAME_PROBE.trim());
+    let out = run_shim("", &probe);
+    assert!(out.contains(r#""reported":["0ms error: boom"]"#), "{out}");
+    assert!(out.contains(r#""pending":3"#), "{out}");
+    assert!(
+        out.contains(r#""leftOnPage":[]"#),
+        "取走后页面不得再留一份：{out}"
+    );
+}
+
+/// A page with no diagnostics and no fallback still has to parse, and the counters the liveness
+/// policy judges must come out identical either way: the two new fields are log-only.
+#[test]
+fn page_notes_never_reach_the_liveness_verdict() {
+    let bare = r#"{"frames":5,"timers":9,"timersSeen":true,"hidden":false,"fallbacks":0}"#;
+    let rich = r#"{"frames":5,"timers":9,"timersSeen":true,"hidden":false,"fallbacks":0,
+                   "pending":7,"notes":["0ms error: boom"]}"#;
+    let bare: PageProbe = serde_json::from_str(bare).expect("旧页面的载荷必须仍能解析");
+    let rich: PageProbe = serde_json::from_str(rich).expect("新载荷必须能解析");
+    assert_eq!(bare.frames, rich.frames);
+    // A page that cannot count pending frames reads as "unknown", never as zero.
+    assert_eq!(bare.pending, -1);
+    assert!(bare.notes.is_empty());
+    assert_eq!(rich.pending, 7);
+    assert_eq!(rich.notes, vec!["0ms error: boom".to_string()]);
+    // The verdict is computed from `frames` alone, so both answers judge the same.
+    let previous = Frames {
+        frames: 5,
+        timers: 4,
+        timers_seen: true,
+        ..Frames::default()
+    };
+    assert_eq!(
+        judge_frames(Some(bare.frames), Some(previous)),
+        judge_frames(Some(rich.frames), Some(previous))
+    );
+}
+
+/// The guard runs on the same engines the compat layer exists for, and a replayed injection must
+/// not stack a second listener.
+#[test]
+fn the_menu_focus_guard_stays_es5_and_installs_once() {
+    let script = menu_focus_guard_script();
+    for syntax in ["=>", "`", "??", "const ", "let ", "class "] {
+        assert!(
+            !script.contains(syntax),
+            "菜单焦点守卫必须保持 ES5，发现 {syntax:?}"
+        );
+    }
+    assert!(script.contains("__dshMenuFocusGuard === true"), "{script}");
+    // Capture phase is load-bearing: it has to beat the page's own mousedown handling.
+    assert!(script.contains("}, true);"), "必须走捕获阶段：{script}");
+    // The fix is suppressing the default action, never moving the focus: focusing the pressed row
+    // is what broke the first pane (see the constant's doc comment).
+    assert!(script.contains("event.preventDefault();"), "{script}");
+    assert!(
+        !script.contains(".focus("),
+        "守卫不得自己搬动焦点：{script}"
+    );
+
+    let probe = r#"
+      var added = 0;
+      var stub = { document: { addEventListener: function () { added += 1; } } };
+      global.window = stub;
+      __SCRIPT__
+      __SCRIPT__
+      process.stdout.write(String(added));
+    "#
+    .replace("__SCRIPT__", &script);
+    assert_eq!(run_shim("", &probe), "1");
+}
+
+/// The bug this exists for, driven in a real engine against the shape of the real markup: a press
+/// inside the popup must suppress its default action (so WebKit blurs nothing and the popup stays
+/// mounted long enough for the click), and everything outside a popup must be left alone.
+#[test]
+fn a_press_inside_a_menu_popup_leaves_the_focus_alone() {
+    let dom = r#"
+      var listeners = [];
+      function node(role, parent, extra) {
+        var self = {
+          nodeType: 1,
+          parentNode: parent === undefined ? null : parent,
+          tagName: (extra && extra.tagName) || "BUTTON",
+          getAttribute: function (name) { return name === "role" ? role : null; }
+        };
+        if (extra && extra.contentEditable) self.isContentEditable = true;
+        return self;
+      }
+      var stub = {
+        document: {
+          addEventListener: function (type, fn) { listeners.push({ type: type, fn: fn }); }
+        }
+      };
+      global.window = stub;
+    "#;
+    let drive = r#"
+      var press = function (target, options) {
+        var event = { button: 0, defaultPrevented: false, target: target, prevented: false };
+        event.preventDefault = function () { event.prevented = true; };
+        if (options) for (var key in options) event[key] = options[key];
+        for (var i = 0; i < listeners.length; i++) {
+          if (listeners[i].type === "mousedown") listeners[i].fn(event);
+        }
+        return event.prevented ? "held" : "released";
+      };
+      var out = [];
+      // The real markup: role="menu" popup > role="menuitem" button > <span> label.
+      var menu = node("menu");
+      var row = node("menuitem", menu);
+      out.push(press(node(null, row, { tagName: "SPAN" })));
+      // The composer around it must keep behaving normally.
+      out.push(press(node(null, node(null, null, { tagName: "DIV" }), { tagName: "BUTTON" })));
+      // A filter field inside a popup owns the caret: the guard must not take it.
+      out.push(press(node(null, node("listbox"), { tagName: "INPUT" })));
+      out.push(press(node(null, node("menu"), { contentEditable: true, tagName: "DIV" })));
+      // Secondary button and an already-handled press.
+      out.push(press(row, { button: 2 }));
+      out.push(press(row, { defaultPrevented: true }));
+      process.stdout.write(out.join(","));
+    "#;
+    let script = format!("{dom}\n{guard}\n{drive}", guard = menu_focus_guard_script());
+    assert_eq!(
+        run_shim("", &script),
+        "held,released,released,released,released,released"
+    );
+}

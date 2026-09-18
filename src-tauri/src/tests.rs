@@ -788,3 +788,99 @@ fn only_a_clear_field_lets_the_staged_tree_be_committed() {
     assert!(swap_blocked(false, false, true));
     assert!(swap_blocked(true, true, true));
 }
+
+/// The three injected scripts are independently switchable, and each appears at most once: a
+/// duplicate console wrapper would double every diagnostic line, and a duplicate rAF wrapper
+/// would deliver every frame twice.
+#[test]
+fn each_injected_script_follows_its_own_switch() {
+    let data_dir = test_dir("harness-scripts");
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let base = Config::load(&data_dir);
+
+    let all = harness_scripts(&Config {
+        render_fallback: true,
+        page_diagnostics: true,
+        keep_menu_focus: true,
+        ..base.clone()
+    });
+    let fallback = all
+        .iter()
+        .filter(|s| s.contains("__dshRafFallback"))
+        .count();
+    let diagnostics = all.iter().filter(|s| s.contains("__dshPageNotes")).count();
+    let menu = all
+        .iter()
+        .filter(|s| s.contains("__dshMenuFocusGuard"))
+        .count();
+    assert_eq!(fallback, 1, "渲染兜底只能注入一份：{all:?}");
+    assert_eq!(diagnostics, 1, "页面诊断只能注入一份：{all:?}");
+    assert_eq!(menu, 1, "菜单补焦点只能注入一份：{all:?}");
+    // Diagnostics observe a page the other layers have finished setting up.
+    let order = |needle: &str| all.iter().position(|s| s.contains(needle));
+    assert!(
+        order("__dshPageNotes") > order("__dshRafFallback"),
+        "{all:?}"
+    );
+
+    let off = harness_scripts(&Config {
+        render_fallback: false,
+        page_diagnostics: false,
+        keep_menu_focus: false,
+        ..base.clone()
+    });
+    assert!(
+        !off.iter().any(|s| s.contains("__dshRafFallback")),
+        "{off:?}"
+    );
+    assert!(!off.iter().any(|s| s.contains("__dshPageNotes")), "{off:?}");
+    assert!(
+        !off.iter().any(|s| s.contains("__dshMenuFocusGuard")),
+        "{off:?}"
+    );
+
+    // One off, one on: no switch may carry another.
+    let only_diagnostics = harness_scripts(&Config {
+        render_fallback: false,
+        page_diagnostics: true,
+        keep_menu_focus: false,
+        ..base
+    });
+    assert!(
+        !only_diagnostics
+            .iter()
+            .any(|s| s.contains("__dshRafFallback")),
+        "{only_diagnostics:?}"
+    );
+    assert!(
+        only_diagnostics
+            .iter()
+            .any(|s| s.contains("__dshPageNotes")),
+        "{only_diagnostics:?}"
+    );
+    assert!(
+        !only_diagnostics
+            .iter()
+            .any(|s| s.contains("__dshMenuFocusGuard")),
+        "{only_diagnostics:?}"
+    );
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// The switch is on by default, and a config file written before it existed must not read as off:
+/// a missing key is what every installed machine has right now.
+#[test]
+fn page_diagnostics_defaults_on_for_a_config_that_predates_it() {
+    let older = r#"{"port":3080,"workspace":"/tmp","dsh_home":null,"system_updates":"install"}"#;
+    let config: Config = serde_json::from_str(older).expect("旧配置必须仍能解析");
+    assert!(config.page_diagnostics);
+    assert!(config.keep_menu_focus);
+    assert!(config.render_fallback);
+    assert!(config.webkit_compat);
+
+    let off =
+        r#"{"port":3080,"workspace":"/tmp","page_diagnostics":false,"keep_menu_focus":false}"#;
+    let config: Config = serde_json::from_str(off).expect("显式关闭必须能解析");
+    assert!(!config.page_diagnostics);
+    assert!(!config.keep_menu_focus);
+}

@@ -148,9 +148,31 @@ pub struct Config {
     /// behaviour, for comparing against it or for a page the wrapper disagrees with.
     #[serde(default = "default_render_fallback")]
     pub render_fallback: bool,
+    /// Carry what the Harness page reports about itself — uncaught errors, rejected promises and
+    /// the two console levels that carry failures — back into this shell's log (see
+    /// `window::PAGE_DIAGNOSTICS_SCRIPT`). On by default: the window has no console, and every
+    /// WebView-only fault in this repo's history has otherwise cost a round trip asking the user
+    /// to reproduce it under an attached inspector. It only observes; off removes the script.
+    #[serde(default = "default_page_diagnostics")]
+    pub page_diagnostics: bool,
+    /// Hold the focus still while a menu popup is clicked, which WebKit does not do on its own
+    /// (see `window::MENU_FOCUS_GUARD_SCRIPT`). On by default: without it the dsh model and
+    /// reasoning pickers close without selecting anything, because the popup unmounts before the
+    /// `click` reaches it. This is the one shim here that changes page *behaviour* rather than
+    /// filling in a missing API, so it has its own switch — off restores the engine's own.
+    #[serde(default = "default_keep_menu_focus")]
+    pub keep_menu_focus: bool,
 }
 
 fn default_render_fallback() -> bool {
+    true
+}
+
+fn default_page_diagnostics() -> bool {
+    true
+}
+
+fn default_keep_menu_focus() -> bool {
     true
 }
 
@@ -329,6 +351,8 @@ impl Config {
             auto_update_plugins: false,
             webkit_compat: default_webkit_compat(),
             render_fallback: default_render_fallback(),
+            page_diagnostics: default_page_diagnostics(),
+            keep_menu_focus: default_keep_menu_focus(),
         };
         // The same repair a loaded file gets, so the value seeded here is already usable
         // (a `HOME` that is relative or gone would otherwise become the workspace).
@@ -2499,6 +2523,14 @@ fn harness_scripts(config: &Config) -> Vec<String> {
     }
     if config.render_fallback {
         scripts.push(window::render_fallback_script());
+    }
+    if config.keep_menu_focus {
+        scripts.push(window::menu_focus_guard_script());
+    }
+    // Last, so it observes a page the others have already finished setting up — and so a fault
+    // in the diagnostics never precedes the layer it would be reporting about.
+    if config.page_diagnostics {
+        scripts.push(window::page_diagnostics_script());
     }
     scripts
 }
