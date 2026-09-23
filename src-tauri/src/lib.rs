@@ -162,6 +162,18 @@ pub struct Config {
     /// filling in a missing API, so it has its own switch — off restores the engine's own.
     #[serde(default = "default_keep_menu_focus")]
     pub keep_menu_focus: bool,
+    /// Stand in for the scroll anchoring WebKit never implemented (see
+    /// `window::SCROLL_ANCHOR_SCRIPT`). On by default: without it a conversation whose content
+    /// above the reader changes height — expanding a reasoning block in dsh 0.1.7 does exactly
+    /// that — throws the viewport by that height on WebKit, which is the reported flicker, while
+    /// Chromium and Gecko compensate natively and never show it. Off restores the engine's own
+    /// behaviour, for comparing against it or for a page the shim disagrees with.
+    #[serde(default = "default_scroll_anchor")]
+    pub scroll_anchor: bool,
+}
+
+fn default_scroll_anchor() -> bool {
+    true
 }
 
 fn default_render_fallback() -> bool {
@@ -353,6 +365,7 @@ impl Config {
             render_fallback: default_render_fallback(),
             page_diagnostics: default_page_diagnostics(),
             keep_menu_focus: default_keep_menu_focus(),
+            scroll_anchor: default_scroll_anchor(),
         };
         // The same repair a loaded file gets, so the value seeded here is already usable
         // (a `HOME` that is relative or gone would otherwise become the workspace).
@@ -2526,6 +2539,11 @@ fn harness_scripts(config: &Config) -> Vec<String> {
     }
     if config.keep_menu_focus {
         scripts.push(window::menu_focus_guard_script());
+    }
+    // The anchor shim observes layout in the same conversation the guard's presses land in, and it
+    // reads only geometry; it is independent of the two above and of the diagnostics below.
+    if config.scroll_anchor {
+        scripts.push(window::scroll_anchor_script());
     }
     // Last, so it observes a page the others have already finished setting up — and so a fault
     // in the diagnostics never precedes the layer it would be reporting about.

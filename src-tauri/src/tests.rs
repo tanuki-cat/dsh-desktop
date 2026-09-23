@@ -802,6 +802,7 @@ fn each_injected_script_follows_its_own_switch() {
         render_fallback: true,
         page_diagnostics: true,
         keep_menu_focus: true,
+        scroll_anchor: true,
         ..base.clone()
     });
     let fallback = all
@@ -813,9 +814,14 @@ fn each_injected_script_follows_its_own_switch() {
         .iter()
         .filter(|s| s.contains("__dshMenuFocusGuard"))
         .count();
+    let anchor = all
+        .iter()
+        .filter(|s| s.contains("__dshScrollAnchor"))
+        .count();
     assert_eq!(fallback, 1, "渲染兜底只能注入一份：{all:?}");
     assert_eq!(diagnostics, 1, "页面诊断只能注入一份：{all:?}");
     assert_eq!(menu, 1, "菜单补焦点只能注入一份：{all:?}");
+    assert_eq!(anchor, 1, "滚动锚定只能注入一份：{all:?}");
     // Diagnostics observe a page the other layers have finished setting up.
     let order = |needle: &str| all.iter().position(|s| s.contains(needle));
     assert!(
@@ -827,6 +833,7 @@ fn each_injected_script_follows_its_own_switch() {
         render_fallback: false,
         page_diagnostics: false,
         keep_menu_focus: false,
+        scroll_anchor: false,
         ..base.clone()
     });
     assert!(
@@ -838,12 +845,17 @@ fn each_injected_script_follows_its_own_switch() {
         !off.iter().any(|s| s.contains("__dshMenuFocusGuard")),
         "{off:?}"
     );
+    assert!(
+        !off.iter().any(|s| s.contains("__dshScrollAnchor")),
+        "{off:?}"
+    );
 
     // One off, one on: no switch may carry another.
     let only_diagnostics = harness_scripts(&Config {
         render_fallback: false,
         page_diagnostics: true,
         keep_menu_focus: false,
+        scroll_anchor: false,
         ..base
     });
     assert!(
@@ -864,6 +876,12 @@ fn each_injected_script_follows_its_own_switch() {
             .any(|s| s.contains("__dshMenuFocusGuard")),
         "{only_diagnostics:?}"
     );
+    assert!(
+        !only_diagnostics
+            .iter()
+            .any(|s| s.contains("__dshScrollAnchor")),
+        "{only_diagnostics:?}"
+    );
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
@@ -877,10 +895,16 @@ fn page_diagnostics_defaults_on_for_a_config_that_predates_it() {
     assert!(config.keep_menu_focus);
     assert!(config.render_fallback);
     assert!(config.webkit_compat);
+    assert!(config.scroll_anchor);
 
     let off =
         r#"{"port":3080,"workspace":"/tmp","page_diagnostics":false,"keep_menu_focus":false}"#;
     let config: Config = serde_json::from_str(off).expect("显式关闭必须能解析");
     assert!(!config.page_diagnostics);
     assert!(!config.keep_menu_focus);
+
+    let no_anchor = r#"{"port":3080,"workspace":"/tmp","scroll_anchor":false}"#;
+    let config: Config = serde_json::from_str(no_anchor).expect("显式关闭必须能解析");
+    assert!(!config.scroll_anchor, "scroll_anchor 必须能被显式关掉");
+    assert!(config.render_fallback, "关掉一个开关不得带走另一个");
 }

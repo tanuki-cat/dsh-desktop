@@ -1771,3 +1771,363 @@ fn a_press_inside_a_menu_popup_leaves_the_focus_alone() {
         "held,released,released,released,released,released"
     );
 }
+
+/// The anchor shim runs on the same engines the compat layer exists for, and a replayed injection
+/// must not stack a second observer.
+#[test]
+fn the_scroll_anchor_shim_stays_es5_and_installs_once() {
+    let script = scroll_anchor_script();
+    for syntax in ["=>", "`", "??", "const ", "let ", "class "] {
+        assert!(
+            !script.contains(syntax),
+            "滚动锚定垫片必须保持 ES5，发现 {syntax:?}"
+        );
+    }
+    assert!(script.contains("__dshScrollAnchor === true"), "{script}");
+
+    let probe = r#"
+      var observers = 0;
+      var rows = [];
+      for (var i = 0; i < 8; i++) {
+        rows.push({ getBoundingClientRect: function () { return { top: i * 40, bottom: i * 40 + 40, height: 40 }; } });
+      }
+      var box = {
+        isConnected: true, firstElementChild: { children: rows }, children: rows,
+        clientHeight: 200, scrollHeight: 320, scrollTop: 0,
+        getBoundingClientRect: function () { return { top: 0, bottom: 200, height: 200 }; },
+        querySelectorAll: function () { return rows; },
+        addEventListener: function () {}, removeEventListener: function () {}
+      };
+      global.window = {
+        navigator: { userAgent: "AppleWebKit/605.1.15 (KHTML, like Gecko)" },
+        document: { querySelector: function (s) { return s === "[data-conversation-scroll]" ? box : null; }, body: {} },
+        ResizeObserver: function () { observers += 1; },
+        setInterval: function () { return 1; }, clearInterval: function () {},
+        getComputedStyle: function () { return { overflowY: "auto" }; }
+      };
+      global.window.ResizeObserver.prototype.observe = function () {};
+      global.window.ResizeObserver.prototype.disconnect = function () {};
+      __SCRIPT__
+      __SCRIPT__
+      process.stdout.write(String(observers));
+    "#
+    .replace("__SCRIPT__", &script);
+    assert_eq!(run_shim("", &probe), "1", "重复注入不得叠加观察者");
+}
+
+/// The engines that already anchor must be left alone. `CSS.supports("overflow-anchor", "none")`
+/// answers true on WebKit, which implements the property and not the behaviour, so a feature test
+/// would install a second compensator on top of Chromium's own — measured 2026-09-22: Chromium
+/// compensates a 100 px insertion above the viewport by 100 px of `scrollTop`, and a second
+/// correction on top of that would double the jump.
+#[test]
+fn the_scroll_anchor_shim_only_installs_where_the_engine_cannot_anchor() {
+    let script = scroll_anchor_script();
+    let probe = r#"
+      function stub(ua) {
+        var observers = 0;
+        var box = {
+          isConnected: true, firstElementChild: { children: [] }, children: [],
+          clientHeight: 200, scrollHeight: 320, scrollTop: 0,
+          getBoundingClientRect: function () { return { top: 0, bottom: 200, height: 200 }; },
+          querySelectorAll: function () { return []; },
+          addEventListener: function () {}, removeEventListener: function () {}
+        };
+        var w = {
+          navigator: { userAgent: ua },
+          document: { querySelector: function (s) { return s === "[data-conversation-scroll]" ? box : null; }, body: {} },
+          ResizeObserver: function () { observers += 1; },
+          setInterval: function () { return 1; }, clearInterval: function () {},
+          getComputedStyle: function () { return { overflowY: "auto" }; }
+        };
+        w.ResizeObserver.prototype.observe = function () {};
+        w.ResizeObserver.prototype.disconnect = function () {};
+        return w;
+      }
+      var out = [];
+      var uas = [
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)",
+        "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 (KHTML, like Gecko) Edg/153.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; rv:156.0) Gecko/20100101 Firefox/156.0"
+      ];
+      // The shim reads the global `window`, exactly as an injected script does in the page.
+      for (var i = 0; i < uas.length; i++) {
+        global.window = stub(uas[i]);
+        __SCRIPT__
+        out.push(global.window.__dshScrollAnchorActive === true ? "on" : "off");
+      }
+      process.stdout.write(out.join(","));
+    "#
+    .replace("__SCRIPT__", &script);
+    // Safari anchors nothing; Chrome, Edge and Firefox anchor natively. Gecko has no AppleWebKit
+    // token at all, which is the same answer by a different route.
+    assert_eq!(run_shim("", &probe), "on,off,off,off");
+}
+
+/// The bug this exists for, driven in a real engine against a scroll port with real arithmetic:
+/// content inserted **above** the reader changes every following row's position, and the row the
+/// reader was looking at has to stay where it was on screen.
+///
+/// The mutation that must break this is compensating by a re-chosen anchor instead of the
+/// remembered one: after the insertion the topmost row of the port is a different row, so choosing
+/// again compares two different rows and concludes nothing moved.
+#[test]
+fn inserted_content_above_the_reader_does_not_move_the_viewport() {
+    let dom = r#"
+      var scrollListeners = [];
+      var ROW_H = 40.5;
+      var COUNT = 20;
+      // Document coordinates, the only model in which an insertion above the viewport is
+      // self-consistent: a row's screen position is its document position minus the scroll offset,
+      // so adding height moves every row below it and nothing else. Patching rectangles instead
+      // lets rows overlap, which no layout does.
+      var docTops = [];
+      for (var d = 0; d < COUNT; d++) docTops.push(d * 40);
+      var state = { scrollTop: 0 };
+      function rowAt(index) {
+        return {
+          index: index,
+          getBoundingClientRect: function () {
+            var top = docTops[index] - state.scrollTop;
+            return { top: top, bottom: top + ROW_H, height: ROW_H };
+          }
+        };
+      }
+      var rows = [];
+      for (var r = 0; r < COUNT; r++) rows.push(rowAt(r));
+      // What the page does to lay out an expansion: the block AT `blockIndex` changes height, so
+      // that block's own top stays put and every row AFTER it moves. Rows before it do not move,
+      // and the block itself is not the row being watched — an expansion is only visible as a jump
+      // to a reader who is looking at something below it.
+      function splice(blockIndex, by) {
+        for (var i = blockIndex + 1; i < COUNT; i++) docTops[i] += by;
+      }
+      var box = {
+        isConnected: true, firstElementChild: { children: rows }, children: rows,
+        clientHeight: 200,
+        get scrollHeight() { return docTops[COUNT - 1] + ROW_H; },
+        get scrollTop() { return state.scrollTop; },
+        // Truncated on the way in, exactly as WebKit stores it (measured 2026-09-22: writing
+        // 502.5 reads back 502). A shim that trusted the value it asked for would hold a position
+        // the scroller is not at, which is the real-engine bug this stub exists to catch.
+        set scrollTop(v) {
+          var stored = Math.trunc(v);
+          var moved = stored !== state.scrollTop;
+          state.scrollTop = stored;
+          if (moved) for (var k = 0; k < scrollListeners.length; k++) scrollListeners[k]({});
+        },
+        getBoundingClientRect: function () { return { top: 0, bottom: 200, height: 200 }; },
+        querySelectorAll: function () { return rows; },
+        addEventListener: function (type, fn) { if (type === "scroll") scrollListeners.push(fn); },
+        removeEventListener: function (type, fn) {
+          if (type !== "scroll") return;
+          var i = scrollListeners.indexOf(fn);
+          if (i >= 0) scrollListeners.splice(i, 1);
+        }
+      };
+      var env = { box: box, rows: rows, state: state, splice: splice, docTops: docTops };
+      var observers = [];
+      global.window = {
+        navigator: { userAgent: "AppleWebKit/605.1.15 (KHTML, like Gecko)" },
+        document: { querySelector: function (s) { return s === "[data-conversation-scroll]" ? box : null; }, body: {} },
+        ResizeObserver: function (cb) { observers.push(cb); },
+        setInterval: function () { return 1; }, clearInterval: function () {},
+        getComputedStyle: function () { return { overflowY: "auto" }; }
+      };
+      global.window.ResizeObserver.prototype.observe = function () {};
+      global.window.ResizeObserver.prototype.disconnect = function () {};
+      global.env = env;
+      global.fire = function () { for (var i = 0; i < observers.length; i++) observers[i]([]); };
+    "#;
+    let drive = r#"
+      __SCRIPT__
+      var env = global.env, fire = global.fire;
+      var out = {};
+      env.box.scrollTop = 300;               // the reader is mid-conversation
+      fire();                                // settle the snapshot on the row in view
+      // At scrollTop 300 the port covers document 300..500; row 7 starts at 280 and only crosses
+      // the top edge, so the anchor is row 8 (document 320, screen 20). The block that expands is
+      // row 4, above the reader — which is where an expansion has to be to move what they see.
+      var watched = env.rows[8];
+      var before = watched.getBoundingClientRect().top;
+
+      // 1) The block above the reader COLLAPSES by a half pixel (real geometry does): every row
+      //    below it moves up, so without a correction the reader's row leaves the top of the
+      //    viewport — the flicker. This is also the direction that separates the two
+      //    implementations: re-choosing an anchor here picks a *different* row (one the collapse
+      //    moved, whose offset by then already matches), so a re-chosen anchor concludes that
+      //    nothing moved and leaves the reader 120 px down the page.
+      env.splice(4, -120.5);
+      fire();
+      out.collapsedTop = watched.getBoundingClientRect().top;
+      out.collapsedScrollTop = env.state.scrollTop;
+      fire();
+      out.collapsedTwice = watched.getBoundingClientRect().top;
+
+      // 2) It expands again: the same correction in the other direction, back to the geometry the
+      //    reader started from. Repeating matters — a shim that lost track of which row it was
+      //    watching on the first correction passes step 1 and fails here.
+      env.splice(4, 120.5);
+      fire();
+      out.restoredTop = watched.getBoundingClientRect().top;
+      out.restoredScrollTop = env.state.scrollTop;
+
+      out.before = before;
+      process.stdout.write(JSON.stringify(out));
+    "#
+    .replace("__SCRIPT__", &scroll_anchor_script());
+    let script = format!("{dom}\n{drive}");
+    let out = run_shim("", &script);
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("读数必须是 JSON");
+    let number = |key: &str| {
+        parsed[key]
+            .as_f64()
+            .unwrap_or_else(|| panic!("缺少 {key}：{out}"))
+    };
+    let before = number("before");
+    assert!(
+        (number("collapsedTop") - before).abs() < 1.5,
+        "上方收起后，读者正在看的行必须留在原处：{out}"
+    );
+    assert!(
+        (number("restoredTop") - before).abs() < 1.5,
+        "再次展开后同样必须留在原处：{out}"
+    );
+    assert!(
+        (number("collapsedTwice") - number("collapsedTop")).abs() < 1.5,
+        "第二次回调不得再补一次：{out}"
+    );
+    // 120.5 px of content above came and went, so the offset moved by that much each way. The
+    // tolerance absorbs the engine's whole-pixel truncation, which is what makes this catch a
+    // shim that remembered the offset it asked for instead of the one it got.
+    assert!(
+        (number("collapsedScrollTop") - 179.0).abs() < 1.5,
+        "收起必须按插入高度反向补偿：{out}"
+    );
+    assert!(
+        (number("restoredScrollTop") - 299.0).abs() < 1.5,
+        "展开必须按插入高度正向补偿：{out}"
+    );
+}
+
+/// Two states belong to the page, not to the shim: following the tail (`followTail` already scrolls
+/// to the bottom on every layout change) and a reader sitting at the bottom. Compensating either
+/// would fight a scroll the page is making. Reader scrolling alone is also never compensated — it
+/// moves the reader without moving the layout, so the snapshot is renewed rather than spent.
+#[test]
+fn the_scroll_anchor_shim_leaves_the_page_and_the_reader_alone() {
+    let dom = r#"
+      var scrollListeners = [];
+      var opts = { following: false };
+      var tops = [];
+      for (var i = 0; i < 20; i++) tops.push(i * 40);
+      var state = { scrollTop: 0 };
+      function rowAt(index) {
+        return {
+          index: index,
+          // Half-pixel rows, like the real conversation (measured anchor top 502.5 at dpr 2).
+          getBoundingClientRect: function () {
+            var top = tops[index] - state.scrollTop;
+            return { top: top, bottom: top + 40.5, height: 40.5 };
+          }
+        };
+      }
+      var rows = [];
+      for (var j = 0; j < tops.length; j++) rows.push(rowAt(j));
+      var box = {
+        isConnected: true, firstElementChild: { children: rows }, children: rows,
+        clientHeight: 200,
+        get scrollHeight() { return tops[tops.length - 1] + 40; },
+        get scrollTop() { return state.scrollTop; },
+        set scrollTop(v) {
+          var moved = v !== state.scrollTop;
+          state.scrollTop = v;
+          if (moved) for (var k = 0; k < scrollListeners.length; k++) scrollListeners[k]({});
+        },
+        getBoundingClientRect: function () { return { top: 0, bottom: 200, height: 200 }; },
+        querySelectorAll: function () { return rows; },
+        addEventListener: function (type, fn) { if (type === "scroll") scrollListeners.push(fn); },
+        removeEventListener: function () {},
+      };
+      var observers = [];
+      global.window = {
+        navigator: { userAgent: "AppleWebKit/605.1.15 (KHTML, like Gecko)" },
+        document: {
+          querySelector: function (s) {
+            if (s === "[data-conversation-scroll]") return box;
+            if (s === "[data-chat-following-tail]") return opts.following ? {} : null;
+            return null;
+          }, body: {}
+        },
+        ResizeObserver: function (cb) { observers.push(cb); },
+        setInterval: function () { return 1; }, clearInterval: function () {},
+        getComputedStyle: function () { return { overflowY: "auto" }; }
+      };
+      global.window.ResizeObserver.prototype.observe = function () {};
+      global.window.ResizeObserver.prototype.disconnect = function () {};
+      global.env = { box: box, rows: rows, state: state, opts: opts, tops: tops };
+      global.fire = function () { for (var i = 0; i < observers.length; i++) observers[i]([]); };
+    "#;
+    let drive = r#"
+      __SCRIPT__
+      var env = global.env, fire = global.fire;
+      var out = [];
+
+      // 1) Following the tail: the page is scrolling to the bottom itself, so a layout change is
+      //    the shim's business only to re-snapshot. The shift is applied to the watched rows, not
+      //    below them, so a compensator that ignored the flag would move the offset here.
+      env.opts.following = true;
+      env.box.scrollTop = 200;
+      fire();
+      var held = env.state.scrollTop;
+      var anchorRow = null;
+      for (var a = 0; a < env.rows.length; a++) {
+        var rect = env.rows[a].getBoundingClientRect();
+        if (rect.top >= -1 && rect.top < 200) { anchorRow = env.rows[a]; break; }
+      }
+      for (var i = 0; i < env.rows.length; i++) if (i >= 5) (function (row) {
+        if (!row.__base) row.__base = row.getBoundingClientRect;
+        row.getBoundingClientRect = function () {
+          var r = row.__base.call(row); return { top: r.top + 60, bottom: r.bottom + 60, height: r.height };
+        };
+      })(env.rows[i]);
+      fire();
+      out.push(env.state.scrollTop === held ? "tail-held" : "tail-moved:" + env.state.scrollTop);
+
+      // 2) A reader at the very bottom asked for the bottom, so a layout change is left alone even
+      //    with the tail flag off. The rows move again, so a compensator that ignored this would
+      //    visibly move the offset.
+      env.opts.following = false;
+      env.box.scrollTop = env.box.scrollHeight - env.box.clientHeight;
+      fire();
+      var bottom = env.state.scrollTop;
+      for (var b = 0; b < env.rows.length; b++) if (b >= 5) (function (row) {
+        if (!row.__base) row.__base = row.getBoundingClientRect;
+        var previous = row.__shift || 60;
+        row.__shift = previous + 60;
+        row.getBoundingClientRect = function () {
+          var r = row.__base.call(row); return { top: r.top + row.__shift, bottom: r.bottom + row.__shift, height: r.height };
+        };
+      })(env.rows[b]);
+      fire();
+      out.push(env.state.scrollTop === bottom ? "bottom-held" : "bottom-moved:" + env.state.scrollTop);
+
+      // 3) Scrolling alone must survive a following layout callback: the reader moved, the layout
+      //    did not, and compensating here would cancel the gesture.
+      env.box.scrollTop = 120;
+      fire();
+      env.box.scrollTop = 260;
+      fire();
+      out.push(env.state.scrollTop === 260 ? "reader-kept" : "reader-moved:" + env.state.scrollTop);
+
+      process.stdout.write(out.join(","));
+    "#
+    .replace("__SCRIPT__", &scroll_anchor_script());
+    let script = format!("{dom}\n{drive}");
+    assert_eq!(
+        run_shim("", &script),
+        "tail-held,bottom-held,reader-kept",
+        "跟尾、贴底与读者滚动都必须留给页面"
+    );
+}

@@ -1244,6 +1244,240 @@ pub fn menu_focus_guard_script() -> String {
     MENU_FOCUS_GUARD_SCRIPT.to_string()
 }
 
+/// Give the conversation back the scroll anchoring WebKit never implemented.
+///
+/// **The gap.** WebKit has no CSS scroll anchoring at all — the feature is absent from every
+/// Safari release up to 27 (WebKit bug 171099), while Chromium and Gecko have shipped it for
+/// years. Its absence is invisible until content *above* the reader changes height, and then the
+/// reader is thrown by exactly that much: measured 2026-09-22 on macOS 27, growing a block above
+/// the scroll port by 200 px moved the target 200 px down the screen with no compensation at all.
+///
+/// **Why it surfaced with dsh 0.1.7.** That release reworked the conversation around an anchoring
+/// assumption it states outright: the browser's own anchoring is disabled only while the view is
+/// following the tail, and is relied on everywhere else. Expanding a reasoning block then changes
+/// height in a single layout — `contain: size layout` is dropped, a sticky header appears, and the
+/// whole Markdown body mounts for the first time — and on WebKit nothing holds the viewport while
+/// that happens. The page looks blank for a frame and the tail-follow pulls it back: the reported
+/// flicker. In the browser this cannot reproduce, because there the engine does the compensating.
+///
+/// **The shim.** Remember the row the reader is looking at, and when layout changes move the
+/// scroll offset by exactly the distance that row moved — the correction the engine would have
+/// made. The resize observer fires after layout and before paint, so the stale position is never
+/// painted. Two states are deliberately left to the page: following the tail (`followTail` is
+/// already scrolling to the bottom every frame) and sitting at the bottom (the reader asked for
+/// the bottom). Reader scrolling renews the snapshot instead of spending it, or the shim would
+/// fight the very gesture it is meant to preserve.
+///
+/// **Engine-gated on the user agent, not a feature test.** `CSS.supports("overflow-anchor",
+/// "none")` answers `true` on WebKit, which implements the property and not the behaviour, so a
+/// feature test would install a second compensator on top of engines that already anchor —
+/// Chromium measured here compensates a 100 px insertion by 0 px of `scrollTop` and 0 px of
+/// movement. The UA gate keeps this to the engines that need it (measured 2026-09-22).
+///
+/// ES5 on purpose, like every other injected script: it runs on the engines those exist for.
+const SCROLL_ANCHOR_SCRIPT: &str = r#"
+(function () {
+  var w = window;
+  if (w.__dshScrollAnchor === true) return;
+  w.__dshScrollAnchor = true;
+  // WebKit answers true to a feature test for overflow-anchor while its scroller does not
+  // compensate at all, so the engine gate has to be the user agent. Chromium and Gecko implement
+  // the real thing and are left alone rather than compensated a second time.
+  var ua = "";
+  try { ua = String((w.navigator && w.navigator.userAgent) || ""); } catch (error) { ua = ""; }
+  var webkit = ua.indexOf("AppleWebKit") !== -1;
+  var chromium = ua.indexOf("Chrome") !== -1 || ua.indexOf("Chromium") !== -1 || ua.indexOf("Edg/") !== -1;
+  if (!webkit || chromium) return;
+  if (!w.document || typeof w.document.querySelector !== "function") return;
+
+  var SCROLLER = "[data-conversation-scroll]";
+  var ROW = "[data-disclosure-row]";
+  var FLOW = "[data-chat-flow-key]";
+  var TAIL = "[data-chat-following-tail]";
+  var BOTTOM_EPS = 8;
+  var EDGE_EPS = 1;
+  var SETTLE_MS = 100;
+  var SETTLE_TRIES = 120;
+
+  var box = null;
+  var content = null;
+  var watcher = null;
+  var anchor = null;
+  var offset = 0;
+  var scrollTop = 0;
+
+  var pickScroller = function () {
+    var found = null;
+    try { found = w.document.querySelector(SCROLLER); } catch (error) { found = null; }
+    if (found) return found;
+    // A host that renamed the hook still has a scrollable ancestor above its conversation rows.
+    var node = null;
+    try { node = w.document.querySelector(ROW); } catch (error2) { node = null; }
+    while (node && node !== w.document.body && node.parentNode) {
+      var style = null;
+      try { style = w.getComputedStyle ? w.getComputedStyle(node) : null; } catch (error3) { style = null; }
+      if (style && (style.overflowY === "auto" || style.overflowY === "scroll")
+          && node.scrollHeight > node.clientHeight + 4) return node;
+      node = node.parentNode;
+    }
+    return null;
+  };
+
+  // The single column every row lives in: its height is what a layout change moves.
+  var contentRoot = function (scroller) {
+    var node = scroller.firstElementChild;
+    while (node && node.firstElementChild && node.children && node.children.length === 1) {
+      node = node.firstElementChild;
+    }
+    return node || scroller;
+  };
+
+  // The topmost row that starts inside the scroll port. A row that merely crosses the top edge is
+  // skipped: its own offset already depends on where the reader scrolled to.
+  var pickAnchor = function () {
+    if (!box) return null;
+    var port = box.getBoundingClientRect();
+    var list = null;
+    try { list = box.querySelectorAll(FLOW); } catch (error) { list = null; }
+    if (!list || !list.length) {
+      var root = contentRoot(box);
+      list = (root && root.children) || [];
+    }
+    for (var i = 0; i < list.length; i++) {
+      var element = list[i];
+      var rect = element.getBoundingClientRect();
+      if (rect.height <= 0) continue;
+      if (rect.top < port.top - EDGE_EPS) continue;
+      if (rect.top >= port.bottom) return null;
+      return element;
+    }
+    return null;
+  };
+
+  var offsetOf = function (element) {
+    return element.getBoundingClientRect().top - box.getBoundingClientRect().top;
+  };
+
+  var followingTail = function () {
+    try { return w.document.querySelector(TAIL) !== null; } catch (error) { return false; }
+  };
+
+  var atBottom = function () {
+    return box.scrollHeight - box.scrollTop - box.clientHeight <= BOTTOM_EPS;
+  };
+
+  var connected = function (element) {
+    if (element === null) return false;
+    if (typeof element.isConnected === "boolean") return element.isConnected;
+    return true;
+  };
+
+  var remember = function () {
+    anchor = pickAnchor();
+    restate();
+  };
+
+  // The snapshot is the triple (anchor, offset, scrollTop), always read together so the three stay
+  // consistent. The scroll offset is read back from the engine rather than remembered from the
+  // value asked for: WebKit truncates it to whole pixels (measured 2026-09-22: writing 502.5 reads
+  // back 502) while row geometry routinely lands on halves, and a snapshot holding the requested
+  // fraction would describe a position the scroller is not at.
+  var restate = function () {
+    offset = anchor === null ? 0 : offsetOf(anchor);
+    scrollTop = box === null ? 0 : box.scrollTop;
+  };
+
+  // The correction the engine would have made: move the offset by exactly the distance the row the
+  // reader was looking at has moved, over and above the distance it should have moved from
+  // scrolling alone. That row is measured again **by identity**, not re-chosen — after a layout
+  // change the topmost row of the port is a different row, so choosing again would compare two
+  // different rows and conclude that nothing had moved.
+  //
+  // Working from the scroll offset instead of trying to recognise our own writes makes reader
+  // scrolling and this correction indistinguishable on purpose: whatever moved the offset by the
+  // same amount the scroll moved is subtracted out, so only a genuine layout change survives as
+  // delta. Counting writes instead needed the value to survive a round trip through the engine,
+  // which it does not.
+  //
+  // The resize observer fires after layout and before paint, so the stale position is never shown.
+  var reconcile = function () {
+    if (!box) return;
+    if (!connected(anchor)) { remember(); return; }
+    // Following the tail is the page's own job, and a reader at the bottom asked for the bottom:
+    // compensating either would fight a scroll the page is already making.
+    if (followingTail() || atBottom()) { remember(); return; }
+    var delta = offsetOf(anchor) - (offset - (box.scrollTop - scrollTop));
+    if (delta > 0.5 || delta < -0.5) box.scrollTop = box.scrollTop + delta;
+    restate();
+  };
+
+  // Two mechanisms, and both are load-bearing:
+  //
+  // * The snapshot carries the scroller position alongside the anchor offset, so the correction
+  //   only accounts for movement that scrolling does not already explain. A snapshot left behind
+  //   by a reader's scroll therefore yields a delta of zero and compensates nothing, which is what
+  //   makes it safe to hold one across a scroll at all.
+  // * A scroll re-states the snapshot so the remembered offset describes where the anchor actually
+  //   is. Re-choosing here is also safe, and deliberately so: after this shim's own correction the
+  //   row the reader was looking at is still the topmost row of the port, so a re-pick returns the
+  //   same row. That is what lets one code path serve reader scrolling, the page's own scrolling
+  //   and this shim's write alike, with no attempt to tell them apart.
+  var onScroll = function () { remember(); };
+
+  var detach = function () {
+    if (watcher !== null && typeof watcher.disconnect === "function") watcher.disconnect();
+    watcher = null;
+    if (box !== null && typeof box.removeEventListener === "function") {
+      box.removeEventListener("scroll", onScroll, true);
+    }
+    box = null;
+    content = null;
+    anchor = null;
+    offset = 0;
+    scrollTop = 0;
+  };
+
+  var attach = function () {
+    box = pickScroller();
+    if (!box) return false;
+    content = contentRoot(box);
+    remember();
+    if (typeof box.addEventListener === "function") box.addEventListener("scroll", onScroll, true);
+    if (typeof w.ResizeObserver === "function") {
+      watcher = new w.ResizeObserver(reconcile);
+      watcher.observe(box);
+      if (content !== box) watcher.observe(content);
+    }
+    w.__dshScrollAnchorActive = true;
+    return true;
+  };
+
+  attach();
+  // Injected before the document is parsed, so the first attempt predates the conversation. A
+  // later one follows a session switch, which replaces the scroll port rather than growing it.
+  if (!box && typeof w.setInterval === "function") {
+    var tries = 0;
+    var timer = w.setInterval(function () {
+      if (attach() || ++tries > SETTLE_TRIES) {
+        if (typeof w.clearInterval === "function") w.clearInterval(timer);
+      }
+    }, SETTLE_MS);
+  }
+  if (typeof w.setInterval === "function") {
+    w.setInterval(function () {
+      if (box !== null && box.isConnected === false) detach();
+      if (box === null) attach();
+    }, 1000);
+  }
+})();
+"#;
+
+/// The scroll-anchor shim. A plain constant today; it stays behind a function so callers do not
+/// depend on whether it needs substitution, like the other three.
+pub fn scroll_anchor_script() -> String {
+    SCROLL_ANCHOR_SCRIPT.to_string()
+}
+
 /// Most recent page notes the probe may carry back at once.
 ///
 /// The ring drops its oldest entry rather than growing: a page erroring in a loop must not turn
