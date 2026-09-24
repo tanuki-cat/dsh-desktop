@@ -1239,4 +1239,97 @@ wry 只在注册了 `document_title_changed_handler` 时才转发 `document.titl
 **真机验证待做**：装上 0.1.6-alpha.2 后确认实例跑的是新版本；以及把 `system_updates` 临时改回 `notify` 时，
 Harness 窗口标题确实出现"有新版本 … 可用（未自动安装）"。
 
+### 13.21 接管自家重放的实例，把市场重启从死路变成通路（2026-09-24）
+
+**触发**：用户反馈"desktop 更新插件重启，在我选择接管以后会出现错误"，失败页文案
+`dsh web 进程已结束（退出码 0），自动重启失败：Harness 输出已结束（进程已退出）`。
+
+**根因**：壳把**插件市场自己拉起的替代实例**当成了"别人的 Harness"来询问，而面板上唯一走得通的答复
+恰好会把它杀掉 —— 市场于是判定自己那次重启失败、把恢复页放到端口上，壳随后的 spawn 撞 `EADDRINUSE`。
+
+三条证据链（同一时刻、两边日志逐条对齐）：
+
+| 时刻 | 壳 `harness.log` | 市场 helper `dsh-market-restart-*.err.log` |
+| --- | --- | --- |
+| 10:49:38 | — | `update: dshmarket -> dshmarket@1.61.0 exit=0` |
+| 10:50:03 | — | `restart: scheduled pid=94459 helper=98903` |
+| 10:50:04 | `Harness pid 94459 exited unexpectedly (退出码 0)` | helper 等端口空 → 拉起替代实例 **98905** |
+| 10:50:07 | `端口 3080 在交接窗内已由 pid 98905 服务：交由启动流程处理（不采用它重放的 cwd）` | 替代实例持续应答（8 s settle 计时开始） |
+| 10:50:10 | `接管确认：用户选择 take-over` | — |
+| 10:50:11 | `spawn: … --port 3080`（→ 98934） | `the replacement never came up (it exited with code 0)` → `starting the recovery surface` |
+| 10:50:12 | `dsh: startup failed … EADDRINUSE` | 恢复面绑定 3080 |
+| 10:50:39/41 | 点「重新启动」→ 报"端口被其它程序占用"（恢复面对探针返回 200，不是 401 栅栏） | 恢复面继续占着（默认 15 分钟空闲才放手） |
+| 10:50:47 | 第三次 spawn **98981** → 成功 | — |
+
+关键判据来自市场 helper 源码（`lib/restart.js` 的 `restartHelperSource`）：它判定替代实例"起来了"的依据是
+**端口连续应答 8 秒**（`SETTLE_MS`）。壳在 10:50:10 发 SIGTERM，替代实例是 dsh（`process.on("SIGTERM", () => interrupt(0))`），
+**退出码 0**，正好落在那 8 秒窗内。09-22 15:30 的同类重启没出事，只是因为壳先做了一次核心更新、直到 15:31:52 才接管 ——
+helper 早已收工，没有恢复面来抢端口。**这是竞态，不是必然。**
+
+**为什么"不采用它重放的 cwd"本身没错**：市场的 `restartLaunch()` 用 `dshArgv()` 重放，其 `cwd` 是 CLI 自己的目录
+（本次实测 `/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib`，见 `recovery.json` 的 `"cwd"`），不是本壳配置的
+`/Users/wangzy`。所以它**既不能复用也不是外人**：不能复用（workspace 错），也不是外人（它就是本壳这次更新）。
+中间那条"问用户"的路只有坏答案。
+
+**修法一：按命令行重放识别自家实例，不问。**
+
+- 新增纯函数 `is_our_own_launch(command, overlay)`：**同时**满足 `harness::looks_like_dsh_web(command)`
+  **且**命令行含本壳独有的 overlay 路径（`--patch <app-data>/force-print-url.yml`）。
+  两个条件缺一不可 —— 只看路径会把"提到这个路径的无关程序"（`grep <overlay>`）当成 Harness 去发信号；
+- `start()` 把 `overlay` 的绑定**前移到检测步骤之前**（原先在第 4 步写文件时才定义），检测据此判定；
+- 命中即 `ForeignAction::TakeOver`，**不调 `resolve_foreign_action`**：面板不再出现，用户也不再有机会杀掉
+  市场正在等的实例。后续流程不变（单 pid SIGTERM → 等端口空 → 自启并拿新 token URL）。
+
+**修法二：端口上若是市场的恢复页，不当"别的程序"处理。**
+
+`Probe::Other` 分支先读市场自己的载荷再决定：
+
+- 新增 `harness::market_recovery(port)` → `No` / `Holding` / `Blaming`，判据是
+  `GET /dsh-market/recovery` 返回 200 且载荷含 `"recovery":true`（**宿主自己的** `/dsh-market/status` 没有这个字段，
+  所以两者不会混）；再按 `"implicated":true` 分出是否点名了插件；
+- `Blaming`：那一页的勾选清单是关掉报错插件的**唯一入口**，因此**不抢端口** —— 用系统浏览器打开它，失败页写明
+  "改完回来点「重新启动 Harness」"；
+- `Holding`（没点名插件，页面只是占着端口）：`POST /dsh-market/recovery/release` 请它释放，
+  等端口真空出来后继续本次启动（`RECOVERY_RELEASE_GRACE` = 3 s，页面的释放动作就是关掉 listener）；
+- 都不是才回到原来的"请在 config.json 里换一个端口"。
+
+**修法三：spawn 之后仍可能被抢 —— 一次重试。** 这是**本次事故真正走的那条路**，只修检测是不够的：
+恢复页不是在检测时就在，而是**在检测与 spawn 之间**出现的（helper 等满 8 s 才判定失败并起恢复面）。
+因此 `wait_for_url` 失败后增加一次判定：子进程**已经退出**（即根本没绑上端口，正是"被 EADDRINUSE 打死"的形状）**且**端口上是 `Holding` 恢复页
+→ 请求释放、`disown` 旧 pid、**重跑一次** spawn。仅一次：页面在第二次 spawn 前已经消失，而"还有别的东西占着"
+不该变成重试循环。释放失败时**保留原始失败原因**（它才准确），只记一条日志 —— 下次启动的检测会把这一条说得更明白。
+
+判定"已经退出"用的是新加的 `child_is_gone(&mut Child)`，**不是** `process::is_alive`：后者是
+`kill(pid, 0)`，对一个**已退出但未被 reap** 的子进程仍然返回成功（macOS 实测：`wait` 之前 `kill -0` 一直答 0），
+而本壳的子进程正是"自己的、未 reap 的、被 EADDRINUSE 打死的"—— 用它就永远不会重试。`try_wait` 的三个答复
+因此都被明确处理：`Ok(Some)` 已退出、`Err(ECHILD)` 已被外部 reap（仍算已退出；Windows 没有这一路，
+所以那一支单独 `cfg`）、`Ok(None)` 仍在运行（**不重试** —— 否则会在一个活着的实例旁边再起一个）。
+
+新增的 `harness::request()` 与 `probe()` 同一套边界（`PROBE_TIMEOUT` 每次读前重臂、`PROBE_RESPONSE_LIMIT` 限内存），
+区别只是它要读载荷、不提前下结论。
+
+**验证**：
+
+- 单测 218 → **222**：`only_this_shells_own_invocation_counts_as_a_replay`（自家 argv / 终端 `dsh web` /
+  别人的 overlay / 只提到路径的无关程序四态）、`the_recovery_surface_is_told_apart_from_any_other_occupant`
+  与 `only_an_answered_release_counts`（真实 socket 上的恢复面替身）、
+  `an_exited_child_reads_as_gone_however_it_was_reaped`（重试判据的三个答复，含**外部 reap 掉子进程**后
+  `ECHILD` 那一路 —— 该用例经过变异验证：把 `ECHILD` 读成"还在跑"，用例会失败）；
+- **真机核对**（本轮，非单测）：把市场**真实的** `lib/recovery.js` 起在 3199，用真实函数打它 ——
+  `market_recovery(3199)` 得 `Holding`、`release_market_recovery(3199)` 返回 true 且端口**确实**变为连接被拒；
+  同时用宿主 `/dsh-market/status` 形态的替身确认判为 `No`。载荷逐字取自本次事故现场的
+  `dsh-market-restart-2026-09-24T02-50-03.recovery.json`；
+- 门禁：`cargo test` 222 passed、`cargo fmt --check` 通过、`cargo clippy --all-targets` 0 warning。
+
+**未验证**：真实走一遍"市场点重启 → 壳自动接管重放的替代实例 → 起自己的"完整链路（需要市场再次触发重启，
+且要在 8 秒 settle 窗内发生）。本轮只到"识别判据 + 恢复面处置"这一层。
+
+**影响范围**：`src-tauri/src/harness.rs`（新增 `MarketRecovery`、`market_recovery`、`release_market_recovery`、
+`request`、`is_ok`，公开 `RECOVERY_PATH`）、`src-tauri/src/lib.rs`（`is_our_own_launch`、
+`release_holding_recovery`、`RECOVERY_RELEASE_GRACE`、`start()` 的检测分支与 `Probe::Other` 分支、
+`overlay` 绑定前移、**spawn 的一次重试循环**）、两个测试文件。
+无新依赖、无配置项变更。
+
+
+
 

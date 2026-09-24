@@ -67,6 +67,12 @@ const MAX_AUTO_RESTARTS: u32 = 3;
 /// this is the only signal; a few seconds of delay before recovery is imperceptible next to
 /// the restart that follows.
 const REUSED_POLL: Duration = Duration::from_secs(3);
+/// How long the plugin market's recovery page gets to let go of the port after being asked.
+///
+/// Short on purpose: the page answers the release request by closing its listener, which is one
+/// syscall. The wait only covers a page that is mid-response, and every second here is a second the
+/// user's restart is not happening.
+const RECOVERY_RELEASE_GRACE: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -1033,6 +1039,108 @@ fn ours_on_port(data_dir: &Path, port: u16) -> bool {
     process::read_state(data_dir)
         .map(|state| state.pid)
         .is_some_and(|pid| Some(pid) == owner && process::is_alive(pid))
+}
+
+/// Whether a running Harness is a replay of this shell's own invocation.
+///
+/// The one process that passes both identity signals and is still not somebody else's session: the
+/// plugin market's restart helper replays the CLI's argv verbatim, and that argv carries this
+/// shell's own overlay path — `--patch <app-data>/force-print-url.yml` — which no other launcher
+/// produces. A terminal `dsh web` has no such flag; the official desktop app's launcher has its
+/// own.
+///
+/// It matters because such an instance is neither adoptable nor a stranger. Not adoptable: the
+/// replayed argv also replays the CLI's own working directory, so its workspace is the CLI
+/// directory rather than the configured one. Not a stranger: it is this shell's own update, mid
+/// handoff. Asked about like any foreign instance, the only answer that leads anywhere is "take it
+/// over" — and that is what killed the replacement the market was waiting for, so the market read
+/// its own restart as failed and put a recovery page on the port (2026-09-24).
+///
+/// Pure, so the matrix is testable.
+///
+/// Both halves are needed. The overlay path alone matches any command that merely mentions it —
+/// the path contains `dsh`, so a substring test would call `grep <overlay>` a replay and signal
+/// it. The identity rule the takeover path already applies ([looks_like_dsh_web]) is what says the
+/// process behind the port is the CLI, and this adds the one flag only this shell passes.
+///
+/// [looks_like_dsh_web]: harness::looks_like_dsh_web
+fn is_our_own_launch(command: &str, overlay: &Path) -> bool {
+    harness::looks_like_dsh_web(command) && command.contains(&*overlay.to_string_lossy())
+}
+/// Has this child of ours exited?
+///
+/// `try_wait`, not `process::is_alive`. The latter is `kill(pid, 0)`, which keeps answering
+/// "alive" for a child that has exited and not been reaped — measured on macOS, `kill -0` returns 0
+/// until `wait` reaps it — and a child of this shell is exactly that: ours, unreaped, and dead
+/// after `EADDRINUSE`. Reading it that way is what would silently disable the retry.
+///
+/// `Ok(None)` is the one answer that must not be retried over: the child is still running and
+/// would go on holding whatever it holds while a second one is spawned beside it.
+fn child_is_gone(child: &mut std::process::Child) -> bool {
+    match child.try_wait() {
+        Ok(Some(_)) => true,
+        Err(error) => unreadable_status_is_gone(&error),
+        Ok(None) => false,
+    }
+}
+
+/// Does an exit status that could not be read mean the child is gone?
+///
+/// Unix answers `ECHILD` for a child that something outside this process reaped, which is gone by
+/// definition — the harness's own test runner does exactly that, so reading the error as "running"
+/// would silently disable the retry there.
+///
+/// Windows has no equivalent error and does not leave zombies, so there the answer stays "not
+/// gone". The two directions are not symmetric: refusing to retry only costs the user the original
+/// failure page, while retrying wrongly would spawn a second Harness beside a live one.
+#[cfg(unix)]
+fn unreadable_status_is_gone(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ECHILD)
+}
+
+#[cfg(not(unix))]
+fn unreadable_status_is_gone(_error: &std::io::Error) -> bool {
+    false
+}
+
+/// Ask the plugin market's recovery page to give the port back, when that is what is on it.
+///
+/// `Ok(false)` means the port is not held by a page this shell may end: a `Blaming` page belongs to
+/// the user (its checklist is the only way to switch the blamed plugin off), and anything else is
+/// not the market at all. `Ok(true)` means the port is free again and the caller may bind it.
+///
+/// Reached from two places, because the page can appear at either: it may already be there when the
+/// launch starts (a restart that failed earlier), or it may arrive while this launch is spawning —
+/// the market's helper gives its own replacement eight seconds to answer before deciding the
+/// restart failed, and a launch that spawns inside that window loses the port to it.
+fn release_holding_recovery(app: &AppHandle, port: u16) -> Result<bool, String> {
+    if harness::market_recovery(port) != harness::MarketRecovery::Holding {
+        return Ok(false);
+    }
+    harness::app_log(&format!(
+        "端口 {port} 上是插件市场的恢复页（没有点名插件），已请求它释放端口"
+    ));
+    window::set_status(
+        app,
+        "插件市场留下了恢复页，正在取回端口…",
+        &format!("127.0.0.1:{port}{}", harness::RECOVERY_PATH),
+    );
+    if !harness::release_market_recovery(port) {
+        return Err(format!(
+            "插件市场在端口 {port} 上留下的恢复页没有响应释放请求。"
+        ));
+    }
+    let deadline = std::time::Instant::now() + RECOVERY_RELEASE_GRACE;
+    while !matches!(harness::probe(port), harness::Probe::Closed) {
+        if std::time::Instant::now() > deadline {
+            return Err(format!(
+                "已请求插件市场的恢复页释放端口 {port}，但它仍然占用着。"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    harness::app_log(&format!("恢复页已释放端口 {port}"));
+    Ok(true)
 }
 
 /// Whether an instance left running may be serving from the tree a swap would replace.
@@ -2079,6 +2187,11 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
         }
     }
 
+    // The launcher-level overlay every Harness this shell starts is given. Named here rather than
+    // written here so detection can recognise a replay of this shell's own invocation: the plugin
+    // market's restart helper replays our argv verbatim, overlay path included, and that path is
+    // what tells such a process apart from somebody else's `dsh web`.
+    let overlay = data_dir.join("force-print-url.yml");
     // Whether the detection step signalled something and must therefore wait for the port to
     // come free before spawning.
     let mut took_over = false;
@@ -2164,10 +2277,30 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
                     // mislabelled) after a choice that leaves the other instance running.
                     took_over = false;
                     let command = owner.and_then(harness::process_command);
-                    let action = foreign_instance_action(owner, command.as_deref());
-                    // An identified instance is always a question: it may be a terminal session
-                    // or an agent run the user wants to keep, and only they can say.
-                    let action = resolve_foreign_action(app, &config, port, action);
+                    // A replay of this shell's own invocation is the one identified instance that
+                    // is not somebody else's session, so it is not asked about. The plugin
+                    // market's restart replays our argv exactly — same CLI, same `--patch <our
+                    // overlay>` — and the replacement boots in the CLI's directory instead of the
+                    // configured workspace, which is why it cannot be adopted either. Asked
+                    // about, the only answer that leads anywhere is "take it over", and the
+                    // question is what turned a market restart into a dead end: the user answered
+                    // it, the replacement died, the market read that as its own failure and put a
+                    // recovery page on the port this launch was about to bind (2026-09-24).
+                    let replayed_ours = owner.is_some()
+                        && command
+                            .as_deref()
+                            .is_some_and(|command| is_our_own_launch(command, &overlay));
+                    let action = if replayed_ours {
+                        harness::app_log("端口上的 Harness 是本应用自身启动命令的重放（插件市场重启的替代实例）：按自家实例处理，不再询问");
+                        ForeignAction::TakeOver {
+                            pid: owner.unwrap_or_default(),
+                        }
+                    } else {
+                        let action = foreign_instance_action(owner, command.as_deref());
+                        // An identified instance is always a question: it may be a terminal
+                        // session or an agent run the user wants to keep, and only they can say.
+                        resolve_foreign_action(app, &config, port, action)
+                    };
                     let page = terminal_page(&action);
                     match action {
                         ForeignAction::UseBrowser => {
@@ -2241,9 +2374,40 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
             }
         }
         harness::Probe::Other => {
-            return Err(
-                format!("端口 {port} 被其它程序占用，请在 config.json 里换一个端口。").into(),
-            );
+            // The plugin market's own recovery page is the one occupant that is not a reason to
+            // send the user to config.json: it is a state this shell can end, and the port the
+            // restart it is waiting on needs. Reaching it here means a market restart failed and
+            // the surface took the port over — including the case where this shell's own takeover
+            // killed the replacement the market was waiting for (2026-09-24).
+            match harness::market_recovery(port) {
+                // Blaming plugins: the checklist on that page is the only way to switch the
+                // blamed one off without editing the profile by hand, so it is left alone.
+                harness::MarketRecovery::Blaming => {
+                    window::open_external(&format!(
+                        "http://127.0.0.1:{port}{}",
+                        harness::RECOVERY_PATH
+                    ));
+                    return Err(format!(
+                        "上次插件更新后 Harness 没能启动，插件市场在端口 {port} 上留下了恢复页，\
+                         已用系统浏览器打开。请在那一页里取消勾选启动时报错的插件并重启；\
+                         插件装好后回到本窗口点「重新启动 Harness」，本应用就会取回端口。"
+                    )
+                    .into());
+                }
+                // Holding the port with nothing to offer: the user's own restart is waiting for
+                // exactly this port, and the page would hold it for fifteen idle minutes.
+                harness::MarketRecovery::Holding => {
+                    if let Err(reason) = release_holding_recovery(app, port) {
+                        return Err(reason.into());
+                    }
+                }
+                harness::MarketRecovery::No => {
+                    return Err(format!(
+                        "端口 {port} 被其它程序占用，请在 config.json 里换一个端口。"
+                    )
+                    .into());
+                }
+            }
         }
         harness::Probe::Closed => {}
     }
@@ -2314,7 +2478,6 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
     }
 
     // 4) Force the startup URL line with a launcher-level overlay patch.
-    let overlay = data_dir.join("force-print-url.yml");
     std::fs::write(
         &overlay,
         "- id: web-runtime\n  config:\n    openBrowser: !!js ctx.webStartup.openBrowser\n    printUrl: true\n    surfaceContext: true\n    trustedHosts: !!js ctx.webStartup.trustedHosts\n",
@@ -2356,17 +2519,6 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
             resolved.dsh_js.display(),
         ),
     );
-    let spawned = harness::spawn(&resolved.node, &resolved.dsh_js, &options)
-        .map_err(|e| format!("启动进程失败: {e}"))?;
-    let pid = spawned.child.id();
-    adopt(pid, data_dir);
-    // Both sides use SeqCst, so either this thread sees the exit flag or `shutdown` sees the
-    // freshly registered pid: the Harness cannot slip past the app exit unnoticed.
-    if EXITING.load(Ordering::SeqCst) {
-        shutdown();
-        return Ok(());
-    }
-
     // A profile that does not exist yet is initialised on first use, which is slower
     // (measured ~4s on a warm machine, but plugin installs can take much longer).
     // `first_launch` was captured before seeding, so a bundled first start still gets 90 s
@@ -2380,36 +2532,82 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
         STARTUP_TIMEOUT_NEXT
     };
 
-    let url = match spawned.wait_for_url(timeout) {
-        Ok(url) => url,
-        Err(reason) => {
-            // The CLI may still be starting even though nothing answered in time. Stopping it
-            // keeps the failure page honest and leaves the port free for the next attempt.
-            let tail = spawned.ring.tail();
-            // A tree that was just swapped in and never printed its URL is not one to keep:
-            // put the previous one back now, while the reason is still in hand, instead of
-            // making the user hit the same wall on the next launch.
-            let rolled_back = core_swapped && roll_back_core_update(&paths);
-            // The cache still names this version as the newest, so without a marker every
-            // later launch would stage and swap the same broken tree again.
-            // `version` was updated to the swapped one at the commit above, so it names the
-            // tree that failed rather than the one that was running before.
-            if core_swapped {
-                update::mark_core_attempt_failed(data_dir, &version);
-            }
-            return abort_start(
-                pid,
-                format!(
-                    "{reason}{}\n\n最近输出:\n{tail}",
-                    if rolled_back {
-                        "\n\n新版本未能启动，已回滚到上一个版本。"
-                    } else {
-                        ""
+    // The market's recovery page can take the port *after* detection as well as before it: its
+    // helper gives the replacement it spawned eight seconds to answer before deciding the restart
+    // failed and putting the page up, so a launch that spawns inside that window loses the race
+    // through no fault of its own. One retry covers it — the page is gone by the time the second
+    // attempt spawns — and the failure that is reported when there is nothing to retry is the
+    // original one, which names the real reason.
+    let mut attempt = 0;
+    let (spawned, url) = loop {
+        attempt += 1;
+        let mut spawned = harness::spawn(&resolved.node, &resolved.dsh_js, &options)
+            .map_err(|e| format!("启动进程失败: {e}"))?;
+        let pid = spawned.child.id();
+        adopt(pid, data_dir);
+        // Both sides use SeqCst, so either this thread sees the exit flag or `shutdown` sees the
+        // freshly registered pid: the Harness cannot slip past the app exit unnoticed.
+        if EXITING.load(Ordering::SeqCst) {
+            shutdown();
+            return Ok(());
+        }
+        match spawned.wait_for_url(timeout) {
+            Ok(url) => break (spawned, url),
+            Err(reason) => {
+                // Only a child that is already gone may be retried: one that is still running
+                // would go on holding whatever it holds while a second one is spawned beside it.
+                // A child that never bound the port is exactly the shape the market's helper
+                // produces, so this is also what keeps the retry from racing a live Harness.
+                let exited = child_is_gone(&mut spawned.child);
+                if attempt == 1 && exited {
+                    match release_holding_recovery(app, port) {
+                        Ok(true) => {
+                            harness::app_log(&format!(
+                                "端口 {port} 曾被插件市场的恢复页占住（{reason}），已取回端口：重试一次"
+                            ));
+                            disown(pid);
+                            continue;
+                        }
+                        // The page is there but would not let go. The original reason is still the
+                        // accurate one to report, and the next launch's detection names this
+                        // precisely — so it is logged here rather than replacing the message.
+                        Err(release_failure) => harness::app_log(&format!(
+                            "端口 {port} 上疑似插件市场的恢复页，但释放失败：{release_failure}"
+                        )),
+                        Ok(false) => {}
                     }
-                ),
-            );
+                }
+                // The CLI may still be starting even though nothing answered in time. Stopping it
+                // keeps the failure page honest and leaves the port free for the next attempt.
+                let tail = spawned.ring.tail();
+                // A tree that was just swapped in and never printed its URL is not one to keep:
+                // put the previous one back now, while the reason is still in hand, instead of
+                // making the user hit the same wall on the next launch.
+                let rolled_back = core_swapped && roll_back_core_update(&paths);
+                // The cache still names this version as the newest, so without a marker every
+                // later launch would stage and swap the same broken tree again.
+                // `version` was updated to the swapped one at the commit above, so it names the
+                // tree that failed rather than the one that was running before.
+                if core_swapped {
+                    update::mark_core_attempt_failed(data_dir, &version);
+                }
+                return abort_start(
+                    pid,
+                    format!(
+                        "{reason}{}\n\n最近输出:\n{tail}",
+                        if rolled_back {
+                            "\n\n新版本未能启动，已回滚到上一个版本。"
+                        } else {
+                            ""
+                        }
+                    ),
+                );
+            }
         }
     };
+    // The pid the supervisor and the state file carry: the last child spawned, which is the one
+    // serving the URL this launch ended up with.
+    let pid = spawned.child.id();
 
     // The new tree booted and printed its URL: the swap is real. Until this line the previous
     // tree was still the fallback a launch would roll back to.

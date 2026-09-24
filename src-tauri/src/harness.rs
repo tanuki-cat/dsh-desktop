@@ -503,6 +503,105 @@ fn read_verdict(response: &[u8]) -> Option<Probe> {
     body.contains(AUTH_FENCE).then_some(Probe::Harness)
 }
 
+/// Path the plugin market answers its recovery surface on. Public because the failure page names
+/// it: that page is the one thing the user can act on, and it is useless unnamed.
+pub const RECOVERY_PATH: &str = "/dsh-market/recovery";
+/// Path that surface releases its port through — the same one its own page offers as a button.
+const RECOVERY_RELEASE_PATH: &str = "/dsh-market/recovery/release";
+/// The marker only the recovery surface's payload carries. The live host answers
+/// `/dsh-market/status` with the host's own shape and no such field.
+const RECOVERY_MARKER: &str = "\"recovery\":true";
+/// The marker the same payload carries once it blames a plugin.
+const RECOVERY_BLAME_MARKER: &str = "\"implicated\":true";
+
+/// What the plugin market's recovery surface is doing on a port, when it is on one at all.
+///
+/// It exists because a market restart that never came up leaves the browser on a dead origin: the
+/// surface takes the port over and serves a checklist of the installed plugins, so the user can
+/// switch off the one the boot blamed without editing the profile by hand.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MarketRecovery {
+    /// Not the recovery surface.
+    No,
+    /// Up, and blaming nothing: the state a restart that failed for an unrelated reason leaves
+    /// behind — a port held for fifteen idle minutes by a page with no decision to offer.
+    Holding,
+    /// Up, and blaming at least one plugin. That checklist is the user's only way to switch the
+    /// blamed plugin off without editing the profile by hand, so it is left where it is.
+    Blaming,
+}
+
+/// Is the plugin market's recovery surface the thing holding `port`?
+///
+/// Asked by the startup path, because "the port is occupied" and "the market's recovery page is on
+/// it" are the same symptom with opposite answers: the first is somebody else's program, the second
+/// is a state this shell can end and the port the user's restart is waiting for (field report
+/// 2026-09-24).
+pub fn market_recovery(port: u16) -> MarketRecovery {
+    match request(port, &format!("GET {RECOVERY_PATH}")) {
+        None => MarketRecovery::No,
+        Some(response) if !is_ok(&response) => MarketRecovery::No,
+        Some(response) => {
+            let body = String::from_utf8_lossy(&response);
+            if !body.contains(RECOVERY_MARKER) {
+                MarketRecovery::No
+            } else if body.contains(RECOVERY_BLAME_MARKER) {
+                MarketRecovery::Blaming
+            } else {
+                MarketRecovery::Holding
+            }
+        }
+    }
+}
+
+/// Ask that surface to let go of `port`, so this shell can bind it.
+///
+/// The surface offers exactly this to its own page, and its same-origin rule allows a request with
+/// no `Origin` at all — the shape a non-browser client sends. Whether the port actually came free
+/// is the caller's wait, not this return value.
+pub fn release_market_recovery(port: u16) -> bool {
+    request(port, &format!("POST {RECOVERY_RELEASE_PATH}")).is_some_and(|response| is_ok(&response))
+}
+
+/// One bounded HTTP exchange with `port`: the raw response, or `None` when nothing answered.
+///
+/// Bounded the same way [`probe`] is — `PROBE_TIMEOUT` re-armed before every read, and
+/// `PROBE_RESPONSE_LIMIT` on what is kept — but without the probe's early verdict: both callers
+/// here read a payload, and both run on a path that already knows the port is occupied.
+fn request(port: u16, method_and_path: &str) -> Option<Vec<u8>> {
+    let addr = format!("127.0.0.1:{port}").parse().ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).ok()?;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let request = format!(
+        "{method_and_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: dsh-desktop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    if !arm_within(&stream, deadline) || stream.write_all(request.as_bytes()).is_err() {
+        return None;
+    }
+    let mut response: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        if response.len() >= PROBE_RESPONSE_LIMIT || !arm_within(&stream, deadline) {
+            break;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    Some(response)
+}
+
+/// Does this response start with a `200` status line?
+fn is_ok(response: &[u8]) -> bool {
+    let Some(end) = response.iter().position(|byte| *byte == b'\n') else {
+        return false;
+    };
+    let status = String::from_utf8_lossy(&response[..end]);
+    status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200")
+}
+
 /// Does this command line name the `dsh web` server the CLI boots?
 ///
 /// The auth fence says a *Harness* is on the port; this says the process behind it is the CLI

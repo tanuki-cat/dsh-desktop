@@ -398,6 +398,109 @@ fn redacts_token() {
     assert!(!out.contains("abcdef"));
 }
 
+/// A stand-in for the market's recovery surface: the paths, the payload markers and the
+/// release-on-POST behaviour that `market_recovery` and `release_market_recovery` read.
+///
+/// A real socket rather than a mock because the two functions are entirely about what arrives over
+/// one, and the payload shape is what tells the recovery surface apart from the live host — the
+/// live host answers `/dsh-market/status` with no `recovery` field at all.
+fn recovery_stand_in(body: &'static str, release: bool) -> (u16, std::sync::mpsc::Receiver<()>) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            // One reader for the whole request: a second `BufReader` over the same socket starts
+            // with an empty buffer while the first one holds the already-read headers, so the
+            // request is never seen and the client times out on an answer that was never sent.
+            let mut reader = BufReader::new(&stream);
+            let mut first = String::new();
+            if reader.read_line(&mut first).is_err() {
+                return;
+            }
+            let mut header = String::new();
+            loop {
+                header.clear();
+                match reader.read_line(&mut header) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if header == "\r\n" || header == "\n" => break,
+                    Ok(_) => {}
+                }
+            }
+            if first.starts_with("POST ") && release {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                );
+                let _ = tx.send(());
+                // The real surface closes its listener here; this thread ends with it.
+                return;
+            }
+            if first.starts_with("GET ") {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            } else {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        }
+    });
+    (port, rx)
+}
+
+/// The recovery surface is recognised by its payload, and the verdict decides what the startup path
+/// does with the port: a page with a checklist is the user's, one without is in the way.
+#[test]
+fn the_recovery_surface_is_told_apart_from_any_other_occupant() {
+    // Blaming a plugin: the checklist is the only way to switch it off, so the page is left alone.
+    let (port, _rx) = recovery_stand_in(
+        r#"{"ok":true,"recovery":true,"plugins":[{"name":"broken","implicated":true}]}"#,
+        false,
+    );
+    assert_eq!(market_recovery(port), MarketRecovery::Blaming);
+
+    // Up with nothing to offer: the state a restart that failed for an unrelated reason leaves.
+    // Verbatim from the surface this shell met in the field — it lists every plugin and marks each
+    // one, so an empty `plugins` array is not a shape it produces.
+    let (port, _rx) = recovery_stand_in(
+        r#"{"ok":true,"recovery":true,"profile":"web","marketVersion":"1.59.0","plugins":[{"name":"dshmarket","rows":["dsh-market"],"enabled":true,"protected":false,"carrier":false,"toggleable":true,"implicated":false}],"unmatched":[],"lastErrors":[]}"#,
+        false,
+    );
+    assert_eq!(market_recovery(port), MarketRecovery::Holding);
+
+    // The live host's own status payload: no `recovery` field, so this is not the surface.
+    let (port, _rx) = recovery_stand_in(r#"{"active":false,"phase":"idle","busy":false}"#, false);
+    assert_eq!(market_recovery(port), MarketRecovery::No);
+
+    // A 404 from a program that is not the market at all.
+    let (port, _rx) = recovery_stand_in("", false);
+    assert_eq!(market_recovery(port), MarketRecovery::No);
+}
+
+/// Asking the surface to release is what gets the port back; a listener that ignores the request
+/// must not be reported as a release.
+#[test]
+fn only_an_answered_release_counts() {
+    let (port, released) = recovery_stand_in(r#"{"ok":true,"recovery":true,"plugins":[]}"#, true);
+    assert!(release_market_recovery(port));
+    assert!(
+        released.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "the release request never reached the surface"
+    );
+
+    // Nothing listening: no answer, so no release.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+    assert!(!release_market_recovery(closed_port));
+}
+
 /// Every credential on the line must go, not just the first. The scan used to compare against the
 /// wrong offset from the second match on, so an env dump or an echoed header kept every secret
 /// after the first one.

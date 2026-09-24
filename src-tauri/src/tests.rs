@@ -6,6 +6,103 @@
 use super::*;
 use crate::update_flow::{stop_mode, StopMode};
 
+/// The retry after a lost port turns on telling an exited child from a live one, and the obvious
+/// liveness test is wrong in a way that silently disables the retry.
+///
+/// `process::is_alive` is `kill(pid, 0)`, which keeps answering "alive" for a child that has exited
+/// but not been reaped (measured on macOS). A child of this shell is exactly that — ours, unreaped,
+/// and dead after `EADDRINUSE` — so `child_is_gone` reads the exit status instead, and every answer
+/// it can give is pinned here (2026-09-24).
+///
+/// Unix-only: the `ECHILD` case is forced with `waitpid`, which is not how Windows reaps, and the
+/// helper's other two answers are already covered by the shared `/bin/sleep` shape it spawns.
+#[cfg(unix)]
+#[test]
+fn an_exited_child_reads_as_gone_however_it_was_reaped() {
+    let spawn_sleep = |seconds: &str| {
+        std::process::Command::new("/bin/sleep")
+            .arg(seconds)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+
+    // 1. Exited, not yet reaped by anyone. The reading the retry depends on: `try_wait` reaps it
+    //    here, so the answer is `Ok(Some(_))`. `kill(pid, 0)` would still have said "alive" at the
+    //    moment this is called, which is why the helper must not use it.
+    let mut exited = spawn_sleep("0");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        child_is_gone(&mut exited),
+        "an exited child must read as gone"
+    );
+
+    // 2. Already reaped by somebody else: `try_wait` answers `ECHILD`, which is still "gone".
+    //    Reaping it here from outside Rust's own bookkeeping is what forces that arm.
+    let mut stolen = spawn_sleep("0");
+    std::thread::sleep(Duration::from_millis(500));
+    let stolen_pid = stolen.id() as libc::pid_t;
+    // SAFETY: `waitpid` on a pid this process owns; the call only reaps, it does not signal.
+    let reaped = unsafe { libc::waitpid(stolen_pid, std::ptr::null_mut(), libc::WNOHANG) };
+    assert_eq!(
+        reaped, stolen_pid,
+        "the child should have been reapable from here"
+    );
+    assert!(
+        child_is_gone(&mut stolen),
+        "a child reaped outside this handle must still read as gone, not as running"
+    );
+
+    // 3. Still running: not gone. Retrying over this one would spawn a second Harness beside a live
+    //    first one, which is the failure the guard exists to prevent.
+    let mut running = spawn_sleep("30");
+    assert!(
+        !child_is_gone(&mut running),
+        "a running child must not read as gone"
+    );
+    let _ = running.kill();
+    let _ = running.wait();
+}
+
+/// The replay test is what keeps a market restart from being treated as a stranger's session.
+///
+/// The two shapes that must not be confused: a terminal `dsh web` (identified, but somebody
+/// else's) and the market's replacement (this shell's own argv, replayed). Only the overlay path
+/// tells them apart, and only this shell ever puts it on a command line — and the identity rule has
+/// to hold as well, or any program that merely mentions the path would be signalled as a Harness
+/// (2026-09-24).
+#[test]
+fn only_this_shells_own_invocation_counts_as_a_replay() {
+    let overlay = Path::new(
+        "/Users/me/Library/Application Support/com.deepseek.dsh.desktop/force-print-url.yml",
+    );
+    // The market's helper replays exactly what this shell spawned, overlay included.
+    let ours = format!(
+        "/opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --patch \"{}\" --no-open --port 3080",
+        overlay.display()
+    );
+    assert!(is_our_own_launch(&ours, overlay));
+
+    // A terminal `dsh web`: identified by the takeover rules, and emphatically not ours.
+    assert!(!is_our_own_launch(
+        "/opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js web --port 3080",
+        overlay
+    ));
+    // A different shell's overlay is a different shell's launch.
+    assert!(!is_our_own_launch(
+        "/opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --patch /tmp/other.yml --port 3080",
+        overlay
+    ));
+    // A program that merely carries the path in an argument is not the CLI, so the identity rule
+    // is what keeps it from being signalled.
+    assert!(!is_our_own_launch(
+        &format!("/usr/bin/grep {}", overlay.display()),
+        overlay
+    ));
+}
+
 /// The menu item and the handler that acts on it are bound by a string: a rename on either side
 /// silently drops every click, and the only recovery the user has from a page that stopped
 /// drawing would stop working with no error anywhere.

@@ -85,6 +85,19 @@ Rust 侧（`src-tauri/src/window.rs`）：
 `confirm_takeover()` 只有拿到 `TakeOver` 才返回 true：`UseOtherPort` 明确表示「那个实例留着」，
 **不是**发信号的许可。
 
+> **2026-09-24 补正（「无条件询问」有一个例外：本壳自己命令行的重放）**：上表第一行现在是
+> 「先判重放，再决定问不问」。插件市场的「立即重启」把宿主 SIGTERM 后，detached helper 按**原 argv**
+> 拉起替代实例 —— 那条命令行带本壳独有的 `--patch <app-data>/force-print-url.yml`，因此
+> `is_our_own_launch()` 认得出它是自家实例（判据见
+> [`design-task-feat-dsh-tauri-desktop-shell.md` §13.21](./design-task-feat-dsh-tauri-desktop-shell.md)）。
+> 这类实例**不询问**，直接按自家处理。
+>
+> 为什么必须例外：它重放的 argv 连 `cwd` 都是 CLI 目录而不是本壳配置的 workspace，所以既不能复用、
+> 也不是「别人的会话」；面板上唯一走得通的答复恰好就是接管，而那一杀会让市场判定自己重启失败、
+> 把恢复页放到端口上，本壳随后的 spawn 撞 `EADDRINUSE`（2026-09-24 实测）。**无条件询问的前提是
+> 「端口上那个进程属于别人」**，重放的自家实例不满足这个前提，因此不在本条规则的适用范围内；
+> 真正的第三方实例（终端 `dsh web`、官方桌面端、别人的 overlay）仍然一律询问。
+
 ### 3.2.1 「保留并换端口」与重试循环
 
 `UseOtherPort` 在配置端口之上的**第一个空闲端口**启动本壳的 Harness（`free_port_from()`，向上搜
@@ -222,6 +235,7 @@ the status page`）。判断抽成 `terminal_page(&ForeignAction)` 以便单测�
 
 - `src-tauri/src/window.rs`：`CHOICE_EVENT`、`ChoiceOption`、`Choice`、`ask_choice`、
   `wait_for_choice`、`record_choice`、`choice_script`；
+- `src-tauri/src/lib.rs`（2026-09-24 补正新增）：`is_our_own_launch`（重放识别，命中即跳过询问）；
 - `src-tauri/src/lib.rs`：`ForeignAction::{Ask, UseOtherPort}`、`resolve_foreign_action`、
   `unanswered_choice`、`confirm_takeover`、`terminal_page`、`takeover_question`、`may_stop_before_update`、
   `runtime_port` / `free_port_from` / `PORT_OVERRIDE`、四条 kill 路径、`CHOICE_EVENT` 监听器；
