@@ -363,12 +363,17 @@ fn defaults_do_not_take_over_foreign_state() {
 
     // Killing whatever holds the port is the user's call, not a startup path's.
     assert!(!config.take_over_existing);
-    // The release tag plus `alpha`, because upstream publishes ahead of `latest`: measured
-    // 2026-09-18, `alpha` was the newest version on the registry (0.1.6-alpha.2) while `latest`
-    // was still 0.1.5-rc.2. `next` stays out — it tracked `latest` and adds nothing.
+    // Every channel upstream publishes to, because which one leads moves between releases:
+    // measured 2026-09-18, `alpha` held the newest version (0.1.6-alpha.2) while `latest` was
+    // 0.1.5-rc.2; measured 2026-09-24, `next` led both (0.1.7-rc.1 against alpha 0.1.7-alpha.2
+    // and latest 0.1.5-rc.3) and was the only version newer than the installed one.
     assert_eq!(
         config.update_tags,
-        vec!["latest".to_string(), "alpha".to_string()]
+        vec![
+            "latest".to_string(),
+            "next".to_string(),
+            "alpha".to_string()
+        ]
     );
     // A profile is user data; keeping its plugin tree current is opt-in.
     assert!(!config.auto_update_plugins);

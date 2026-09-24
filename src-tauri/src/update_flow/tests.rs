@@ -70,7 +70,7 @@ fn a_staged_update_swaps_the_tree_and_an_unconfirmed_one_is_rolled_back() {
             latest: Some("0.1.6".into()),
             // The tags the answer came from: this test only cares that the entry parses and is
             // carried across the recovery, so any real set will do.
-            tags: vec!["latest".to_string(), "alpha".to_string()],
+            tags: update::default_tags(),
             attempted: None,
             failed: None,
             failed_at: 0,

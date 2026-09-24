@@ -61,10 +61,12 @@ fn live_check_reports_the_registry_head() {
     // The tags the shell actually consults by default, so this test answers "does the shipped
     // configuration find the newest build?" rather than "does an arbitrary list work?".
     let tags = update::default_tags();
-    assert!(
-        tags.iter().any(|tag| tag == "alpha"),
-        "the shipped default must consult the alpha tag: {tags:?}"
-    );
+    for channel in ["latest", "next", "alpha"] {
+        assert!(
+            tags.iter().any(|tag| tag == channel),
+            "the shipped default must consult the {channel} tag: {tags:?}"
+        );
+    }
 
     // Any real published version outranks 0.0.1, so this must report an update.
     match update::check(&npm, update::PACKAGE, &tags, "0.0.1") {
@@ -76,7 +78,7 @@ fn live_check_reports_the_registry_head() {
     }
 
     // The registry's own tags, printed so a human can see what the default resolved to and
-    // whether a newer alpha existed at the time. Not asserted: the tags move without notice.
+    // which channel led at the time. Not asserted: the tags move without notice.
     let published = update::fetch_dist_tags(&npm, update::PACKAGE)
         .expect("the registry must answer with its dist-tags");
     let mut names: Vec<&str> = published.iter().map(|(name, _)| name.as_str()).collect();

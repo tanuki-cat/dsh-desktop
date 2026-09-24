@@ -176,24 +176,34 @@ fn collected(rx: Option<mpsc::Receiver<Captured>>) -> Captured {
         .unwrap_or_else(Captured::empty)
 }
 
-/// The dist-tags this shell follows by default: the release channel plus `alpha`.
+/// The dist-tags this shell follows by default: every channel upstream publishes to.
 ///
 /// `latest` alone is what this shell shipped with, and it is not enough: upstream publishes
 /// ahead of it. Measured 2026-09-18, the registry answered `{"latest":"0.1.5-rc.2",
 /// "alpha":"0.1.6-alpha.2"}` — the alpha tag held the newest version on the registry and the
-/// shell never looked at it. `next` stays out: it tracked the same version as `latest` and
-/// carries no information `latest` does not.
+/// shell never looked at it.
+///
+/// `next` is in the list for the same reason, and it is not an edge case: which channel leads
+/// changes from release to release, so a fixed subset of them goes blind whenever the newest
+/// build lands in one it left out. Measured 2026-09-24, `{"latest":"0.1.5-rc.3",
+/// "next":"0.1.7-rc.1","alpha":"0.1.7-alpha.2"}` — `next` led both other tags and was the only
+/// version newer than the installed `0.1.7-alpha.2`, so a shell reading `latest` and `alpha`
+/// reported "up to date" while an update existed.
 ///
 /// A tag the registry does not publish is not a failure as long as one of the others matches
 /// (see [`check`]), which is what lets one list serve both the CLI and the plugin market:
 /// `dshmarket` publishes no `alpha`, so it is simply filtered out there.
 ///
-/// This reverses the 2026-09-15 convergence to `["latest"]`; the original rationale and why it
-/// no longer holds are in §13.4 of the design document. `require_tested_dsh` is unchanged and
-/// still bounds what may be installed: an alpha outside the tested range is reported, not
-/// installed.
+/// This reverses the 2026-09-15 convergence to `["latest"]` and the 2026-09-18 exclusion of
+/// `next`; the original rationale and why it no longer holds are in §13.4 of the design
+/// document. `require_tested_dsh` is unchanged and still bounds what may be installed: a
+/// version outside the tested range is reported, not installed.
 pub fn default_tags() -> Vec<String> {
-    vec!["latest".to_string(), "alpha".to_string()]
+    vec![
+        "latest".to_string(),
+        "next".to_string(),
+        "alpha".to_string(),
+    ]
 }
 
 /// The CLI this shell supervises.

@@ -430,8 +430,8 @@ TCC 归因仍待验证。
   并在 npm 全局前缀 ≠ CLI 实际位置时带 `--prefix` —— 与启动脚本一致。
 - 时序：**更新在探测之前**；更新成功则强制重启实例（否则复用旧进程仍跑旧二进制）。
 - 可见性：检查/安装/失败都写进 `logs/harness.log`；splash 显示"正在检查 dsh 更新…/发现新版本…"。
-- 配置：`auto_update`（默认 true）、`update_tags`（当时默认 `["latest","next"]`；后经两次修正，
-  现为 `["latest","alpha"]` —— 见本节末两条修正注）。
+- 配置：`auto_update`（默认 true）、`update_tags`（当时默认 `["latest","next"]`；后经三次修正，
+  现为 `["latest","next","alpha"]` —— 见本节末三条修正注）。
 
 > **2026-09-15 修正（默认值收敛）**：`update_tags` 默认改为 **`["latest"]`** —— 预发布渠道 `next` 不该是
 > 桌面用户的默认目标。同轮一并收敛的还有：`auto_update_plugins` 默认 **`false`**（profile 是用户数据）、
@@ -459,6 +459,38 @@ TCC 归因仍待验证。
 >
 > 验证：单测 192 → **194**；联网集成测试改用 `update::default_tags()` 并打印 registry 实际标签，
 > 实测 `live registry head = 0.1.6-alpha.2 (dist-tags: ["latest", "alpha"])`（改动前为 `0.1.5-rc.2`）。
+
+> **2026-09-24 第三次修正（`next` 收回，改为覆盖全部渠道）**：`update_tags` 默认改为
+> **`["latest","next","alpha"]`**，**推翻上面那次对 `next` 的排除**。
+>
+> 触发场景（用户实测报告）：桌面壳启动时"没有检测到 dsh 的新版本"。当天 registry 返回
+> `{"latest":"0.1.5-rc.3","next":"0.1.7-rc.1","alpha":"0.1.7-alpha.2"}`，本机已装 `0.1.7-alpha.2` ——
+> 三个标签里**只有 `next` 比已装版本新**，而它正是被排除的那个，于是壳判 `UpToDate`、
+> 日志写 `dsh is up to date: 0.1.7-alpha.2`。缓存与网络查询本身都是好的：`update-check.json` 的
+> `checked_at`/`installed`/`latest` 三项与实时 registry 完全一致，问题只在"问哪几个标签"。
+>
+> 上面那次排除 `next` 的理由是"它当时与 `latest` 同版本，不提供额外信息"——这是一个**关于当时
+> registry 状态的观察，不是一条稳定性质**。哪个渠道领先会随发版变化：09-18 领先的是 `alpha`，
+> 09-24 领先的是 `next`。只要默认值是一份固定子集，最新构建落在这份子集之外时壳就必然失明，
+> 而"失明"的表现恰好是最难被发现的：不是报错，是报"已是最新"。
+>
+> 真正管住安装范围的自始至终是 `require_tested_dsh`（默认开，区间 `[0.1.5-rc.1, 0.2.0)`），
+> 不是标签白名单——这正是 09-18 纳入 `alpha` 时已经确立的论据，本次只是把它贯彻到底：
+> 标签列表的职责是"别漏掉上游发布过的版本"，"哪些版本能装"由版本闸门回答。因此本次**不再**逐渠道
+> 论证该不该跟，而是让默认值覆盖上游发布的全部渠道。
+>
+> 配套改动：
+>
+> - `update/tests.rs` 的 `release_and_alpha_tags()` 改名为 `shipped_tags()` 并**委托给
+>   `default_tags()`**。此前测试自己写死一份列表，因此默认值怎么改测试都不会响——这正是 `next`
+>   被排除后无人发现的原因。
+> - 新增两个回归用例：`the_shipped_default_consults_every_upstream_channel`（默认值必须含三个渠道）、
+>   `the_next_tag_can_be_the_only_newer_version_on_the_registry`（09-24 的真实数据：旧列表判
+>   `UpToDate`、新列表判 `UpdateAvailable { to: 0.1.7-rc.1 }`，且该版本在已测试区间内可装）。
+> - 联网集成测试与 `src/tests.rs` 的默认值断言同步为三个渠道。
+>
+> 边界：`dshmarket` 没有 `alpha`（也没有 `next`）标签，但"registry 没有该标签只要还有一个匹配就
+> 不算失败"的既有规则不受影响，插件市场那条路径照旧。
 
 验证：`cargo test` **12 passed**（6 原有 + 6 版本比较）；另加一个联网集成测试
 `tests/update_live.rs`（默认跳过，设 `DSH_DESKTOP_LIVE_TESTS=1` 才跑），实测本机 registry head =

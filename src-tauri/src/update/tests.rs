@@ -102,6 +102,69 @@ fn the_alpha_tag_can_be_the_newest_version_on_the_registry() {
     assert_eq!(newest_tagged(&behind).unwrap().to_string(), "0.1.5-rc.2");
 }
 
+/// The shipped default must consult every channel upstream publishes to. Which one leads moves
+/// between releases, so a list that names a fixed subset goes blind whenever the newest build
+/// lands in a channel it left out — which is exactly how `next` came to be included.
+#[test]
+fn the_shipped_default_consults_every_upstream_channel() {
+    let tags = shipped_tags();
+    for channel in ["latest", "next", "alpha"] {
+        assert!(
+            tags.iter().any(|tag| tag == channel),
+            "the shipped default must consult {channel}: {tags:?}"
+        );
+    }
+}
+
+/// The miss this list exists to prevent, measured 2026-09-24: `next` led both other channels and
+/// held the only version newer than the installed one. A shell reading `latest` and `alpha`
+/// alone answered "up to date" while an update was published.
+#[test]
+fn the_next_tag_can_be_the_only_newer_version_on_the_registry() {
+    let installed = "0.1.7-alpha.2";
+    let published = [
+        ("latest".to_string(), "0.1.5-rc.3".to_string()),
+        ("next".to_string(), "0.1.7-rc.1".to_string()),
+        ("alpha".to_string(), "0.1.7-alpha.2".to_string()),
+    ];
+    let select = |wanted: &[&str]| -> Vec<(String, String)> {
+        published
+            .iter()
+            .filter(|(name, _)| wanted.contains(&name.as_str()))
+            .cloned()
+            .collect()
+    };
+
+    // What the shell used to ask: both other channels are at or below the installed version.
+    assert_eq!(
+        judge(
+            &newest_tagged(&select(&["latest", "alpha"]))
+                .unwrap()
+                .to_string(),
+            installed
+        ),
+        Status::UpToDate {
+            version: "0.1.7-alpha.2".into()
+        }
+    );
+
+    // What it asks now: the release-candidate channel is the update.
+    assert_eq!(
+        judge(
+            &newest_tagged(&select(&["latest", "next", "alpha"]))
+                .unwrap()
+                .to_string(),
+            installed
+        ),
+        Status::UpdateAvailable {
+            from: installed.into(),
+            to: "0.1.7-rc.1".into()
+        }
+    );
+    // Inside the tested range, so the gate admits the install rather than only reporting it.
+    assert!(may_install("0.1.7-rc.1", true));
+}
+
 /// One tag list serves both the CLI and the plugin market, so a tag the registry does not publish
 /// must not fail the check: `dshmarket` has no `alpha` tag at all.
 #[test]
@@ -111,7 +174,7 @@ fn a_tag_the_registry_does_not_publish_is_ignored_while_another_matches() {
         ("beta".to_string(), "1.19.0-beta.4".to_string()),
         ("latest".to_string(), "1.47.0".to_string()),
     ];
-    let wanted = ["latest".to_string(), "alpha".to_string()];
+    let wanted = shipped_tags();
     let selected: Vec<(String, String)> = market
         .into_iter()
         .filter(|(name, _)| wanted.iter().any(|w| w == name))
@@ -164,8 +227,11 @@ fn release_tags() -> Vec<String> {
     vec!["latest".to_string()]
 }
 
-fn release_and_alpha_tags() -> Vec<String> {
-    vec!["latest".to_string(), "alpha".to_string()]
+/// The shipped default, read from its one definition rather than spelled out again: a test
+/// that hard-codes the list cannot notice the list changing, which is how `next` stayed out of
+/// it after it had become the leading channel.
+fn shipped_tags() -> Vec<String> {
+    default_tags()
 }
 
 #[test]
@@ -231,12 +297,13 @@ fn cache_freshness_follows_interval_installed_version_and_tags() {
         360
     ));
     // A different set of tags is a different question: an answer built from `latest` alone says
-    // nothing about whether `alpha` has moved, so it must not be reused once the default grows.
+    // nothing about whether the other channels have moved, so it must not be reused once the
+    // default grows.
     assert!(
         !entry(Some("0.1.5-rc.2"), "0.1.5-rc.1", release.clone()).is_fresh(
             1_000 + 60,
             "0.1.5-rc.1",
-            &release_and_alpha_tags(),
+            &shipped_tags(),
             60
         )
     );
@@ -247,7 +314,7 @@ fn cache_freshness_follows_interval_installed_version_and_tags() {
     )
     .expect("a cache file from an older shell must still parse");
     assert!(legacy.tags.is_empty());
-    assert!(!legacy.is_fresh(1_000 + 60, "0.1.5-rc.1", &release_and_alpha_tags(), 60));
+    assert!(!legacy.is_fresh(1_000 + 60, "0.1.5-rc.1", &shipped_tags(), 60));
 }
 
 #[test]
@@ -258,7 +325,7 @@ fn cache_round_trips_on_disk() {
         checked_at: 42,
         installed: "0.1.5-rc.1".into(),
         latest: Some("0.1.5-rc.2".into()),
-        tags: release_and_alpha_tags(),
+        tags: shipped_tags(),
         attempted: Some("0.1.5-rc.2".into()),
         failed: None,
         failed_at: 0,

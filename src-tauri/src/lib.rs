@@ -94,11 +94,12 @@ pub struct Config {
     pub auto_update: bool,
     /// Dist-tags consulted in auto mode; the highest version among them wins.
     ///
-    /// Defaults to `latest` plus `alpha` — upstream publishes ahead of `latest`, so following
-    /// only the release tag means never seeing the newest build. A tag the registry does not
-    /// publish is ignored while another one matches, which is why this list is also usable for the
-    /// plugin market (`dshmarket` publishes no `alpha`). Narrow it to `["latest"]` to stay on
-    /// release versions only.
+    /// Defaults to every channel upstream publishes to — `latest`, `next` and `alpha` — because
+    /// which one leads changes from release to release: upstream publishes ahead of `latest`, and
+    /// a fixed subset of the channels goes blind whenever the newest build lands in one it left
+    /// out. A tag the registry does not publish is ignored while another one matches, which is why
+    /// this list is also usable for the plugin market (`dshmarket` publishes no `alpha`). Narrow
+    /// it to `["latest"]` to stay on release versions only.
     #[serde(default = "default_update_tags")]
     pub update_tags: Vec<String>,
     /// Trust a successful registry answer for this many minutes (0 = query on every start).
