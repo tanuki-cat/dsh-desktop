@@ -273,7 +273,7 @@ runtime-stage: runtime-fetch
 		"$(RUNTIME_DIR)/profile-template" "$(DSHMARKET_VERSION)" "$(RUNTIME_DIR)/tools/bin"
 	@xattr -cr $(RUNTIME_DIR) 2>/dev/null || true
 	@$(PYTHON) scripts/write_third_party_notices.py "$(RUNTIME_DIR)" "$(NODE_VERSION)" "$(DSH_VERSION)" "$(PNPM_VERSION)" "$(DSHMARKET_VERSION)"
-	@DSH_RUNTIME_MAX_FILES=45000 DSH_RUNTIME_MAX_MB=600 sh scripts/check-runtime-stage.sh "$(RUNTIME_DIR)"
+	@DSH_RUNTIME_MAX_FILES=45000 DSH_RUNTIME_MAX_MB=900 sh scripts/check-runtime-stage.sh "$(RUNTIME_DIR)"
 	@du -sh $(RUNTIME_DIR) 2>/dev/null || true
 
 # 打包"无需预装 node/dsh"的版本：bundle.resources 会把 runtime/ 一起塞进 .app。

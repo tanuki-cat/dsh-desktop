@@ -16,11 +16,12 @@
 set -eu
 
 # 2026-09-13 实测（macOS arm64 的干净 staging）：31,069 个文件 / 520 MB（du 块占用）。
+# dsh 0.2.0-rc.2 的干净 staging 在四个平台实测约 751–775 MB；尺寸上限预留到 900 MB。
 # 干净 staging 约 3 万文件：少一棵树（仅 dsh-prefix 就 2.5 万）或混进别的平台的 payload
 # 都会明显偏出，而"往 staging 里多放两万个文件"正是方案 §5（v3.1 第 4 条）实测过的漏网场景。
 min_files=${DSH_RUNTIME_MIN_FILES:-20000}
 max_files=${DSH_RUNTIME_MAX_FILES:-55000}
-max_mb=${DSH_RUNTIME_MAX_MB:-700}
+max_mb=${DSH_RUNTIME_MAX_MB:-900}
 
 root=$1
 [ -n "$root" ] || { echo "缺少 runtime 目录" >&2; exit 2; }
