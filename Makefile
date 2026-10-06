@@ -189,7 +189,7 @@ distclean: clean
 #   make runtime-clean    回收 staging 与下载缓存
 # staging 必须按平台各自执行：dsh 树里有平台相关的原生模块。
 NODE_VERSION      ?= 22.23.2
-DSH_VERSION       ?= 0.1.5-rc.2
+DSH_VERSION       ?= 0.2.0-rc.2
 PNPM_VERSION      ?= 12.3.4
 DSHMARKET_VERSION ?= 1.46.1
 RUNTIME_DIR       := $(TAURI_DIR)/runtime

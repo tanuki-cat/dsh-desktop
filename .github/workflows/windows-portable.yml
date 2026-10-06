@@ -19,7 +19,7 @@ on:
         description: 随包附带的 dsh 版本
         required: false
         type: string
-        default: 0.1.5-rc.2
+        default: 0.2.0-rc.2
       node_version:
         description: 随包附带的 Node 版本
         required: false
@@ -42,7 +42,7 @@ on:
         description: 随包附带的 dsh 版本
         required: false
         type: string
-        default: 0.1.5-rc.2
+        default: 0.2.0-rc.2
       node_version:
         description: 随包附带的 Node 版本
         required: false

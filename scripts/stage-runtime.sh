@@ -13,7 +13,7 @@ set -eu
 
 out=${1:?用法: stage-runtime.sh <runtime 目录>}
 node_version=${NODE_VERSION:-22.23.2}
-dsh_version=${DSH_VERSION:-0.1.5-rc.2}
+dsh_version=${DSH_VERSION:-0.2.0-rc.2}
 pnpm_version=${PNPM_VERSION:-12.3.4}
 market_version=${DSHMARKET_VERSION:-1.46.1}
 cache=${CACHE_DIR:-.runtime-cache}

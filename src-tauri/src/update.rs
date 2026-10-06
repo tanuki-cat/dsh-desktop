@@ -247,7 +247,7 @@ pub fn failure_window_secs(failures: u32) -> u64 {
 /// version outside this window may rename a flag or change that line. Saying so at startup beats
 /// failing later with a confusing timeout.
 pub const TESTED_MIN: &str = "0.1.5-rc.1";
-pub const TESTED_MAX_EXCLUSIVE: &str = "0.2.0";
+pub const TESTED_MAX_EXCLUSIVE: &str = "0.2.1-alpha.2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {

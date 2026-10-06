@@ -770,12 +770,14 @@ fn compatibility_flags_versions_outside_the_tested_range() {
     assert_eq!(compatibility(TESTED_MIN), Compatibility::Tested);
     assert_eq!(compatibility("0.1.5-rc.2"), Compatibility::Tested);
     assert_eq!(compatibility("0.1.9"), Compatibility::Tested);
+    assert_eq!(compatibility("0.2.0"), Compatibility::Tested);
+    assert_eq!(compatibility("0.2.1-alpha.1"), Compatibility::Tested);
     assert!(matches!(
         compatibility("0.1.4"),
         Compatibility::Older { .. }
     ));
     assert!(matches!(
-        compatibility("0.2.0"),
+        compatibility("0.2.1-alpha.2"),
         Compatibility::Newer { .. }
     ));
     assert!(matches!(
@@ -799,19 +801,11 @@ fn a_version_that_would_not_be_run_is_not_installed() {
     // Inside the tested range: install normally.
     assert!(may_install("0.1.5-rc.2", true));
     assert!(may_install("0.1.9", true));
-    // The alpha line the shell now follows by default: 0.1.6-alpha.2 is inside
-    // [TESTED_MIN, TESTED_MAX_EXCLUSIVE), so following the tag does not trip the gate.
-    assert!(may_install("0.1.6-alpha.2", true));
-    // The gate is about the tested *range*, not about prerelease status — a prerelease of the
-    // boundary version sorts below it, so it is admitted, exactly like a release inside the range.
-    // Recorded rather than asserted as desirable: 0.2.0-alpha.1 previews the untested 0.2.0 line,
-    // and an exclusive upper bound does not exclude it.
-    assert!(may_install("0.2.0-alpha.1", true));
-    // Past the boundary either way, prerelease or not: refused.
-    assert!(!may_install("0.2.0", true));
-    assert!(!may_install("0.2.1-rc.1", true));
-    // Past it: the startup check would refuse, so the install must not happen either.
-    assert!(!may_install("0.2.0", true));
+    assert!(may_install("0.2.0", true));
+    assert!(may_install("0.2.1-alpha.1", true));
+    // Only versions below the next prerelease are allowed by default.
+    assert!(!may_install("0.2.1-alpha.2", true));
+    assert!(!may_install("0.2.1", true));
     assert!(!may_install("1.0.0", true));
     assert!(!may_install("未知", true));
     // With the gate switched off the user has accepted untested versions, so both steps
