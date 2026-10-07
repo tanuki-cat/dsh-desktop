@@ -5,6 +5,24 @@
 
 use super::*;
 
+#[test]
+fn plugin_install_only_accepts_the_requested_version() {
+    assert_eq!(
+        plugin_install_outcome(Some("2.0.0"), "1.0.0", "2.0.0"),
+        PluginInstallOutcome::Updated
+    );
+    assert_eq!(
+        plugin_install_outcome(Some("1.0.0"), "1.0.0", "2.0.0"),
+        PluginInstallOutcome::Unchanged
+    );
+    for actual in [None, Some("1.5.0"), Some("")] {
+        assert_eq!(
+            plugin_install_outcome(actual, "1.0.0", "2.0.0"),
+            PluginInstallOutcome::Invalid
+        );
+    }
+}
+
 /// A staged update is verified and swapped, and a launch that never confirmed it is undone by
 /// the next one. This is the whole P2-10 contract, minus the npm call.
 #[test]

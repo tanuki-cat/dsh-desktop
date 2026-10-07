@@ -66,6 +66,42 @@ fn a_tree_without_its_entry_script_is_not_a_usable_install() {
 }
 
 #[test]
+fn cross_device_copy_publishes_only_complete_tree() {
+    let root = scratch("cross-device-copy");
+    let source = root.join("source");
+    let target = root.join("target");
+    write(&source.join("nested/marker"), "complete");
+
+    copy_across_devices(&source, &target).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(target.join("nested/marker")).unwrap(),
+        "complete"
+    );
+    assert!(!source.exists());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+
+    let next = root.join("next");
+    write(&next.join("marker"), "new");
+    assert!(copy_across_devices(&next, &target).is_err());
+    assert!(next.exists());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn only_cross_device_rename_errors_allow_copying() {
+    #[cfg(unix)]
+    assert!(is_cross_device(&std::io::Error::from_raw_os_error(
+        libc::EXDEV
+    )));
+    #[cfg(windows)]
+    assert!(is_cross_device(&std::io::Error::from_raw_os_error(17)));
+    assert!(!is_cross_device(&std::io::Error::from(
+        std::io::ErrorKind::PermissionDenied
+    )));
+}
+
+#[test]
 fn a_commit_replaces_the_live_tree_and_keeps_the_previous_one() {
     let root = scratch("commit");
     let target = root.join("live");

@@ -129,9 +129,9 @@ pub fn verify_install(prefix: &Path, package: &str, expected: &str) -> Result<Ve
 
 /// Move a path, falling back to copy-then-remove when the two ends are on different filesystems.
 ///
-/// `rename` is what makes the swap atomic, so it is always tried first. The fallback is not
-/// atomic and is only reached when the rollback directory and the live prefix sit on different
-/// volumes — a configuration the user chose by pointing `dsh_path` at another disk.
+/// `rename` is tried first. Only a cross-device error falls back to copying into a private
+/// directory beside the destination and renaming it into place after the copy finishes. Other
+/// errors must not turn into a partial copy over an existing tree.
 pub fn move_path(from: &Path, to: &Path) -> Result<(), String> {
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)
@@ -139,18 +139,66 @@ pub fn move_path(from: &Path, to: &Path) -> Result<(), String> {
     }
     match std::fs::rename(from, to) {
         Ok(()) => Ok(()),
-        Err(rename_error) => {
-            copy_tree(from, to).map_err(|error| {
-                format!(
-                    "无法移动 {} 到 {}（rename: {rename_error}；copy: {error}）",
-                    from.display(),
-                    to.display()
-                )
-            })?;
-            std::fs::remove_dir_all(from)
-                .map_err(|error| format!("复制完成但无法删除 {}: {error}", from.display()))
+        Err(error) if is_cross_device(&error) => copy_across_devices(from, to),
+        Err(error) => Err(format!(
+            "无法移动 {} 到 {}: {error}",
+            from.display(),
+            to.display()
+        )),
+    }
+}
+
+fn is_cross_device(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EXDEV)
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_NOT_SAME_DEVICE
+        error.raw_os_error() == Some(17)
+    }
+}
+
+/// Copy out of sight on the destination volume, then publish with one rename.
+fn copy_across_devices(from: &Path, to: &Path) -> Result<(), String> {
+    let parent = to
+        .parent()
+        .ok_or_else(|| format!("目标没有父目录: {}", to.display()))?;
+    let name = to
+        .file_name()
+        .ok_or_else(|| format!("目标没有名称: {}", to.display()))?;
+    let mut temporary = None;
+    for index in 0..1000 {
+        let mut candidate = name.to_os_string();
+        candidate.push(format!(".copy-{}-{index}", std::process::id()));
+        let candidate = parent.join(candidate);
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                temporary = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("无法创建临时目录 {}: {error}", candidate.display())),
         }
     }
+    let temporary = temporary.ok_or_else(|| format!("无法预留 {} 的临时目录", to.display()))?;
+    let result = (|| {
+        copy_tree(from, &temporary)
+            .map_err(|error| format!("无法复制 {}: {error}", from.display()))?;
+        // A second writer must not be merged into or replaced by this copy.
+        if std::fs::symlink_metadata(to).is_ok() {
+            return Err(format!("目标已存在: {}", to.display()));
+        }
+        std::fs::rename(&temporary, to)
+            .map_err(|error| format!("无法提交复制目录 {}: {error}", to.display()))?;
+        std::fs::remove_dir_all(from)
+            .map_err(|error| format!("复制完成但无法删除 {}: {error}", from.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&temporary);
+    }
+    result
 }
 
 /// Put `staged` in place of `target`, keeping the previous tree at `backup`.

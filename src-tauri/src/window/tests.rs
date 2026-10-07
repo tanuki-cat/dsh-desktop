@@ -1349,35 +1349,32 @@ fn download_names_never_collide() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    // Free name is used as-is, taken names get a counter before the extension.
-    assert_eq!(
-        unique_download_path(&dir, std::ffi::OsStr::new("a.pdf")),
-        dir.join("a.pdf")
-    );
-    std::fs::write(dir.join("a.pdf"), "x").unwrap();
-    assert_eq!(
-        unique_download_path(&dir, std::ffi::OsStr::new("a.pdf")),
-        dir.join("a-1.pdf")
-    );
-    std::fs::write(dir.join("a-1.pdf"), "x").unwrap();
-    assert_eq!(
-        unique_download_path(&dir, std::ffi::OsStr::new("a.pdf")),
-        dir.join("a-2.pdf")
-    );
+    let name = std::ffi::OsStr::new("a.pdf");
+    let first = unique_download_path(&dir, name, 0);
+    assert_eq!(first, dir.join("a.pdf"));
+    // The first request has not created its file yet. The second must still differ.
+    let second = unique_download_path(&dir, name, 1);
+    let third = unique_download_path(&dir, name, 2);
+    assert_ne!(first, second);
+    assert_ne!(second, third);
+    std::fs::write(&second, "x").unwrap();
+    let fallback = unique_download_path(&dir, name, 1);
+    assert_ne!(fallback, second);
+    assert_ne!(fallback, third);
+    assert!(!fallback.exists());
     // Extension-less names keep working.
-    std::fs::write(dir.join("b"), "x").unwrap();
-    assert_eq!(
-        unique_download_path(&dir, std::ffi::OsStr::new("b")),
-        dir.join("b-1")
-    );
+    let plain = unique_download_path(&dir, std::ffi::OsStr::new("b"), 3);
+    assert!(plain
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("b-"));
+    assert!(plain.extension().is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Exhausting the numbered candidates must not fall back to a name that is already taken.
-///
-/// The old fallback returned the requested name itself, so the one case it existed for — a
-/// thousand files already called `a.pdf` — silently overwrote one of them (review C4).
+/// An already occupied serial-based name must move to another free destination.
 #[test]
 fn an_exhausted_name_search_never_reuses_a_taken_file() {
     let dir = std::env::temp_dir().join(format!(
@@ -1389,11 +1386,10 @@ fn an_exhausted_name_search_never_reuses_a_taken_file() {
 
     let name = std::ffi::OsStr::new("a.pdf");
     std::fs::write(dir.join("a.pdf"), "x").unwrap();
-    for index in 1..1000 {
-        std::fs::write(dir.join(format!("a-{index}.pdf")), "x").unwrap();
-    }
+    let reserved = unique_download_path(&dir, name, 42);
+    std::fs::write(&reserved, "x").unwrap();
 
-    let chosen = unique_download_path(&dir, name);
+    let chosen = unique_download_path(&dir, name, 42);
     assert!(
         !chosen.exists(),
         "the chosen name must be free: {}",

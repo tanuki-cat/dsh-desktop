@@ -92,11 +92,17 @@ pub(crate) fn update_market_plugin(
     );
     match installed {
         Ok(()) => {
-            let after =
-                update::installed_plugin(profile_dir, update::MARKET_PLUGIN).unwrap_or_default();
-            if after == from {
-                // pnpm wrote the package somewhere the profile does not load it from: report
-                // and remember the attempt instead of retrying on every launch.
+            let after = update::installed_plugin(profile_dir, update::MARKET_PLUGIN);
+            if plugin_install_outcome(after.as_deref(), from, to) == PluginInstallOutcome::Updated {
+                harness::app_log(&format!(
+                    "plugin updated: {} {from} -> {to}",
+                    update::MARKET_PLUGIN
+                ));
+                return true;
+            }
+            if plugin_install_outcome(after.as_deref(), from, to) == PluginInstallOutcome::Unchanged
+            {
+                // pnpm wrote the package somewhere the profile does not load it from.
                 update::mark_plugin_attempt_ineffective(data_dir, to);
                 harness::app_log(&format!(
                     "plugin installed but the profile still loads {} {from}",
@@ -104,11 +110,19 @@ pub(crate) fn update_market_plugin(
                 ));
                 return false;
             }
+            // A successful exit is not proof that the profile contains the requested package.
+            // A missing or unexpected version must not leave an unusable profile in place.
+            let restored = restore_profile(&snapshot, profile_dir);
+            update::mark_plugin_attempt_failed(data_dir, to);
             harness::app_log(&format!(
-                "plugin updated: {} {from} -> {after}",
-                update::MARKET_PLUGIN
+                "plugin install returned success but profile loads {:?} instead of {to}{}",
+                after,
+                match restored {
+                    Ok(()) => "（已从快照恢复 profile）".to_string(),
+                    Err(error) => format!("（profile 恢复失败: {error}）"),
+                }
             ));
-            true
+            false
         }
         Err(reason) => {
             // pnpm may have rewritten the profile before it gave up: put the snapshot back so
@@ -127,6 +141,21 @@ pub(crate) fn update_market_plugin(
             ));
             false
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PluginInstallOutcome {
+    Updated,
+    Unchanged,
+    Invalid,
+}
+
+fn plugin_install_outcome(actual: Option<&str>, from: &str, to: &str) -> PluginInstallOutcome {
+    match actual {
+        Some(version) if version == to => PluginInstallOutcome::Updated,
+        Some(version) if version == from => PluginInstallOutcome::Unchanged,
+        _ => PluginInstallOutcome::Invalid,
     }
 }
 

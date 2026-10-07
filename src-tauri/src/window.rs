@@ -28,6 +28,8 @@ pub const CHOICE_EVENT: &str = "dsh-desktop:takeover-choice";
 
 /// Question ids, so an answer that crossed a retry cannot be mistaken for the current one.
 static NEXT_QUESTION: AtomicU64 = AtomicU64::new(0);
+/// Distinct destinations even before earlier downloads create their files.
+static NEXT_DOWNLOAD: AtomicU64 = AtomicU64::new(0);
 
 /// APIs the compat layer can install when this WebView lacks them (see [`compat_script`]).
 ///
@@ -2042,7 +2044,8 @@ pub fn create_harness(
                         // download", which is better than writing the file next to the process.
                         return false;
                     };
-                    *destination = unique_download_path(&dir, &file_name_of(destination));
+                    let serial = NEXT_DOWNLOAD.fetch_add(1, Ordering::Relaxed);
+                    *destination = unique_download_path(&dir, &file_name_of(destination), serial);
                     harness::app_log(&format!(
                         "download started: {url} -> {}",
                         destination.display()
@@ -2831,11 +2834,11 @@ fn downloads_dir() -> Option<PathBuf> {
     None
 }
 
-/// Never overwrite an existing download: `report.pdf` becomes `report-1.pdf` when taken.
-fn unique_download_path(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
-    let candidate = dir.join(name);
-    if !candidate.exists() {
-        return candidate;
+/// Give each request a distinct name, even before an earlier download appears on disk.
+fn unique_download_path(dir: &Path, name: &std::ffi::OsStr, serial: u64) -> PathBuf {
+    let requested = dir.join(name);
+    if serial == 0 && std::fs::symlink_metadata(&requested).is_err() {
+        return requested;
     }
     let name = Path::new(name);
     let stem = name
@@ -2845,28 +2848,25 @@ fn unique_download_path(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
     let extension = name
         .extension()
         .map(|ext| ext.to_string_lossy().to_string());
-    for index in 1..1000 {
+    // WebKit may not create the file until after Requested returns. A distinct request serial
+    // prevents concurrent callbacks in this process from choosing the same still-free path.
+    let prefix = format!("{stem}-{}-{serial}", std::process::id());
+    for index in 0u64.. {
+        let suffix = if index == 0 {
+            String::new()
+        } else {
+            format!("-{index}")
+        };
         let file = match &extension {
-            Some(extension) => format!("{stem}-{index}.{extension}"),
-            None => format!("{stem}-{index}"),
+            Some(extension) => format!("{prefix}{suffix}.{extension}"),
+            None => format!("{prefix}{suffix}"),
         };
         let candidate = dir.join(file);
-        if !candidate.exists() {
+        if std::fs::symlink_metadata(&candidate).is_err() {
             return candidate;
         }
     }
-    // A thousand taken names is not a reason to overwrite the file that is already there — the
-    // old fallback returned exactly that name, so the download silently replaced it. A timestamp
-    // is unique enough to finish the download, and readable enough to find again (review C4).
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
-    let file = match &extension {
-        Some(extension) => format!("{stem}-{stamp}.{extension}"),
-        None => format!("{stem}-{stamp}"),
-    };
-    dir.join(file)
+    unreachable!("download destination index exhausted")
 }
 
 fn file_name_of(suggested: &std::path::Path) -> std::ffi::OsString {
