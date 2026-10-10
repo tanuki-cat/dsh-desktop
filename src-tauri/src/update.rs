@@ -246,8 +246,16 @@ pub fn failure_window_secs(failures: u32) -> u64 {
 /// through `--profile web --patch … --no-open --port N` and parses its `dsh web:` line, so a
 /// version outside this window may rename a flag or change that line. Saying so at startup beats
 /// failing later with a confusing timeout.
+///
+/// The upper bound names the next *release* line, not the newest prerelease upstream has published.
+/// Pinning it to the newest alpha seen turns the next alpha into a launch failure, on the channel
+/// this shell follows by default and one day after the build that set the bound: 0.2.1-alpha.2 was
+/// published 2026-10-09, while `0.2.1-alpha.2` was written here as the bound on 2026-10-06 from the
+/// then-newest 0.2.1-alpha.1 — so the shell refused to boot the version its own update check had
+/// just been told to follow. Every 0.2.1 prerelease sorts below `0.2.1`, so the whole line stays
+/// admitted while the release itself still needs its own verification.
 pub const TESTED_MIN: &str = "0.1.5-rc.1";
-pub const TESTED_MAX_EXCLUSIVE: &str = "0.2.1-alpha.2";
+pub const TESTED_MAX_EXCLUSIVE: &str = "0.2.1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {

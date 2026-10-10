@@ -772,12 +772,13 @@ fn compatibility_flags_versions_outside_the_tested_range() {
     assert_eq!(compatibility("0.1.9"), Compatibility::Tested);
     assert_eq!(compatibility("0.2.0"), Compatibility::Tested);
     assert_eq!(compatibility("0.2.1-alpha.1"), Compatibility::Tested);
+    assert_eq!(compatibility("0.2.1-alpha.2"), Compatibility::Tested);
     assert!(matches!(
         compatibility("0.1.4"),
         Compatibility::Older { .. }
     ));
     assert!(matches!(
-        compatibility("0.2.1-alpha.2"),
+        compatibility("0.2.1"),
         Compatibility::Newer { .. }
     ));
     assert!(matches!(
@@ -792,6 +793,42 @@ fn compatibility_flags_versions_outside_the_tested_range() {
     assert!(Version::parse(TESTED_MIN).unwrap() < Version::parse(TESTED_MAX_EXCLUSIVE).unwrap());
 }
 
+/// The bound names the next release line, so every prerelease below it must boot.
+///
+/// This is the property the field failure of 2026-10-09 broke. The bound was written on
+/// 2026-10-06 as `0.2.1-alpha.2` — then the newest build on the registry, and the very channel
+/// `default_tags()` follows — and upstream published `0.2.1-alpha.2` three days later. The shell
+/// then refused to start the CLI its own update check had been told to follow, on a machine where
+/// nothing about the CLI had changed: the five contracts (four launcher flags and the `dsh web:`
+/// line) were all still satisfied by that version when it was measured against them.
+///
+/// The spellings are derived from the bound rather than written out, so raising the bound to the
+/// next line keeps this test meaningful instead of making it a list of dead versions.
+#[test]
+fn the_upper_bound_admits_every_prerelease_below_the_line_it_names() {
+    let bound = Version::parse(TESTED_MAX_EXCLUSIVE).unwrap();
+    // The bound itself is the first version that needs its own verification.
+    assert!(matches!(
+        compatibility(TESTED_MAX_EXCLUSIVE),
+        Compatibility::Newer { .. }
+    ));
+    let line = format!("{}.{}.{}", bound.major, bound.minor, bound.patch);
+    for suffix in [
+        "alpha.0", "alpha.1", "alpha.2", "alpha.99", "beta.1", "rc.1",
+    ] {
+        let prerelease = format!("{line}-{suffix}");
+        assert!(
+            Version::parse(&prerelease).unwrap() < bound,
+            "{prerelease} must sort below the {TESTED_MAX_EXCLUSIVE} bound"
+        );
+        assert_eq!(
+            compatibility(&prerelease),
+            Compatibility::Tested,
+            "{prerelease} sorts below the bound, so a machine running it must still boot"
+        );
+    }
+}
+
 /// `auto_update` and `require_tested_dsh` are on together by default, so the update path has
 /// to respect the same range the startup check enforces. Installing a version that would then
 /// be refused leaves the user with a CLI this shell wrote and will not run, and the working
@@ -803,9 +840,10 @@ fn a_version_that_would_not_be_run_is_not_installed() {
     assert!(may_install("0.1.9", true));
     assert!(may_install("0.2.0", true));
     assert!(may_install("0.2.1-alpha.1", true));
-    // Only versions below the next prerelease are allowed by default.
-    assert!(!may_install("0.2.1-alpha.2", true));
-    assert!(!may_install("0.2.1", true));
+    assert!(may_install("0.2.1-alpha.2", true));
+    // The bound itself and everything above it: a version the startup check would refuse is never
+    // installed either, which is the whole point of the two sharing one range.
+    assert!(!may_install(TESTED_MAX_EXCLUSIVE, true));
     assert!(!may_install("1.0.0", true));
     assert!(!may_install("未知", true));
     // With the gate switched off the user has accepted untested versions, so both steps
