@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.4.12"
+version = "0.4.13"
 edition = "2021"
 rust-version = "1.77"
 description = "Tauri shell that supervises `dsh web` and hosts it in the system WebView"
@@ -26,3 +26,8 @@ url = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSSavePanel", "NSPanel", "NSResponder", "NSWindow"] }

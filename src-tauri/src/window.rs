@@ -13,6 +13,8 @@ use tauri::webview::{DownloadEvent, NewWindowResponse, PageLoadEvent};
 use tauri::{AppHandle, Manager, Webview, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use url::Url;
 
+mod download;
+
 pub const SPLASH: &str = "splash";
 pub const HARNESS: &str = "harness";
 
@@ -2081,28 +2083,40 @@ pub fn create_harness(
                 set_title_if(&window, &compose_title(pending_notice().as_deref(), false));
             }
         })
-        // Downloads land in the user's Downloads folder instead of vanishing.
-        .on_download(move |_webview, event| {
+        // macOS needs a user-selected path to grant WebKit write access to protected folders.
+        .on_download(move |webview, event| {
             match event {
                 DownloadEvent::Requested { url, destination } => {
-                    let Some(dir) = downloads_dir() else {
-                        harness::app_log(&format!("download dropped (no directory): {url}"));
-                        // Refusing here is the point: wry treats a `false` return as "do not
-                        // download", which is better than writing the file next to the process.
-                        return false;
-                    };
                     let serial = NEXT_DOWNLOAD.fetch_add(1, Ordering::Relaxed);
-                    *destination = unique_download_path(&dir, &file_name_of(destination), serial);
+                    match download::destination(destination, serial) {
+                        Ok(Some(path)) => *destination = path,
+                        Ok(None) => {
+                            harness::app_log(&format!("download cancelled by user: {url}"));
+                            return false;
+                        }
+                        Err(error) => {
+                            harness::app_log(&format!("download refused: {url}: {error}"));
+                            let _ = webview
+                                .window()
+                                .set_title("DSH Desktop — 无法保存下载，请重试");
+                            return false;
+                        }
+                    }
                     harness::app_log(&format!(
                         "download started: {url} -> {}",
                         destination.display()
                     ));
                 }
-                DownloadEvent::Finished { url, path, .. } => {
-                    let where_to = path
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "unknown".into());
-                    harness::app_log(&format!("download finished: {url} -> {where_to}"));
+                DownloadEvent::Finished { url, path, success } => {
+                    harness::app_log(&format!(
+                        "{}: {url}",
+                        download::completion_message(success, path.as_deref())
+                    ));
+                    if !success {
+                        let _ = webview
+                            .window()
+                            .set_title("DSH Desktop — 下载未完成（失败或已取消）");
+                    }
                 }
                 // The enum is #[non_exhaustive]: future variants must not break the build.
                 _ => {}
