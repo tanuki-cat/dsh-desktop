@@ -4,6 +4,36 @@
 //! private items.
 
 use super::*;
+
+#[test]
+fn redacts_letter_only_prefixed_keys_and_bare_jwts() {
+    for secret in ["sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c"] {
+        assert_eq!(redact(&format!("error {secret} !")), "error *** !");
+    }
+    let identifier = "a_".repeat(32 * 1024);
+    assert_eq!(redact(&identifier), identifier);
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_logger_restricts_existing_backups() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::test_dir("log-backup-permissions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("harness.log");
+    let backup = backup_path(&path, 1);
+    std::fs::write(&backup, "old").unwrap();
+    std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let logger = Logger::with_limit(&path, 200);
+    assert_eq!(
+        std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    drop(logger);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[test]
@@ -660,6 +690,57 @@ fn quoted_redaction_keeps_the_structure() {
     ] {
         assert_eq!(redact(line), line, "prose or a count was rewritten");
     }
+}
+
+/// A long, random-looking run with no field name in front of it is still a credential.
+///
+/// The field-name pass cannot see the shapes that carry no name: a provider error that echoes a
+/// key into prose, a page's own `console.error` of an object stringified whole, a token in a URL
+/// path. Those arrive from the page's diagnostics, whose text this shell does not author, so the
+/// shape itself has to be enough.
+#[test]
+fn redacts_bare_credential_shaped_runs() {
+    // Real shapes: DeepSeek, GitHub, npm, and a JWT.
+    for secret in [
+        "sk-9f4b2c7e1a8d3f6b5c0e9a2d4f7b1c8e",
+        // Underscored tokens count too: an underscore stays inside a run unless a hyphen came
+        // first, so the whole token is judged as one.
+        "ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+        "npm_1a2B3c4D5e6F7g8H9i0J1k2L3m4N5o6P7q8R",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+    ] {
+        let line = format!("provider error: {secret} rejected");
+        let out = redact(&line);
+        assert!(!out.contains(secret), "未脱敏：{out}");
+        assert!(out.contains("***"), "未标记：{out}");
+        assert!(out.contains("rejected"), "其余文本必须保留：{out}");
+    }
+}
+
+/// Over-redaction is safe; eating ordinary log text is not, because the log is the only evidence
+/// a WebView-only fault leaves behind.
+#[test]
+fn keeps_ordinary_text_that_merely_looks_long() {
+    for line in [
+        "loaded /Users/someone/.dsh/profiles/web/node_modules/@deepseek-ai/dsh/lib/bin.js",
+        "spawn: node --profile web --patch /Users/someone/Library/Application Support/com.deepseek.dsh.desktop/force-print-url.yml",
+        // A plain word run, and a bare hex hash: the hash has one alphabet and no separators.
+        "the quick brown fox jumped over the lazy dog again and again and again",
+        "checksum 9f4b2c7e1a8d3f6b5c0e9a2d4f7b1c8e9f4b2c7e1a8d3f6b5c0e9a2d4f7b1c8e",
+        // Short values stay readable: a version, a port, a flag. (A *field* is redacted whatever
+        // its value — that is the field-name pass, pinned by the test below.)
+        "dsh 0.4.10 listening on 127.0.0.1:3080",
+    ] {
+        assert_eq!(redact(line), line, "普通文本被误伤：{line}");
+    }
+}
+
+/// The short keys a real error message carries are already covered by the field-name pass; this
+/// pins that the shape pass did not take over from it.
+#[test]
+fn field_name_redaction_still_wins() {
+    let out = redact("DEEPSEEK_API_KEY=sk-short1");
+    assert!(!out.contains("sk-short1"), "{out}");
 }
 
 /// The scheme check used to lowercase the whole rest of the line once per match, which made a

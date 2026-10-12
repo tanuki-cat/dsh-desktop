@@ -32,8 +32,81 @@ const RESERVED: &[&str] = &[
     "XPC_SERVICE_NAME",
 ];
 
+/// Variables that let whoever set them run code inside the supervised CLI.
+///
+/// They are ordinary environment entries to every other tool, so a user is entitled to export
+/// them for their own shell — but this app hands the captured environment to a long-lived child
+/// that it also updates and restarts, which turns each of these into a hook on the process the
+/// window is showing. `NODE_OPTIONS=--require …` alone is enough to run a file inside the CLI,
+/// and the loader variables do the same one level down. They are dropped on the way in rather
+/// than blanked, so the entry never reaches the child at all; the name is logged, never the
+/// value (the user can still pass one deliberately through `config.json`'s `env` map, which is
+/// theirs to edit and is documented as the override channel).
+///
+/// npm config names and Windows environment keys are matched without regard to case.
+const DANGEROUS: &[&str] = &[
+    // Node and its package managers: each of these is a code-execution hook for the CLI.
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+    "NPM_CONFIG_NODE_OPTIONS",
+    "NPM_CONFIG_REGISTRY",
+    "npm_config_registry",
+    // Dynamic loader: runs a library of the setter's choosing in every child.
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    // Shells: sourced by the helper shells the CLI itself spawns.
+    "BASH_ENV",
+    "ENV",
+    "ZDOTDIR",
+    "SHELLOPTS",
+    "PROMPT_COMMAND",
+    // Interpreters the CLI's tooling starts.
+    "PYTHONSTARTUP",
+    "PYTHONPATH",
+    "PERL5OPT",
+    "RUBYOPT",
+];
+
 pub fn is_reserved(key: &str) -> bool {
-    key == "_" || key.starts_with("DSH_") || RESERVED.contains(&key)
+    key == "_" || key.starts_with("DSH_") || RESERVED.contains(&key) || is_dangerous(key)
+}
+
+/// Is this a variable that would hand code execution to whoever set it?
+///
+/// Split out so the drop is testable on its own and callers can report it by name.
+pub fn is_dangerous(key: &str) -> bool {
+    DANGEROUS.iter().any(|name| {
+        if cfg!(windows) || name.starts_with("NPM_CONFIG_") || name.starts_with("npm_config_") {
+            name.eq_ignore_ascii_case(key)
+        } else {
+            *name == key
+        }
+    })
+}
+
+/// Remove inherited hooks before applying the explicit config.env overrides.
+pub fn sanitize_command(command: &mut std::process::Command) {
+    let configured: Vec<_> = command
+        .get_envs()
+        .map(|(key, _)| key.to_os_string())
+        .filter(|key| key.to_str().is_some_and(is_dangerous))
+        .collect();
+    for key in configured {
+        command.env_remove(key);
+    }
+    for key in DANGEROUS {
+        command.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(is_dangerous) {
+            command.env_remove(key);
+        }
+    }
 }
 
 /// Parse env output into pairs, dropping anything that is not a plain KEY=VALUE line

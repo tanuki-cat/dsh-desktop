@@ -5,6 +5,61 @@
 
 use super::*;
 
+#[test]
+fn npm_config_files_and_scoped_registry_are_isolated() {
+    let (command, config) = npm_command(Path::new("/opt/node/bin/npm")).unwrap();
+    assert_eq!(command.get_current_dir(), Some(config.0.as_path()));
+    let args: Vec<_> = command
+        .get_args()
+        .map(|v| v.to_string_lossy().into_owned())
+        .collect();
+    assert!(args.contains(&format!("--@deepseek-ai:registry={REGISTRY}")));
+    assert!(args.contains(&"--strict-ssl=true".to_string()));
+    let user = args.iter().position(|a| a == "--userconfig").unwrap();
+    let global = args.iter().position(|a| a == "--globalconfig").unwrap();
+    assert_ne!(args[user + 1], args[global + 1]);
+    for name in ["user.npmrc", "global.npmrc", ".npmrc"] {
+        assert_eq!(std::fs::read_to_string(config.0.join(name)).unwrap(), "");
+    }
+    let path = config.0.clone();
+    drop(config);
+    assert!(!path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn real_npm_ignores_user_scoped_registry_without_network() {
+    let Some(npm) = crate::locator::path_lookup("npm") else {
+        return;
+    };
+    let root = crate::test_dir("npm-config-isolation");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join(".npmrc"),
+        "@deepseek-ai:registry=https://mirror.invalid\nregistry=https://mirror.invalid\n",
+    )
+    .unwrap();
+    let (mut command, _config) = npm_command(&npm).unwrap();
+    command
+        .env("HOME", &root)
+        .env("NPM_CONFIG_REGISTRY", "https://env.invalid")
+        .env_remove("NPM_CONFIG_CACHE")
+        .env("npm_config_cache", root.join("cache"))
+        .args(["config", "get", "@deepseek-ai:registry"]);
+    let result = run_with_timeout(command, Duration::from_secs(10));
+    std::fs::remove_dir_all(root).unwrap();
+    let output = result.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr.bytes)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout.bytes).trim(),
+        REGISTRY
+    );
+}
+
 /// A package manager that prints for its whole budget must not turn that budget into memory:
 /// the drain keeps a bounded slice while still reading the pipe to the end.
 #[test]
@@ -78,6 +133,50 @@ fn picks_newest_among_dist_tags() {
 /// only reads the release tag never sees the newest build. Measured 2026-09-18, the registry
 /// answered `{"latest":"0.1.5-rc.2","alpha":"0.1.6-alpha.2"}` — and `0.1.6-alpha.2` outranks
 /// `0.1.5-rc.2` under semver even though its prerelease identifier sorts below `rc`.
+/// Every npm call is pinned to the public registry, and the two environment spellings npm reads
+/// are removed.
+///
+/// Left alone, the source of the code this shell installs — and then runs on the next launch — is
+/// whatever the invoking environment says: `.npmrc`, `NPM_CONFIG_REGISTRY`, a corporate proxy. The
+/// install path's only other checks are the package name and the version string, and any registry
+/// can forge both, so "where did this tree come from" has to be a constant of the build.
+#[test]
+fn npm_calls_are_pinned_to_the_public_registry() {
+    let (command, _config) = npm_command(Path::new("/opt/node/bin/npm")).unwrap();
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect();
+    let at = args
+        .iter()
+        .position(|arg| arg == "--registry")
+        .expect("npm 调用必须显式指定 registry");
+    assert_eq!(args.get(at + 1).map(String::as_str), Some(REGISTRY));
+    assert!(
+        REGISTRY.starts_with("https://"),
+        "registry 必须是 https：{REGISTRY}"
+    );
+    // Both spellings npm looks at, plus the user config file, are cleared rather than overridden:
+    // the flag wins over all of them anyway, and clearing them keeps a stray setting out of
+    // everything else npm reads from the same files.
+    let removed: Vec<String> = command
+        .get_envs()
+        .filter(|(_, value)| value.is_none())
+        .map(|(key, _)| key.to_string_lossy().to_string())
+        .collect();
+    for key in [
+        "npm_config_registry",
+        "NPM_CONFIG_REGISTRY",
+        "npm_config_userconfig",
+        "NPM_CONFIG_USERCONFIG",
+    ] {
+        assert!(
+            removed.contains(&key.to_string()),
+            "{key} 必须被清除：{removed:?}"
+        );
+    }
+}
+
 #[test]
 fn the_alpha_tag_can_be_the_newest_version_on_the_registry() {
     let tags = vec![

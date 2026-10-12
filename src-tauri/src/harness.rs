@@ -60,7 +60,9 @@ impl Ring {
 
     /// Keep one already-redacted line, dropping the oldest until both bounds hold.
     pub fn push_redacted(&self, line: &str) {
-        let mut tail = self.0.lock().unwrap();
+        // Poison-tolerant like `app_log`: one panicking reader must not turn every later line
+        // into a second panic on the same path.
+        let mut tail = lock_or_recover(&self.0);
         // A single line above the byte budget would otherwise evict everything and still be kept
         // whole; the reader caps lines at `LINE_LIMIT_BYTES`, so this only guards the bound.
         if line.len() > RING_BYTES {
@@ -78,9 +80,7 @@ impl Ring {
 
     /// The kept lines as one block, for the failure page. Never larger than [`RING_BYTES`].
     pub fn tail(&self) -> String {
-        self.0
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.0)
             .lines
             .iter()
             .cloned()
@@ -124,7 +124,83 @@ pub fn redact(line: &str) -> String {
     for key in SECRET_KEYS {
         out = redact_field(&out, key);
     }
+    redact_credential_shapes(&out)
+}
+
+const CREDENTIAL_RUN_MIN: usize = 32;
+const TOKEN_PREFIXES: &[&str] = &[
+    "sk-",
+    "sk_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "npm_",
+    "xoxb-",
+    "xoxp-",
+];
+
+fn redact_credential_shapes(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut run = String::new();
+    for ch in line.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/') {
+            run.push(ch);
+        } else {
+            push_run(&mut out, &run);
+            run.clear();
+            out.push(ch);
+        }
+    }
+    push_run(&mut out, &run);
     out
+}
+
+fn push_run(out: &mut String, run: &str) {
+    if run.is_empty() {
+        return;
+    }
+    // Known prefixes do not depend on digits: a valid random key may contain only letters.
+    let prefixed = TOKEN_PREFIXES
+        .iter()
+        .any(|prefix| run.starts_with(prefix) && run.len() >= prefix.len() + 16);
+    let jwt = if run.starts_with("eyJ") {
+        let mut parts = run.trim_end_matches('.').split('.');
+        let valid = |part: &str| {
+            part.len() >= 8
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        (0..3).all(|_| parts.next().is_some_and(valid)) && parts.next().is_none()
+    } else {
+        false
+    };
+    let bytes = run.as_bytes();
+    let opaque = run.len() >= CREDENTIAL_RUN_MIN
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        && bytes.iter().any(u8::is_ascii_alphabetic)
+        && bytes.iter().any(u8::is_ascii_digit)
+        && bytes.contains(&b'-')
+        && bytes.iter().filter(|&&b| b == b'-').count() <= 1;
+    if prefixed || jwt || opaque {
+        out.push_str("***");
+    } else {
+        out.push_str(run);
+    }
+}
+
+/// Lock a shared cell, tolerating a panic in whoever held it.
+///
+/// Every caller here is on a logging or reporting path: the value behind the lock is a bounded
+/// buffer of text, so the state it was left in is still readable, and dropping the line would
+/// hide the very evidence a report is about. `app_log` documents the same reasoning.
+pub(crate) fn lock_or_recover<T>(cell: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Authentication schemes whose credential sits in the token after the scheme name.
@@ -400,6 +476,10 @@ pub enum Probe {
 
 /// Bound every network touch: a peer that accepts the connection and then stays silent
 /// must not be able to park the startup thread forever.
+///
+/// This is the budget for the **whole** exchange, connect included. Charging the connect and
+/// then the exchange separately doubled the worst case, and the callers poll this probe on a
+/// 200 ms interval: one slow peer then cost them more than the wait they were measuring.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(600);
 
 /// How much of a response the probe keeps before giving up on it.
@@ -456,13 +536,14 @@ pub fn probe(port: u16) -> Probe {
         Ok(a) => a,
         Err(_) => return Probe::Other,
     };
+    // One deadline for the whole exchange: the connect gets what is left of it, and every
+    // read is re-armed against it (see `arm_within`). Splitting the budget in two charged the
+    // slowest peer twice, and these callers poll on a 200 ms interval.
+    let deadline = Instant::now() + PROBE_TIMEOUT;
     let mut stream = match TcpStream::connect_timeout(&addr, PROBE_TIMEOUT) {
         Ok(s) => s,
         Err(_) => return Probe::Closed,
     };
-    // The connect timeout does not cover the exchange, so the exchange gets a deadline of
-    // its own, re-armed before every read (see `arm_within`).
-    let deadline = Instant::now() + PROBE_TIMEOUT;
     let request = format!(
         "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: dsh-desktop\r\nConnection: close\r\n\r\n"
     );
@@ -570,8 +651,9 @@ pub fn release_market_recovery(port: u16) -> bool {
 /// here read a payload, and both run on a path that already knows the port is occupied.
 fn request(port: u16, method_and_path: &str) -> Option<Vec<u8>> {
     let addr = format!("127.0.0.1:{port}").parse().ok()?;
-    let mut stream = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).ok()?;
+    // Same one budget as `probe`: connect and exchange share it.
     let deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut stream = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).ok()?;
     let request = format!(
         "{method_and_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: dsh-desktop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
@@ -795,6 +877,7 @@ pub fn spawn(node: &Path, dsh_js: &Path, opts: &SpawnOptions<'_>) -> std::io::Re
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    crate::shellenv::sanitize_command(&mut command);
     command.envs(opts.env.iter().cloned());
     if let Some(home) = opts.dsh_home {
         command.env("DSH_HOME", home);
@@ -823,6 +906,7 @@ pub fn spawn(node: &Path, dsh_js: &Path, opts: &SpawnOptions<'_>) -> std::io::Re
     ));
 
     let mut child = command.spawn()?;
+    crate::process::remember_spawned(child.id());
     let (tx, rx) = mpsc::channel();
     let ring = Ring::new();
     let log = Logger::open(opts.log_path);
@@ -990,7 +1074,9 @@ static APP_LOGGER: Mutex<Option<Logger>> = Mutex::new(None);
 
 /// Point the shared app logger at the Harness log file (called once during startup).
 pub fn init_app_log(path: &Path) {
-    *APP_LOGGER.lock().unwrap() = Some(Logger::open(path));
+    // Poison-tolerant like `app_log`: the lines this logger carries are how a failed exit stays
+    // visible, so a panicking reader must not be able to silence it for the rest of the run.
+    *lock_or_recover(&APP_LOGGER) = Some(Logger::open(path));
 }
 
 /// Append a shell-side line (navigation blocks, downloads) to the same log, stamped and redacted.
@@ -1121,7 +1207,7 @@ pub struct Logger {
 
 impl Logger {
     pub fn open(path: &Path) -> Self {
-        let mut loggers = LOGGERS.lock().unwrap();
+        let mut loggers = lock_or_recover(&LOGGERS);
         if let Some(existing) = loggers.get(path) {
             return existing.clone();
         }
@@ -1137,7 +1223,17 @@ impl Logger {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
+        // Tighten retained logs too, not only the new handle created by a rotation.
+        for index in 1..=LOG_BACKUPS {
+            crate::process::restrict(&backup_path(path, index));
+        }
         let file = OpenOptions::new().create(true).append(true).open(path).ok();
+        // The log carries the child PATH, absolute paths, workspace names and page text, and it
+        // is the one file here that used to inherit the umask. `state.json` and `config.json`
+        // are already owner-only for the same reason.
+        if file.is_some() {
+            crate::process::restrict(path);
+        }
         let written = std::fs::metadata(path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
@@ -1150,7 +1246,7 @@ impl Logger {
     }
 
     pub fn write(&self, line: &str) {
-        let mut guard = self.file.lock().unwrap();
+        let mut guard = lock_or_recover(&self.file);
         let incoming = line.len() as u64 + 1;
         self.rotate_before(&mut guard, incoming);
         if guard.is_none() {
@@ -1159,6 +1255,11 @@ impl Logger {
                 .append(true)
                 .open(&self.path)
                 .ok();
+            // Recreated after a rotation (or a failed open): the fresh handle needs the same
+            // owner-only mode as the file it replaced.
+            if guard.is_some() {
+                crate::process::restrict(&self.path);
+            }
         }
         if let Some(file) = guard.as_mut() {
             if writeln!(file, "{line}").is_ok() {

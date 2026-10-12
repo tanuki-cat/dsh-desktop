@@ -6,6 +6,20 @@
 use super::*;
 
 #[test]
+fn external_link_limit_covers_alternation_and_unique_queries() {
+    let now = Instant::now();
+    let mut limiter = ExternalOpenLimiter::default();
+    assert!(limiter.allow("https://example/a", now));
+    assert!(limiter.allow("https://example/b", now));
+    assert!(!limiter.allow("https://example/a", now));
+    assert!(limiter.allow("https://example/?n=1", now));
+    assert!(limiter.allow("https://example/?n=2", now));
+    assert!(!limiter.allow("https://example/?n=3", now));
+    assert!(limiter.allow("https://example/a", now + Duration::from_secs(10)));
+    assert!(limiter.recent.len() <= 4);
+}
+
+#[test]
 fn only_web_schemes_leave_the_shell() {
     let allow = |raw: &str| may_open(&Url::parse(raw).expect("test URL must parse"));
     assert!(allow("https://example.com/docs"));
@@ -79,9 +93,12 @@ fn the_browser_fallback_tells_the_user_what_to_keep_open() {
     .expect("the page's report must parse");
 
     let text = report.browser_fallback_detail("0.1.5-rc.2", "http://127.0.0.1:3080/?token=t", true);
+    assert!(text.contains("http://127.0.0.1:3080/"), "给出地址：{text}");
+    // The startup URL carries the launch token, which is the login cookie: the page this text
+    // lands on is on screen, screenshotted and pasted into bug reports.
     assert!(
-        text.contains("http://127.0.0.1:3080/?token=t"),
-        "给出地址：{text}"
+        !text.contains("token=t"),
+        "启动 URL 里的 token 不能出现在界面上：{text}"
     );
     // The reason is the syntax gap, not Iterator: with the compat layer on, Iterator is the
     // one thing this page did *not* fail on.
@@ -1136,6 +1153,7 @@ fn the_frame_probe_is_es5_and_schedules_at_most_one_callback_of_each_kind() {
     // The report is the object itself, never `JSON.stringify(...)` of one: WebKit hands the shell
     // the JSON of the value the script evaluates to, so a returned *string* arrives double-encoded
     // and every answer fails to parse — which the watchdog reads as a dead renderer and reloads
+
     // for. Asserting the probe contained "frames:" instead of checking the wire format is what let
     // that ship once (2026-09-18); the round-trip test below is the real guard.
     assert!(
@@ -2011,6 +2029,88 @@ fn inserted_content_above_the_reader_does_not_move_the_viewport() {
 /// to the bottom on every layout change) and a reader sitting at the bottom. Compensating either
 /// would fight a scroll the page is making. Reader scrolling alone is also never compensated — it
 /// moves the reader without moving the layout, so the snapshot is renewed rather than spent.
+/// The retry loop has to stop, or it probes the document for the life of the session.
+///
+/// It could not stop on "attached" alone: the flag it would look at stays set for the whole
+/// session once set, so a loop that outlived one failed attempt kept calling the ancestor walk
+/// above — measured as a `getComputedStyle` per second, per window, for hours, on a page whose
+/// hooks this shim does not recognise.
+#[test]
+fn scroll_discovery_binds_once_and_recovers_after_exhaustion_and_replacement() {
+    let probe = r#"
+      var timers=[], mutation=null, count=0, disconnected=0, found=null;
+      function scroller(){return {isConnected:true,children:[],scrollTop:0,scrollHeight:500,clientHeight:200,
+        getBoundingClientRect:function(){return {top:0,bottom:200};},querySelectorAll:function(){return [];},
+        addEventListener:function(){},removeEventListener:function(){}};}
+      global.window={navigator:{userAgent:"AppleWebKit/605.1.15"},
+        document:{querySelector:function(s){return s==="[data-conversation-scroll]"?found:null;},body:{}},
+        setInterval:function(fn,ms){var t={fn:fn,ms:ms,active:true};timers.push(t);return t;},
+        clearInterval:function(t){t.active=false;},ResizeObserver:function(){count++;},
+        MutationObserver:function(fn){mutation=fn;}};
+      window.ResizeObserver.prototype.observe=function(){};
+      window.ResizeObserver.prototype.disconnect=function(){disconnected++;};
+      window.MutationObserver.prototype.observe=function(){};
+      __SCRIPT__
+      function tick(ms){timers.slice().forEach(function(t){if(t.active && (!ms||t.ms===ms))t.fn();});}
+      for(var i=0;i<500;i++)tick(100);
+      if(!window.__dshScrollAnchorGaveUp)throw Error("retry did not stop");
+      found=scroller();mutation();for(var j=0;j<100;j++)tick();
+      if(count!==1)throw Error("duplicate observer: "+count);
+      found.isConnected=false;found=scroller();mutation();for(var k=0;k<100;k++)tick();
+      process.stdout.write(count+" "+disconnected);
+    "#.replace("__SCRIPT__", &scroll_anchor_script());
+    assert_eq!(run_shim("", &probe), "2 1");
+}
+
+#[test]
+fn the_scroll_anchor_retry_loop_gives_up() {
+    let script = scroll_anchor_script();
+    let probe = r#"
+      var total = 0;
+      var tick = null;
+      global.window = {
+        navigator: { userAgent: "AppleWebKit/605.1.15 (KHTML, like Gecko)" },
+        document: {
+          querySelector: function () { total += 1; return null; },
+          body: {}
+        },
+        ResizeObserver: function () {},
+        setInterval: function (fn, ms) { if (ms === 100) { tick = fn; } return 1; },
+        clearInterval: function () { tick = null; },
+        getComputedStyle: function () { return { overflowY: "auto" }; }
+      };
+      global.window.ResizeObserver.prototype.observe = function () {};
+      global.window.ResizeObserver.prototype.disconnect = function () {};
+      __SCRIPT__
+      var installed = tick !== null;
+      var local = tick;
+      if (local) { for (var i = 0; i < 500; i++) { local(); } }
+      // `stillArmed` is what the retry budget decides; it is read through the only observable the
+      // shim leaves, namely whether it is still querying the document.
+      process.stdout.write(installed + " " + total + " " + String(global.window.__dshScrollAnchorGaveUp));
+    "#
+    .replace("__SCRIPT__", &script);
+    let out = run_shim("", &probe);
+    let fields: Vec<&str> = out.split(' ').collect();
+    assert_eq!(fields[0], "true", "探测循环必须装上：{out}");
+    assert_eq!(
+        fields[2], "true",
+        "预算用尽后必须留下可观察的退让标记：{out}"
+    );
+    // One attempt costs two selectors — the conversation hook, then the row fallback — and the
+    // budget is SETTLE_TRIES of them, so 240 is every attempt the shim is allowed to make and not
+    // one more. The other 380 ticks cost nothing, which is the whole point of the bound.
+    let calls: u32 = fields[1].parse().unwrap();
+    assert!(
+        calls <= 2 * 120 + 2,
+        "预算用尽后不允许每次心跳都查 DOM（500 次心跳共查了 {calls} 次）"
+    );
+    assert!(
+        calls >= 100,
+        "预算用尽之前必须真的在找（500 次心跳只查了 {calls} 次）"
+    );
+}
+
 #[test]
 fn the_scroll_anchor_shim_leaves_the_page_and_the_reader_alone() {
     let dom = r#"

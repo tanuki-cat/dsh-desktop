@@ -4,7 +4,6 @@
 //! items.
 
 use super::*;
-use crate::update_flow::{stop_mode, StopMode};
 
 /// The retry after a lost port turns on telling an exited child from a live one, and the obvious
 /// liveness test is wrong in a way that silently disables the retry.
@@ -133,15 +132,17 @@ fn self_heal_keeps_a_record_it_can_reuse_and_clears_a_stale_one() {
         port,
         cwd: "/tmp".into(),
         started_at: 1,
+        // The boolean argument below represents the already-verified birth identity.
+        started_marker: None,
     };
     // Ours, still serving the port this run uses: hand it to the reuse branch.
     assert_eq!(
-        self_heal_action(&state(4242, 3080), Some(4242), true, 3080, false),
+        self_heal_action(&state(4242, 3080), Some(4242), true, 3080, true),
         SelfHeal::Keep
     );
     // Ours, but this run uses another port: stop it and drop the record.
     assert_eq!(
-        self_heal_action(&state(4242, 3080), Some(4242), true, 4000, false),
+        self_heal_action(&state(4242, 3080), Some(4242), true, 4000, true),
         SelfHeal::Terminate
     );
     // The pid no longer owns the port. Only a process that still looks like our own
@@ -164,11 +165,10 @@ fn self_heal_keeps_a_record_it_can_reuse_and_clears_a_stale_one() {
         SelfHeal::Clear
     );
 
-    // Keep is what makes `ours` non-None later, and that is the only way `stop_mode` can
-    // pick the process-group signal for an instance this shell started.
-    let ours =
-        self_heal_action(&state(4242, 3080), Some(4242), true, 3080, false) == SelfHeal::Keep;
-    assert_eq!(stop_mode(ours), StopMode::ProcessGroup);
+    assert_eq!(
+        self_heal_action(&state(4242, 3080), Some(4242), true, 3080, false),
+        SelfHeal::Clear
+    );
 }
 
 #[test]

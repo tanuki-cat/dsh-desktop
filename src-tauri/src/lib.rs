@@ -487,8 +487,18 @@ fn free_port_from(from: u16) -> Option<u16> {
 }
 
 /// Remember the supervised Harness so every exit path can stop it.
+///
+/// Adopted identities retain PID-only cleanup; group ownership is recorded at spawn.
 fn adopt(pid: u32, data_dir: &Path) {
-    *LIVE.lock().unwrap() = Some(Live {
+    if let Some(identity) = process::read_state(data_dir)
+        .and_then(|state| state.identity())
+        .filter(|identity| identity.pid == pid)
+    {
+        process::remember_adopted(identity);
+    }
+    // Poison-tolerant: a panicking reader must not turn the exit path into a second panic, or the
+    // supervised Harness would be left running with nothing tracking it.
+    *harness::lock_or_recover(&LIVE) = Some(Live {
         pid,
         data_dir: data_dir.to_path_buf(),
     });
@@ -499,12 +509,15 @@ fn adopt(pid: u32, data_dir: &Path) {
 /// go through tao application_will_terminate and arrive as `Exit` only.
 fn shutdown() {
     EXITING.store(true, Ordering::SeqCst);
-    let mut guard = LIVE.lock().unwrap();
+    let mut guard = harness::lock_or_recover(&LIVE);
     if let Some(live) = guard.take() {
         harness::app_log(&format!("stopping Harness pid {}", live.pid));
-        process::terminate(live.pid, TERMINATE_GRACE);
-        process::clear_state(&live.data_dir);
-        harness::app_log("Harness stopped");
+        if process::terminate(live.pid, TERMINATE_GRACE) {
+            process::clear_state(&live.data_dir);
+            harness::app_log("Harness stopped");
+        } else {
+            harness::app_log("Harness 未能安全终止，保留状态记录以便下次启动检查");
+        }
     }
 }
 
@@ -1030,6 +1043,11 @@ fn copy_tree_into(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Missing or obsolete records never authorize automatic process termination.
+fn recorded_process_still_here(state: &process::HarnessState) -> bool {
+    process::recorded_matches(state)
+}
+
 /// Whether the instance currently owning `port` is the one recorded in our state file.
 ///
 /// The same test `stop_instance_before_update` uses to tell "our own Harness" from "somebody
@@ -1037,8 +1055,7 @@ fn copy_tree_into(from: &Path, to: &Path) -> std::io::Result<()> {
 fn ours_on_port(data_dir: &Path, port: u16) -> bool {
     let owner = harness::listener_pid(port);
     process::read_state(data_dir)
-        .map(|state| state.pid)
-        .is_some_and(|pid| Some(pid) == owner && process::is_alive(pid))
+        .is_some_and(|state| Some(state.pid) == owner && process::recorded_matches(&state))
 }
 
 /// Whether a running Harness is a replay of this shell's own invocation.
@@ -1186,7 +1203,8 @@ fn swap_blocked(kept_conflict: bool, raced: bool, raced_original: bool) -> bool 
 
 /// Forget a supervised pid without signalling it (used when the process is already gone).
 fn disown(pid: u32) {
-    let mut guard = LIVE.lock().unwrap();
+    process::forget_spawned(pid);
+    let mut guard = harness::lock_or_recover(&LIVE);
     if guard.as_ref().is_some_and(|live| live.pid == pid) {
         *guard = None;
     }
@@ -1377,29 +1395,39 @@ fn take_over_handoff_and_start(
             // A retry is still this shell deciding to end somebody else instance, so it is
             // the same question. It is only reached when this attempt did not ask it already
             // (the arms above), so the user sees it at most once per restart.
-            Some(pid) => match confirm_takeover(app, &config, port, pid) {
-                Retry::TakeOver => {
-                    harness::app_log(&format!(
+            Some(pid) => {
+                let expected =
+                    process::pin(pid).ok_or_else(|| "无法确认待接管进程的启动身份".to_string())?;
+                match confirm_takeover(app, &config, port, pid) {
+                    Retry::TakeOver => {
+                        harness::app_log(&format!(
                         "本次启动失败（{reason}），但端口 {port} 已由 pid {pid} 服务：接管后重试一次"
                     ));
-                    window::set_status(app, "正在接管重新启动的 Harness…", &format!("pid {pid}"));
-                    process::terminate_pid(pid, TERMINATE_GRACE);
-                    let _ = wait_for_port_free(port, TERMINATE_GRACE);
-                    start(app, data_dir).map_err(|error| error.reason)
-                }
-                Retry::Declined => {
-                    harness::app_log(&format!(
-                        "本次启动失败（{reason}），端口 {port} 上的 pid {pid} 已按用户选择保留"
-                    ));
-                    Err(reason)
-                }
-                Retry::Refused => {
-                    harness::app_log(&format!(
+                        window::set_status(
+                            app,
+                            "正在接管重新启动的 Harness…",
+                            &format!("pid {pid}"),
+                        );
+                        if !process::terminate_pid(&expected, TERMINATE_GRACE) {
+                            return Err("待接管进程身份已变化或无法终止，已放弃接管".to_string());
+                        }
+                        let _ = wait_for_port_free(port, TERMINATE_GRACE);
+                        start(app, data_dir).map_err(|error| error.reason)
+                    }
+                    Retry::Declined => {
+                        harness::app_log(&format!(
+                            "本次启动失败（{reason}），端口 {port} 上的 pid {pid} 已按用户选择保留"
+                        ));
+                        Err(reason)
+                    }
+                    Retry::Refused => {
+                        harness::app_log(&format!(
                         "本次启动失败（{reason}），端口 {port} 上的 pid {pid} 未被接管：保留该实例"
                     ));
-                    Err(reason)
+                        Err(reason)
+                    }
                 }
-            },
+            }
             // Nothing owns the port any more: report the original failure.
             None => Err(reason),
         },
@@ -1664,11 +1692,30 @@ impl ChildEnv {
             imported.get("PATH").map(String::as_str),
             std::env::var("PATH").ok().as_deref(),
         );
-        let mut vars: Vec<(String, String)> = imported
-            .iter()
-            .filter(|(key, _)| key.as_str() != "PATH")
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
+        // Code-execution hooks the login shell exported are dropped here rather than earlier:
+        // `shellenv` also parses the CLI's `env` output, and the names are worth reporting
+        // next to the import line that listed them. Values are never logged.
+        let mut vars: Vec<(String, String)> = Vec::with_capacity(imported.len() + 3);
+        let mut dropped: Vec<&str> = Vec::new();
+        for (key, value) in imported {
+            // PATH is rebuilt below from the merged sources, never taken from the shell verbatim.
+            if key.as_str() == "PATH" {
+                continue;
+            }
+            if shellenv::is_dangerous(key) {
+                dropped.push(key.as_str());
+                continue;
+            }
+            vars.push((key.clone(), value.clone()));
+        }
+        if !dropped.is_empty() {
+            // `config.json` is the documented way to pass one on purpose, so the line names it.
+            harness::app_log(&format!(
+                "dropped {} code-execution env var(s) from the login shell (set them in config.json's env map to pass one on purpose): {}",
+                dropped.len(),
+                dropped.join(", ")
+            ));
+        }
         vars.push(("PATH".to_string(), merged.clone()));
         if bundled {
             // Recentred global installs: with the read-only seed in front of PATH, `npm i -g`
@@ -1753,9 +1800,11 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
     if let Some(state) = process::read_state(data_dir) {
         let alive = process::is_alive(state.pid);
         let listener = harness::listener_pid(state.port);
-        // The `ps` call is only worth making when the record is alive but no longer owns its
-        // port, which is exactly the case where the alternative reading is pid reuse.
-        let looks_ours = alive && listener != Some(state.pid) && looks_like_our_orphan(state.pid);
+        // Birth identity is required even when the PID owns its recorded port. A command-line
+        // orphan check is needed only when that process has stopped listening.
+        let looks_ours = alive
+            && recorded_process_still_here(&state)
+            && (listener == Some(state.pid) || looks_like_our_orphan(state.pid));
         match self_heal_action(&state, listener, alive, port, looks_ours) {
             SelfHeal::Keep => harness::app_log(&format!(
                 "state.json 记录的 Harness pid {} 仍在端口 {} 服务，交给复用分支处理",
@@ -1767,7 +1816,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
                     "正在清理上次残留的 Harness…",
                     &format!("pid {}", state.pid),
                 );
-                process::terminate(state.pid, TERMINATE_GRACE);
+                if let Some(identity) = state.identity() {
+                    process::terminate_pid(&identity, TERMINATE_GRACE);
+                }
                 process::clear_state(data_dir);
             }
             SelfHeal::Clear => {
@@ -1810,9 +1861,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
     //     tree it replaced goes back before anything resolves a runtime: otherwise this launch
     //     would pick the same unproven tree again and fail the same way.
     let runtime_root = data_dir.join("runtime");
-    let paths = UpdatePaths::new(&runtime_root);
-    recover_pending_swap(&paths, data_dir);
-    clear_stale_staging(&paths);
+    let mut paths = UpdatePaths::new(&runtime_root);
 
     // 3) Resolve the runtime: bundled seed / shadow prefix / the user's install (§2.3/§2.4).
     window::set_status(app, "正在解析运行时…", "");
@@ -1842,6 +1891,20 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
             )),
         }
     }
+    if config.runtime != runtime::Preference::Bundled
+        && config.system_updates == runtime::SystemUpdates::Install
+    {
+        if let Some(dsh) = locator::system_dsh(
+            config.dsh_path.clone(),
+            imported.get("PATH").map(String::as_str),
+        ) {
+            if let Some(prefix) = update::install_prefix(&dsh) {
+                paths.allow_prefix(&prefix);
+            }
+        }
+    }
+    recover_pending_swap(&paths, data_dir);
+    clear_stale_staging(&paths);
     let mut resolved = resolve_runtime(
         app.path().resource_dir().ok().as_deref(),
         data_dir,
@@ -2040,6 +2103,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
                                     resolved.dsh_js.display()
                                 )),
                                 Some(prefix) => {
+                                    if resolved.updates != runtime::Updates::Shadow {
+                                        paths.allow_prefix(prefix);
+                                    }
                                     stage_core_update(&npm, &to, prefix, &paths, &cache)
                                 }
                             };
@@ -2203,9 +2269,15 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
     match harness::probe(port) {
         harness::Probe::Harness => {
             let owner = harness::listener_pid(port);
+            let expected = owner.and_then(process::pin);
             let ours = process::read_state(data_dir)
-                .map(|state| state.pid)
-                .filter(|pid| Some(*pid) == owner && process::is_alive(*pid));
+                .filter(|state| Some(state.pid) == owner && process::recorded_matches(state))
+                .map(|state| {
+                    if let Some(identity) = state.identity() {
+                        process::remember_adopted(identity);
+                    }
+                    state.pid
+                });
 
             match ours {
                 // Our own instance from an earlier run, and no update is about to touch its CLI
@@ -2354,7 +2426,19 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
                             // authenticated URL. Never a group signal: its process group belongs
                             // to whatever started it (a terminal, or an agent run).
                             window::set_status(app, "正在接管其它 Harness…", &format!("pid {pid}"));
-                            process::terminate_pid(pid, TERMINATE_GRACE);
+                            let identity = expected
+                                .as_ref()
+                                .filter(|identity| identity.pid == pid)
+                                .ok_or_else(|| {
+                                    StartError::from(
+                                        "无法确认待接管进程的启动身份，未发送信号".to_string(),
+                                    )
+                                })?;
+                            if !process::terminate_pid(identity, TERMINATE_GRACE) {
+                                return Err("待接管进程身份已变化或无法终止，已放弃接管"
+                                    .to_string()
+                                    .into());
+                            }
                             took_over = true;
                         }
                     }
@@ -2615,6 +2699,9 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
         confirm_core_update(&paths);
     }
     let actual_port = url.port().unwrap_or(port);
+    // The pid is pinned to its start time here, while it is certainly ours, so a later launch —
+    // the one that finds this record after a crash, or after the app was quit by force — can
+    // tell the recorded process from a number the OS has since recycled.
     let _ = process::write_state(
         data_dir,
         &process::HarnessState {
@@ -2625,6 +2712,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            started_marker: process::saved_marker(pid),
         },
     );
 
@@ -2715,6 +2803,8 @@ fn hand_the_gui_to_the_browser(
     window::show_notice(
         app,
         "系统 WebView 太旧，界面已改在浏览器中打开",
+        // The detail names the address so the user can copy it by hand; the token in it is a
+        // credential and stays out (see `window::display_url`).
         &report.browser_fallback_detail(version, url.as_str(), compat),
     );
     true

@@ -24,15 +24,76 @@ pub(crate) struct UpdatePaths {
     pub(crate) swap: PathBuf,
     /// Where a profile is copied before pnpm rewrites it.
     pub(crate) profiles: PathBuf,
+    targets: Vec<PathBuf>,
 }
 
 impl UpdatePaths {
     pub(crate) fn new(runtime_root: &Path) -> UpdatePaths {
+        let root = resolved_path(runtime_root).unwrap_or_else(|| runtime_root.to_path_buf());
         UpdatePaths {
-            staging: runtime_root.join("staging"),
-            rollback: runtime_root.join("rollback"),
-            swap: runtime_root.join("update-swap.json"),
-            profiles: runtime_root.join("profile-backup"),
+            staging: root.join("staging"),
+            rollback: root.join("rollback"),
+            swap: root.join("update-swap.json"),
+            profiles: root.join("profile-backup"),
+            targets: vec![package_dir_in(&root.join("prefix"))],
+        }
+    }
+
+    /// Authorize only the prefix selected independently of the swap record.
+    pub(crate) fn allow_prefix(&mut self, prefix: &Path) {
+        if let Some(prefix) = resolved_path(prefix) {
+            self.targets.push(package_dir_in(&prefix));
+        }
+    }
+
+    fn valid_swap(&self, target: &Path, backup: &Path, version: &str) -> bool {
+        let label = version_label(version);
+        if label.is_empty() || label == "." || label == ".." || label != version {
+            return false;
+        }
+        let Some(target) = resolved_path(target) else {
+            return false;
+        };
+        let Some(backup) = resolved_path(backup) else {
+            return false;
+        };
+        self.targets.contains(&target)
+            && backup == self.rollback.join(label)
+            && !target.starts_with(&backup)
+            && !backup.starts_with(&target)
+            && resolved_path(&transaction::failed_path(&target))
+                == Some(transaction::failed_path(&target))
+    }
+}
+
+/// Resolve existing ancestors, preserving missing leaves for interrupted renames.
+/// Parent traversal is rejected before canonicalization; canonical paths are compared to trusted
+/// destinations so a symlink below an authorized prefix cannot redirect a tree operation.
+fn resolved_path(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return None;
+    }
+    let mut ancestor = path;
+    let mut tail = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let mut resolved = std::fs::canonicalize(ancestor).ok()?;
+                for part in tail.iter().rev() {
+                    resolved.push(part);
+                }
+                return Some(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tail.push(ancestor.file_name()?.to_os_string());
+                ancestor = ancestor.parent()?;
+            }
+            Err(_) => return None,
         }
     }
 }
@@ -296,6 +357,9 @@ pub(crate) fn commit_core_update(
 ) -> Result<(PathBuf, String), String> {
     // Recorded before the swap because it cannot be observed afterwards: once `commit` has run,
     // an absent backup is indistinguishable from one that was never written.
+    if !paths.valid_swap(&staged.target, &staged.backup, &staged.version) {
+        return Err("更新目标或备份路径未获授权，未执行替换".to_string());
+    }
     let had_previous = staged.target.exists();
     transaction::write_swap(
         &paths.swap,
@@ -328,6 +392,17 @@ pub(crate) fn roll_back_core_update(paths: &UpdatePaths) -> bool {
     let Some(record) = transaction::read_swap(&paths.swap) else {
         return false;
     };
+    if !paths.valid_swap(
+        Path::new(&record.target),
+        Path::new(&record.backup),
+        &record.version,
+    ) {
+        harness::app_log(&format!(
+            "更新记录里的路径不在本应用的运行时目录内，放弃本次回滚: target={} backup={}",
+            record.target, record.backup
+        ));
+        return false;
+    }
     match transaction::rollback_with(
         Path::new(&record.target),
         Path::new(&record.backup),
@@ -399,6 +474,21 @@ pub(crate) fn recover_pending_swap(paths: &UpdatePaths, data_dir: &Path) {
     };
     let target = PathBuf::from(&record.target);
     let backup = PathBuf::from(&record.backup);
+    // The record is a file on disk, and the rollback it drives moves whole directory trees and
+    // deletes the ones it finds in the way. This shell wrote every record it is willing to act
+    // on, and every one of them names something inside the tree the update owns — so a record
+    // that names anything else is not a rollback to perform but a sign the file was damaged or
+    // written by something else. Dropping it costs one update attempt; obeying it could move a
+    // directory the user never offered.
+    if !paths.valid_swap(&target, &backup, &record.version) {
+        harness::app_log(&format!(
+            "更新记录里的路径不在本应用的运行时目录内，已丢弃该记录（不执行回滚）: target={} backup={}",
+            target.display(),
+            backup.display()
+        ));
+        transaction::clear_swap(&paths.swap);
+        return;
+    }
     harness::app_log(&format!(
         "上次更新到 v{} 的切换没有完成（CLI 未启动成功），正在回滚到 {} 中的上一棵树",
         record.version,
@@ -476,9 +566,9 @@ pub(crate) fn stop_instance_before_update(
         return Ok(());
     }
     let owner = harness::listener_pid(port);
+    let expected = owner.and_then(process::pin);
     let ours = process::read_state(data_dir)
-        .map(|state| state.pid)
-        .filter(|pid| Some(*pid) == owner && process::is_alive(*pid));
+        .filter(|state| Some(state.pid) == owner && process::recorded_matches(state));
     may_stop_before_update(&probe)?;
 
     let Some(pid) = owner else {
@@ -494,16 +584,22 @@ pub(crate) fn stop_instance_before_update(
             "端口 {port} 上的外部 Harness（pid {pid}）没有被接管，跳过本次更新"
         ));
     }
-    let mode = stop_mode(ours.is_some());
+    let expected = expected
+        .as_ref()
+        .ok_or_else(|| "无法确认更新前待停止进程的启动身份".to_string())?;
+    let mode = stop_mode(ours.is_some() && process::spawned_here(pid));
     window::set_status(
         app,
         "更新前先停止正在运行的 Harness…",
         &format!("pid {pid}（{}）", mode.describe()),
     );
-    let _ = match mode {
+    let stopped = match mode {
         StopMode::ProcessGroup => process::terminate(pid, TERMINATE_GRACE),
-        StopMode::PidOnly => process::terminate_pid(pid, TERMINATE_GRACE),
+        StopMode::PidOnly => process::terminate_pid(expected, TERMINATE_GRACE),
     };
+    if !stopped {
+        return Err("更新前进程身份已变化或无法终止，未替换安装树".to_string());
+    }
     let deadline = std::time::Instant::now() + TERMINATE_GRACE;
     while !matches!(harness::probe(port), harness::Probe::Closed) {
         if std::time::Instant::now() > deadline {

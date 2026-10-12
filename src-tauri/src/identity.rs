@@ -34,6 +34,11 @@ pub(crate) enum SelfHeal {
 ///
 /// `listener` is the pid that owns `state.port`; `looks_ours` is the secondary identity check
 /// for a record whose pid no longer owns its port (see [`looks_like_our_orphan`]).
+///
+/// `alive` is the caller's answer to "is the pid there", not to "is it the same process": a
+/// recycled number is alive too. Every branch that signals therefore also consults the command
+/// line (`looks_ours`) or the recorded start time, and a start time that disagrees ends the
+/// record rather than the process — the pid names somebody else now.
 pub(crate) fn self_heal_action(
     state: &HarnessState,
     listener: Option<u32>,
@@ -41,7 +46,7 @@ pub(crate) fn self_heal_action(
     port: u16,
     looks_ours: bool,
 ) -> SelfHeal {
-    if !alive {
+    if !alive || !looks_ours {
         return SelfHeal::Clear;
     }
     if listener != Some(state.pid) {

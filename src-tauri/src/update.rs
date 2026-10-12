@@ -108,6 +108,7 @@ fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<Output, S
         .spawn()
         .map_err(|error| format!("无法执行命令: {error}"))?;
     let pid = child.id();
+    crate::process::remember_spawned(pid);
 
     // Drain both pipes on their own threads: a child that fills a pipe buffer blocks for ever,
     // and the timeout below would then fire on a process that was only waiting to be read.
@@ -120,17 +121,20 @@ fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<Output, S
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
             Ok(None) => {
-                crate::process::kill_tree(pid);
-                let _ = child.wait();
+                if crate::process::kill_tree(pid) {
+                    let _ = child.wait();
+                }
                 return Err(format!("命令超过 {} 秒未结束，已终止", timeout.as_secs()));
             }
             Err(error) => {
-                crate::process::kill_tree(pid);
-                let _ = child.wait();
+                if crate::process::kill_tree(pid) {
+                    let _ = child.wait();
+                }
                 return Err(format!("等待命令结束失败: {error}"));
             }
         }
     };
+    crate::process::forget_spawned(pid);
     Ok(Output {
         status,
         stdout: collected(stdout),
@@ -475,17 +479,94 @@ fn is_executable(path: &Path) -> bool {
     true
 }
 
-/// npm command that starts whatever PATH the app was launched with.
-fn npm_command(npm: &Path) -> Command {
-    let mut command = Command::new(npm);
-    command.env("PATH", npm_path(npm, std::env::var_os("PATH").as_deref()));
-    command
+/// The registry an automatic install is allowed to name.
+/// Official registry for desktop-managed queries and installs. npm verifies tarball integrity;
+/// that checksum does not independently authenticate the publisher.
+pub const REGISTRY: &str = "https://registry.npmjs.org";
+
+struct NpmConfigDir(PathBuf);
+impl Drop for NpmConfigDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
-/// Read `npm view <pkg> dist-tags --json` and return the tags that exist.
+impl NpmConfigDir {
+    fn create() -> Result<Self, String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = loop {
+            let path = std::env::temp_dir().join(format!(
+                "dsh-npm-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&path) {
+                Ok(()) => break path,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("无法创建隔离的 npm 配置目录: {e}")),
+            }
+        };
+        let config = Self(root);
+        for (name, text) in [
+            ("user.npmrc", ""),
+            ("global.npmrc", ""),
+            (".npmrc", ""),
+            (
+                "package.json",
+                r#"{"name":"dsh-desktop-update-context","private":true}"#,
+            ),
+        ] {
+            std::fs::write(config.0.join(name), text)
+                .map_err(|e| format!("无法写入隔离的 npm 配置: {e}"))?;
+        }
+        Ok(config)
+    }
+}
+
+/// Ignore user/global/project npmrc and npm_config_* overrides. Proxy and OS CA environment
+/// remain available, but registry selection and TLS verification are owned by the desktop.
+fn npm_command(npm: &Path) -> Result<(Command, NpmConfigDir), String> {
+    let config = NpmConfigDir::create()?;
+    let mut command = Command::new(npm);
+    crate::shellenv::sanitize_command(&mut command);
+    for key in [
+        "npm_config_registry",
+        "NPM_CONFIG_REGISTRY",
+        "npm_config_userconfig",
+        "NPM_CONFIG_USERCONFIG",
+    ] {
+        command.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy().to_ascii_lowercase();
+        if name.starts_with("npm_config_") && name != "npm_config_cache" {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env("PATH", npm_path(npm, std::env::var_os("PATH").as_deref()))
+        .current_dir(&config.0)
+        .arg("--userconfig")
+        .arg(config.0.join("user.npmrc"))
+        .arg("--globalconfig")
+        .arg(config.0.join("global.npmrc"))
+        .arg("--registry")
+        .arg(REGISTRY)
+        .arg(format!("--@deepseek-ai:registry={REGISTRY}"))
+        .arg("--strict-ssl=true");
+    Ok((command, config))
+}
+
 pub fn fetch_dist_tags(npm: &Path, package: &str) -> Result<Vec<(String, String)>, String> {
     let fetch = format!("--fetch-timeout={FETCH_TIMEOUT_MS}");
-    let mut command = npm_command(npm);
+    let (mut command, _config) = npm_command(npm)?;
     command.args([
         "view",
         package,
@@ -627,8 +708,8 @@ pub fn install_prefix(dsh_js: &Path) -> Option<PathBuf> {
 fn global_prefix(npm: &Path) -> Option<String> {
     // `npm prefix` is local, but npm still starts a node process that can stall on a lock or a
     // proxy the way the install does, and this runs while the user waits on the splash page.
-    let text =
-        crate::process::stdout_within(npm_command(npm).args(["prefix", "-g"]), QUERY_TIMEOUT)?;
+    let (mut command, _config) = npm_command(npm).ok()?;
+    let text = crate::process::stdout_within(command.args(["prefix", "-g"]), QUERY_TIMEOUT)?;
     if text.is_empty() {
         None
     } else {
@@ -645,7 +726,7 @@ pub fn install(
     prefix: Option<&Path>,
     cache: Option<&Path>,
 ) -> Result<(), String> {
-    let mut command = npm_command(npm);
+    let (mut command, _config) = npm_command(npm)?;
     command.args(["install", "-g", "--no-fund", "--no-audit"]);
     // A whole-process budget as well as npm's own fetch flags: lifecycle scripts, a lock held
     // by another npm, or a registry that stops answering mid-install all outlive `--fetch-timeout`

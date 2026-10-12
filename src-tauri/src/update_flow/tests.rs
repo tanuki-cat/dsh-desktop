@@ -23,6 +23,108 @@ fn plugin_install_only_accepts_the_requested_version() {
     }
 }
 
+#[test]
+fn swap_paths_are_role_bound_and_reject_traversal() {
+    let root = crate::test_dir("dsh-desktop-swap-owns-test");
+    let runtime = root.join("runtime");
+    let mut paths = UpdatePaths::new(&runtime);
+    let target = package_dir_in(&runtime.join("prefix"));
+    let backup = paths.rollback.join("0.2.0");
+    assert!(paths.valid_swap(&target, &backup, "0.2.0"));
+    for bad in [
+        runtime.clone(),
+        runtime.join("../../victim"),
+        root.join("foreign/node_modules/@deepseek-ai/dsh"),
+        root.join("foreign/node_modules/../../victim"),
+        paths.staging.clone(),
+    ] {
+        assert!(!paths.valid_swap(&bad, &backup, "0.2.0"));
+    }
+    for bad in [
+        paths.rollback.clone(),
+        paths.rollback.join("../victim"),
+        target.clone(),
+        paths.rollback.join("other"),
+    ] {
+        assert!(!paths.valid_swap(&target, &bad, "0.2.0"));
+    }
+    assert!(!paths.valid_swap(&target, &paths.rollback.join(".."), ".."));
+    let system_prefix = root.join("system");
+    let system_target = package_dir_in(&system_prefix);
+    assert!(!paths.valid_swap(&system_target, &backup, "0.2.0"));
+    paths.allow_prefix(&system_prefix);
+    assert!(paths.valid_swap(&system_target, &backup, "0.2.0"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_rejects_redirected_target_backup_and_failed_tree() {
+    use std::os::unix::fs::symlink;
+    let root = crate::test_dir("swap-symlink");
+    let runtime = root.join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let paths = UpdatePaths::new(&runtime);
+    let target = package_dir_in(&runtime.join("prefix"));
+    let backup = paths.rollback.join("0.2.0");
+    let victim = root.join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("keep"), "important").unwrap();
+    symlink(&victim, runtime.join("prefix")).unwrap();
+    assert!(!paths.valid_swap(&target, &backup, "0.2.0"));
+    std::fs::remove_file(runtime.join("prefix")).unwrap();
+    std::fs::create_dir_all(&paths.rollback).unwrap();
+    symlink(&victim, &backup).unwrap();
+    assert!(!paths.valid_swap(&target, &backup, "0.2.0"));
+    std::fs::remove_file(&backup).unwrap();
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    symlink(&victim, transaction::failed_path(&target)).unwrap();
+    assert!(!paths.valid_swap(&target, &backup, "0.2.0"));
+    assert_eq!(
+        std::fs::read_to_string(victim.join("keep")).unwrap(),
+        "important"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// A tampered rollback record is discarded, not obeyed.
+#[test]
+fn a_rollback_record_outside_the_runtime_root_is_dropped() {
+    let root = crate::test_dir("dsh-desktop-swap-foreign-record-test");
+    let runtime = root.join("runtime");
+    let paths = UpdatePaths::new(&runtime);
+    std::fs::create_dir_all(&paths.rollback).unwrap();
+    let victim = root.join("victim");
+    std::fs::create_dir_all(victim.join("keep")).unwrap();
+    std::fs::write(victim.join("keep").join("file.txt"), "important").unwrap();
+
+    transaction::write_swap(
+        &paths.swap,
+        &transaction::SwapRecord {
+            target: victim.to_string_lossy().to_string(),
+            backup: root.join("elsewhere").to_string_lossy().to_string(),
+            version: "9.9.9".to_string(),
+            at: 0,
+            had_previous: Some(true),
+        },
+    )
+    .unwrap();
+
+    recover_pending_swap(&paths, &root);
+
+    // The record is gone (so the next launch does not retry it) and the target is untouched.
+    assert!(
+        transaction::read_swap(&paths.swap).is_none(),
+        "记录必须被丢弃"
+    );
+    assert!(
+        victim.join("keep").join("file.txt").is_file(),
+        "记录之外的目录不得被移动或删除"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A staged update is verified and swapped, and a launch that never confirmed it is undone by
 /// the next one. This is the whole P2-10 contract, minus the npm call.
 #[test]

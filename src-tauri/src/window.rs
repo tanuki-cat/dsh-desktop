@@ -132,8 +132,9 @@ impl WebviewReport {
     /// the Harness (updates, stopping it on exit), the browser only renders the UI — with an
     /// engine that does keep getting updates.
     pub fn browser_fallback_detail(&self, dsh_version: &str, url: &str, compat: bool) -> String {
+        let shown = display_url(url);
         format!(
-            "{}\n\n界面已在默认浏览器中打开：\n{url}\n\n\
+            "{}\n\n界面已在默认浏览器中打开：\n{shown}\n\n\
              这个窗口是 harness 的管理窗口（更新与退出清理都在这里）：在浏览器里操作时请不要关闭它，\
              关闭它会停止 harness。",
             self.describe(dsh_version, compat)
@@ -1425,6 +1426,34 @@ const SCROLL_ANCHOR_SCRIPT: &str = r#"
   //   same row. That is what lets one code path serve reader scrolling, the page's own scrolling
   //   and this shim's write alike, with no attempt to tell them apart.
   var onScroll = function () { remember(); };
+  // Retry discovery for a bounded burst. Once attached, layout work belongs to ResizeObserver.
+  var tries = 0;
+  var armed = true;
+  var timer = null;
+  var stopDiscovery = function () {
+    if (timer !== null && typeof w.clearInterval === "function") w.clearInterval(timer);
+    timer = null;
+  };
+  var settle = function () {
+    if (!armed || box !== null) return;
+    if (attach()) { stopDiscovery(); return; }
+    tries += 1;
+    if (tries >= SETTLE_TRIES) {
+      armed = false;
+      stopDiscovery();
+      w.__dshScrollAnchorGaveUp = true;
+    }
+  };
+  var discover = function () {
+    if (box !== null || timer !== null) return;
+    tries = 0;
+    armed = true;
+    w.__dshScrollAnchorGaveUp = false;
+    settle();
+    if (box === null && armed && typeof w.setInterval === "function") {
+      timer = w.setInterval(settle, SETTLE_MS);
+    }
+  };
 
   var detach = function () {
     if (watcher !== null && typeof watcher.disconnect === "function") watcher.disconnect();
@@ -1437,6 +1466,10 @@ const SCROLL_ANCHOR_SCRIPT: &str = r#"
     anchor = null;
     offset = 0;
     scrollTop = 0;
+    // The port is gone on purpose (a session switch): whatever this shim knew about the document
+    // is stale, so the search starts over.
+    tries = 0;
+    armed = true;
   };
 
   var attach = function () {
@@ -1454,22 +1487,23 @@ const SCROLL_ANCHOR_SCRIPT: &str = r#"
     return true;
   };
 
-  attach();
   // Injected before the document is parsed, so the first attempt predates the conversation. A
   // later one follows a session switch, which replaces the scroll port rather than growing it.
-  if (!box && typeof w.setInterval === "function") {
-    var tries = 0;
-    var timer = w.setInterval(function () {
-      if (attach() || ++tries > SETTLE_TRIES) {
-        if (typeof w.clearInterval === "function") w.clearInterval(timer);
-      }
-    }, SETTLE_MS);
+  discover();
+  var changed = function () {
+    if (box !== null && box.isConnected === false) detach();
+    if (box === null) discover();
+  };
+  if (typeof w.MutationObserver === "function") {
+    var discoveryObserver = new w.MutationObserver(changed);
+    discoveryObserver.observe(w.document.documentElement || w.document, { childList: true, subtree: true });
   }
+  // Older engines without MutationObserver use a low-frequency retry for late conversations.
   if (typeof w.setInterval === "function") {
     w.setInterval(function () {
-      if (box !== null && box.isConnected === false) detach();
-      if (box === null) attach();
-    }, 1000);
+      if (box !== null && box.isConnected === false) { detach(); discover(); }
+      if (box === null && typeof w.MutationObserver !== "function") discover();
+    }, 10000);
   }
 })();
 "#;
@@ -1485,10 +1519,16 @@ pub fn scroll_anchor_script() -> String {
 /// The ring drops its oldest entry rather than growing: a page erroring in a loop must not turn
 /// one probe's answer into an unbounded payload, and the newest lines are the ones that describe
 /// what the user just did.
-const PAGE_NOTE_LIMIT: usize = 50;
+///
+/// Ten rather than fifty: the whole batch is assembled, serialised across the IPC boundary and
+/// then written to the log line by line, and this runs on every probe for as long as the page
+/// keeps erroring. Ten covers the newest failures, which is what a report is read from; the
+/// bound is what keeps a page stuck in an error loop from costing a quarter of a megabyte per
+/// probe.
+const PAGE_NOTE_LIMIT: usize = 10;
 
 /// Longest single note, in characters. Long enough for a stack's first frames, short enough that
-/// fifty of them stay a log entry rather than a file.
+/// a full batch of them stays a log entry rather than a file.
 const PAGE_NOTE_CHARS: usize = 500;
 
 /// Collect what the Harness page says about itself, for [`FRAME_PROBE`] to carry back.
@@ -2004,20 +2044,27 @@ pub fn create_harness(
         // page keeps taking input while its model output stops drawing (field report 2026-09-15).
         // The default is "suspend"; this asks for no throttling at all.
         .background_throttling(BackgroundThrottlingPolicy::Disabled)
+        // The callback fires for every frame, not just the top-level document: WebKit asks the
+        // policy delegate before a child frame navigates too, and wry (0.55.1) hands the request
+        // URL over without saying which frame it belongs to. A page that renders remote content —
+        // a link in model output, a fetched page, an embedded iframe — would otherwise reach the
+        // system opener once per attempt, with no click and no way for the user to stop it. One
+        // opener call per URL per `EXTERNAL_OPEN_WINDOW` keeps the intent (a click that leaves the
+        // app arrives once) while bounding what a repeating frame can do.
         .on_navigation(move |target| {
             let same_origin = target.scheme() == "http"
                 && target.host_str() == Some("127.0.0.1")
                 && target.port() == Some(port);
             if !same_origin {
                 harness::app_log(&format!("navigation blocked, opening externally: {target}"));
-                open_external(target.as_str());
+                open_external_once(target.as_str());
             }
             same_origin
         })
         // window.open / target=_blank: never spawn a Tauri window for remote content.
         .on_new_window(move |target, _features| {
             harness::app_log(&format!("new window request, opening externally: {target}"));
-            open_external(target.as_str());
+            open_external_once(target.as_str());
             NewWindowResponse::Deny
         })
         // The only evidence of what the first navigation did. `PageLoadEvent` is
@@ -2773,7 +2820,10 @@ fn watch_first_load(
                     &app,
                     "Harness 页面加载失败",
                     &format!(
-                        "窗口连续 {LOAD_ATTEMPTS} 次都没有加载出 {url}，端口 {port} 也没有在提供服务。\n\n关闭本窗口即退出应用；重新启动会重新拉起 Harness 并换一个新的启动 URL。"
+                        "窗口连续 {LOAD_ATTEMPTS} 次都没有加载出 {}，端口 {port} 也没有在提供服务。\n\n关闭本窗口即退出应用；重新启动会重新拉起 Harness 并换一个新的启动 URL。",
+                        // Never the raw URL: it carries the launch token, and this text is on
+                        // screen and in every screenshot of it.
+                        display_url(url.as_str())
                     ),
                 );
                 return;
@@ -2876,6 +2926,25 @@ fn file_name_of(suggested: &std::path::Path) -> std::ffi::OsString {
         .unwrap_or_else(|| std::ffi::OsString::from("dsh-download"))
 }
 
+/// A URL safe to put in front of the user.
+///
+/// The Harness window is opened on `http://127.0.0.1:PORT/?token=…`, and that token is the
+/// login cookie: anything the shell *shows* — a failure page, the browser-fallback text, a
+/// screen share, a screenshot in a bug report — would carry it. The page itself only ever needs
+/// its own address, so the query goes before the text does. Parsing is lenient on purpose: a
+/// value that will not parse is returned as it came, since this is a display helper and never a
+/// gate (the gate is `may_open`).
+pub fn display_url(target: &str) -> String {
+    match Url::parse(target) {
+        Ok(mut url) => {
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        }
+        Err(_) => target.to_string(),
+    }
+}
+
 /// Schemes the shell is willing to hand to the operating system.
 ///
 /// The Harness page renders whatever the agent produced — model-authored links, fetched pages —
@@ -2884,6 +2953,51 @@ fn file_name_of(suggested: &std::path::Path) -> std::ffi::OsString {
 /// reaches its app handler. Only web navigation leaves the shell (design §7).
 pub fn may_open(target: &Url) -> bool {
     matches!(target.scheme(), "http" | "https")
+}
+
+/// Suppress duplicate navigation callbacks briefly while allowing ordinary repeated clicks.
+/// Unique URLs share a bounded burst budget because query changes bypass URL deduplication.
+const EXTERNAL_OPEN_WINDOW: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct ExternalOpenLimiter {
+    recent: Vec<(String, Instant)>,
+}
+
+impl ExternalOpenLimiter {
+    fn allow(&mut self, url: &str, now: Instant) -> bool {
+        const RATE_WINDOW: Duration = Duration::from_secs(10);
+        const BURST: usize = 4;
+        self.recent
+            .retain(|(_, at)| now.saturating_duration_since(*at) < RATE_WINDOW);
+        if self.recent.len() >= BURST
+            || self.recent.iter().any(|(seen, at)| {
+                seen == url && now.saturating_duration_since(*at) < EXTERNAL_OPEN_WINDOW
+            })
+        {
+            return false;
+        }
+        self.recent.push((url.to_string(), now));
+        true
+    }
+}
+
+static EXTERNAL_OPENS: Mutex<Option<ExternalOpenLimiter>> = Mutex::new(None);
+
+pub fn open_external_once(target: &str) {
+    let Ok(mut url) = Url::parse(target) else {
+        return;
+    };
+    if !may_open(&url) || target.len() > 8192 {
+        return;
+    }
+    url.set_fragment(None);
+    let allowed = crate::harness::lock_or_recover(&EXTERNAL_OPENS)
+        .get_or_insert_with(ExternalOpenLimiter::default)
+        .allow(url.as_str(), Instant::now());
+    if allowed {
+        open_external(target);
+    }
 }
 
 /// Hand a link to the system browser, or drop it with a log line.

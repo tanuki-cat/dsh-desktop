@@ -7,6 +7,18 @@ use super::*;
 
 #[cfg(unix)]
 #[test]
+fn short_helpers_do_not_receive_implicit_node_hooks() {
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args(["-c", "printf '%s' \"${NODE_OPTIONS-unset}\""]);
+    command.env("NODE_OPTIONS", "--require inherited");
+    assert_eq!(
+        stdout_within(&mut command, Duration::from_secs(5)).as_deref(),
+        Some("unset")
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn terminate_stops_a_spawned_process_group() {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -23,6 +35,7 @@ fn terminate_stops_a_spawned_process_group() {
         .unwrap();
     let pid = child.id();
     assert!(is_alive(pid));
+    remember_spawned(pid);
 
     let started = Instant::now();
     assert!(
@@ -60,6 +73,9 @@ fn terminate_cleans_the_group_after_the_leader_is_gone() {
         .spawn()
         .unwrap();
     let pgid = leader.id();
+    // Registered immediately after spawn: the group signal is only
+    // allowed for a pid this process created, so an unregistered one is the *other* test below.
+    remember_spawned(pgid);
     leader.wait().unwrap();
     std::thread::sleep(Duration::from_millis(300));
     assert!(
@@ -73,6 +89,44 @@ fn terminate_cleans_the_group_after_the_leader_is_gone() {
     std::thread::sleep(Duration::from_millis(300));
     let group = unsafe { libc::kill(-(pgid as i32), 0) };
     assert_eq!(group, -1, "the group still has a live member");
+}
+
+/// A pid this shell did not create must never reach a group signal.
+///
+/// `terminate` used to signal `-pid` whenever the leader was gone, whoever the leader had been.
+/// Pids are reusable and so are process group ids, so a stale record — one left by an earlier
+/// launch, or by a reboot — could address a group belonging to somebody else entirely. The
+/// registry is what separates "our child, whose group may still hold workers" from "a number".
+#[cfg(unix)]
+#[test]
+fn an_unregistered_pid_is_not_signalled_as_a_group() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let mut leader = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("sleep 30 & exit 0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pgid = leader.id();
+    leader.wait().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert!(!spawned_here(pgid), "this test needs an unregistered pid");
+    terminate(pgid, Duration::from_millis(200));
+
+    // The surviving child is still there: nothing was signalled.
+    std::thread::sleep(Duration::from_millis(300));
+    let group = unsafe { libc::kill(-(pgid as i32), 0) };
+    assert_eq!(group, 0, "未登记的 pid 不得被当作进程组信号");
+    // Clean up after the assertion, so the sleep does not outlive the test.
+    unsafe {
+        libc::kill(-(pgid as i32), libc::SIGKILL);
+    }
 }
 
 /// The budget has to bound the wait for a finished child's *output*, not just for the child.
@@ -139,6 +193,121 @@ fn non_utf8_output_is_decoded_lossily() {
     );
 }
 
+#[cfg(unix)]
+struct TestChild(std::process::Child);
+#[cfg(unix)]
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+        forget_spawned(self.0.id());
+    }
+}
+
+#[cfg(unix)]
+fn test_child() -> TestChild {
+    TestChild(
+        std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap(),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn birth_identity_is_stable_and_distinct_without_clock_sleeps() {
+    let child = test_child();
+    let other = test_child();
+    let first = pin(child.0.id()).expect("OS process identity");
+    assert!(same_process(&first));
+    assert_ne!(first.marker, pin(other.0.id()).unwrap().marker);
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_or_missing_identity_never_signals_a_live_process() {
+    let mut child = test_child();
+    let pid = child.0.id();
+    let stale = Identity {
+        pid,
+        marker: "not-this-process".to_string(),
+    };
+    assert!(!same_process(&stale));
+    assert!(!terminate_pid(&stale, Duration::ZERO));
+    assert!(child.0.try_wait().unwrap().is_none());
+    assert!(
+        !terminate(pid, Duration::ZERO),
+        "unregistered process must not receive a group signal"
+    );
+    let state = HarnessState {
+        pid,
+        port: 3080,
+        cwd: "/tmp".into(),
+        started_at: 0,
+        started_marker: None,
+    };
+    assert!(!recorded_matches(&state));
+}
+
+#[cfg(unix)]
+#[test]
+fn adopted_identity_is_not_a_spawned_group_and_success_unregisters() {
+    let mut child = test_child();
+    let pid = child.0.id();
+    remember_adopted(pin(pid).unwrap());
+    assert!(!spawned_here(pid));
+    assert!(terminate(pid, Duration::from_secs(2)));
+    assert!(tracked(pid).is_none());
+    let _ = child.0.wait();
+}
+
+#[test]
+fn invalid_state_fields_are_rejected() {
+    let dir = crate::test_dir("state-validation");
+    std::fs::create_dir_all(&dir).unwrap();
+    for raw in [
+        r#"{"pid":0,"port":3080,"cwd":"/tmp","started_at":0}"#,
+        r#"{"pid":4294967295,"port":3080,"cwd":"/tmp","started_at":0}"#,
+        r#"{"pid":4242,"port":0,"cwd":"/tmp","started_at":0}"#,
+        r#"{"pid":4242,"port":3080,"cwd":"relative","started_at":0}"#,
+    ] {
+        std::fs::write(state_path(&dir), raw).unwrap();
+        assert!(read_state(&dir).is_none());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn state_write_does_not_follow_the_old_fixed_temporary_symlink() {
+    use std::os::unix::{fs::symlink, fs::PermissionsExt};
+    let dir = crate::test_dir("state-symlink");
+    std::fs::create_dir_all(&dir).unwrap();
+    let victim = dir.join("victim");
+    std::fs::write(&victim, "important").unwrap();
+    symlink(&victim, dir.join("state.json.tmp")).unwrap();
+    let state = HarnessState {
+        pid: 4242,
+        port: 3080,
+        cwd: "/tmp".into(),
+        started_at: 0,
+        started_marker: None,
+    };
+    write_state(&dir, &state).unwrap();
+    write_state(&dir, &state).unwrap();
+    assert_eq!(std::fs::read_to_string(victim).unwrap(), "important");
+    assert_eq!(
+        std::fs::metadata(state_path(&dir))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn state_round_trip() {
     let dir = crate::test_dir("dsh-desktop-state-test");
@@ -148,6 +317,7 @@ fn state_round_trip() {
         port: 3080,
         cwd: "/tmp".into(),
         started_at: 7,
+        started_marker: None,
     };
     write_state(&dir, &state).unwrap();
     let back = read_state(&dir).unwrap();

@@ -1,6 +1,7 @@
 //! Child-process lifetime, the on-disk state file, and stale-instance recovery.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -12,23 +13,215 @@ pub struct HarnessState {
     pub port: u16,
     pub cwd: String,
     pub started_at: u64,
+    /// When the recorded process started, as the OS reports it (see [`process_start_marker`]).
+    ///
+    /// A pid alone is not an identity: a reboot, a crash loop or a long update window can hand
+    /// the same number to an unrelated process, and every exit path here signals what the record
+    /// names. Comparing the marker before signalling turns "the pid is alive" into "the pid is
+    /// still the process this record describes". Absent in records written before the field
+    /// existed. Missing and obsolete markers cannot authorize automatic cleanup.
+    #[serde(default)]
+    pub started_marker: Option<String>,
 }
 
 pub fn state_path(data_dir: &Path) -> PathBuf {
     data_dir.join("state.json")
 }
 
-pub fn read_state(data_dir: &Path) -> Option<HarnessState> {
-    let raw = std::fs::read_to_string(state_path(data_dir)).ok()?;
-    serde_json::from_str(&raw).ok()
+fn valid_pid(pid: u32) -> bool {
+    pid > 1 && pid <= i32::MAX as u32
 }
 
+pub fn read_state(data_dir: &Path) -> Option<HarnessState> {
+    let raw = std::fs::read_to_string(state_path(data_dir)).ok()?;
+    let state: HarnessState = serde_json::from_str(&raw).ok()?;
+    (valid_pid(state.pid) && state.port != 0 && Path::new(&state.cwd).is_absolute())
+        .then_some(state)
+}
+
+impl HarnessState {
+    pub fn identity(&self) -> Option<Identity> {
+        Some(Identity {
+            pid: self.pid,
+            marker: self.started_marker.clone()?,
+        })
+    }
+}
+
+/// Create a private sibling exclusively, then replace the state in one rename.
 pub fn write_state(data_dir: &Path, state: &HarnessState) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if !valid_pid(state.pid) || state.port == 0 || !Path::new(&state.cwd).is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid Harness state",
+        ));
+    }
     std::fs::create_dir_all(data_dir)?;
     let path = state_path(data_dir);
-    std::fs::write(&path, serde_json::to_vec_pretty(state)?)?;
-    restrict(&path);
-    Ok(())
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let (temporary, mut file) = loop {
+        let candidate = data_dir.join(format!(
+            ".state-{}-{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match options.open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = (|| {
+        file.write_all(&serde_json::to_vec_pretty(state)?)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        {
+            restrict(&temporary);
+            win::replace_file(&temporary, &path)?;
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::rename(&temporary, &path)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// OS birth identity, independent of exec and locale; unavailable identities never permit takeover.
+pub fn process_start_marker(pid: u32) -> Option<String> {
+    if !valid_pid(pid) {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        // SAFETY: the output buffer is sized for the requested kernel structure.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid as i32,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if read != size {
+            return None;
+        }
+        let info = unsafe { info.assume_init() };
+        Some(format!(
+            "macos:{pid}:{}:{}",
+            info.pbi_start_tvsec, info.pbi_start_tvusec
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let start = stat.rsplit_once(')')?.1.split_whitespace().nth(19)?;
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        Some(format!("linux:{pid}:{}:{start}", boot.trim()))
+    }
+    #[cfg(windows)]
+    {
+        win::start_marker(pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub pid: u32,
+    marker: String,
+}
+
+pub fn pin(pid: u32) -> Option<Identity> {
+    Some(Identity {
+        pid,
+        marker: process_start_marker(pid)?,
+    })
+}
+
+pub fn same_process(identity: &Identity) -> bool {
+    process_start_marker(identity.pid).as_deref() == Some(identity.marker.as_str())
+}
+
+#[derive(Clone)]
+struct Tracked {
+    identity: Option<Identity>,
+    group: bool,
+}
+static SPAWNED: Mutex<Option<BTreeMap<u32, Tracked>>> = Mutex::new(None);
+
+/// Called immediately after spawn, never when reusing a previous launch.
+pub fn remember_spawned(pid: u32) {
+    if !valid_pid(pid) {
+        return;
+    }
+    crate::harness::lock_or_recover(&SPAWNED)
+        .get_or_insert_with(BTreeMap::new)
+        .insert(
+            pid,
+            Tracked {
+                identity: pin(pid),
+                group: true,
+            },
+        );
+}
+
+pub fn remember_adopted(identity: Identity) {
+    crate::harness::lock_or_recover(&SPAWNED)
+        .get_or_insert_with(BTreeMap::new)
+        .entry(identity.pid)
+        .or_insert(Tracked {
+            identity: Some(identity),
+            group: false,
+        });
+}
+
+pub fn forget_spawned(pid: u32) {
+    if let Some(entries) = crate::harness::lock_or_recover(&SPAWNED).as_mut() {
+        entries.remove(&pid);
+    }
+}
+
+fn tracked(pid: u32) -> Option<Tracked> {
+    crate::harness::lock_or_recover(&SPAWNED)
+        .as_ref()?
+        .get(&pid)
+        .cloned()
+}
+
+pub fn spawned_here(pid: u32) -> bool {
+    tracked(pid).is_some_and(|t| t.group)
+}
+
+pub fn saved_marker(pid: u32) -> Option<String> {
+    tracked(pid)?.identity.map(|identity| identity.marker)
+}
+
+pub fn recorded_matches(state: &HarnessState) -> bool {
+    state
+        .identity()
+        .is_some_and(|identity| same_process(&identity))
 }
 
 pub fn clear_state(data_dir: &Path) {
@@ -36,7 +229,7 @@ pub fn clear_state(data_dir: &Path) {
 }
 
 pub fn is_alive(pid: u32) -> bool {
-    kill_signal(pid, None)
+    valid_pid(pid) && kill_signal(pid)
 }
 
 /// How long to keep waiting for a finished child's output before giving up on it.
@@ -110,6 +303,7 @@ pub fn output_within(
     timeout: Duration,
     limit: usize,
 ) -> Option<HelperOutput> {
+    crate::shellenv::sanitize_command(command);
     command.stdin(std::process::Stdio::null());
     // Central, so no caller has to remember it: the shipped exe is `windows_subsystem =
     // "windows"`, and a console program (`powershell`, `netstat`, `lsof`, a login shell) spawned
@@ -221,45 +415,98 @@ fn first_line(text: &str) -> String {
 /// left them running — holding the port, the memory, and any lock the tree came with — while the
 /// shell believed it had cleaned up.
 pub fn terminate(pid: u32, grace: Duration) -> bool {
+    let Some(tracked) = tracked(pid) else {
+        return !is_alive(pid);
+    };
+    let result = if !is_alive(pid) {
+        if tracked.group {
+            clean_orphaned_group(pid);
+        }
+        true
+    } else if let Some(identity) = &tracked.identity {
+        terminate_identity(identity, tracked.group, grace)
+    } else {
+        crate::harness::app_log("无法读取进程身份，未发送终止信号");
+        false
+    };
+    if result || !tracked.identity.as_ref().is_some_and(same_process) {
+        forget_spawned(pid);
+    }
+    result
+}
+
+/// External identity must be captured before any user question or other wait.
+pub fn terminate_pid(identity: &Identity, grace: Duration) -> bool {
+    terminate_identity(identity, false, grace)
+}
+
+fn terminate_identity(identity: &Identity, group: bool, grace: Duration) -> bool {
+    let pid = identity.pid;
+    if !valid_pid(pid) || pid == std::process::id() {
+        return false;
+    }
     if !is_alive(pid) {
-        // The leader is gone, but its group may not be: signal the group, and only the group.
-        // The pid on its own now names nothing — or, once the OS reuses it, an unrelated process.
-        clean_orphaned_group(pid);
         return true;
     }
-    kill_signal(pid, Some(TermSignal::Term));
+    if !same_process(identity) {
+        return false;
+    }
+    if !signal_target(pid, group, TermSignal::Term) {
+        return !is_alive(pid);
+    }
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
         if !is_alive(pid) {
+            if group {
+                clean_orphaned_group(pid);
+            }
             return true;
+        }
+        if !same_process(identity) {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    kill_signal(pid, Some(TermSignal::Kill));
+    // Escalation has its own check: SIGTERM may have ended the original process during the wait.
+    if !same_process(identity) {
+        return !is_alive(pid);
+    }
+    signal_target(pid, group, TermSignal::Kill);
     std::thread::sleep(Duration::from_millis(200));
     !is_alive(pid)
 }
 
-/// Stop what is left of a process group whose leader has already exited.
-///
-/// Unix only, and by group id only. `kill(-pgid)` reaches the leader's surviving children and
-/// fails harmlessly once the group is empty; it never falls back to the bare pid, which after the
-/// leader's exit is free for the OS to hand to an unrelated process.
-///
-/// Windows has no process groups to address this way: `taskkill /T` walks the tree from a *live*
-/// process, so a dead leader's pid reaches nothing of its own — and Windows reuses pids quickly,
-/// so signalling it could reach somebody else's tree. There is nothing safe to do there.
+#[cfg(unix)]
+fn signal_target(pid: u32, group: bool, signal: TermSignal) -> bool {
+    let sig = match signal {
+        TermSignal::Term => libc::SIGTERM,
+        TermSignal::Kill => libc::SIGKILL,
+    };
+    if group {
+        // Only a group leader created by this shell may receive a group signal; no PID fallback.
+        if unsafe { libc::getpgid(pid as i32) } != pid as i32 {
+            return false;
+        }
+    }
+    unsafe { libc::kill(if group { -(pid as i32) } else { pid as i32 }, sig) == 0 }
+}
+
+#[cfg(windows)]
+fn signal_target(pid: u32, group: bool, signal: TermSignal) -> bool {
+    taskkill(pid, group, matches!(signal, TermSignal::Kill))
+}
+
+/// A dead leader's group may still contain workers. Never fall back to its now-free PID.
 #[cfg(unix)]
 fn clean_orphaned_group(pgid: u32) {
+    if !valid_pid(pgid) {
+        return;
+    }
     let group = -(pgid as i32);
-    // SAFETY: `kill` has no memory-safety preconditions; a negative argument addresses a group.
     if unsafe { libc::kill(group, libc::SIGTERM) } != 0 {
         return;
     }
-    // A short fixed wait: with the leader reaped there is no single process to poll, and the
-    // children need a moment to act on SIGTERM before the group is killed outright.
     std::thread::sleep(Duration::from_millis(200));
-    // SAFETY: as above.
     unsafe {
         libc::kill(group, libc::SIGKILL);
     }
@@ -268,61 +515,20 @@ fn clean_orphaned_group(pgid: u32) {
 #[cfg(windows)]
 fn clean_orphaned_group(_pgid: u32) {}
 
-/// Signal a single PID: used for instances this shell did not start, whose process
-/// group belongs to the user's terminal rather than to us.
-pub fn terminate_pid(pid: u32, grace: Duration) -> bool {
-    if !is_alive(pid) {
-        return true;
-    }
-    signal_pid(pid, TermSignal::Term);
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        if !is_alive(pid) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    signal_pid(pid, TermSignal::Kill);
-    std::thread::sleep(Duration::from_millis(200));
-    !is_alive(pid)
-}
-
-/// Stop a process this shell spawned for a short-lived job (npm, pnpm, the CLI's plugin command)
-/// together with whatever it spawned.
-///
-/// Unlike [`terminate`] this does not wait for a graceful exit: the caller has already decided
-/// the job ran past its budget, and a package manager that ignored SIGTERM once will ignore it
-/// again. It is never used on a Harness the user may be watching — only on the update helpers,
-/// whose whole purpose is to finish and exit.
-pub fn kill_tree(pid: u32) {
-    #[cfg(unix)]
-    {
-        // The child was spawned with `process_group(0)`, so the negative pid is its own group.
-        // Falling back to the pid covers a caller that spawned it without one.
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-            libc::kill(pid as i32, libc::SIGKILL);
-        }
-    }
-    #[cfg(windows)]
-    {
-        // `/T` reaches the tree, `/F` skips the grace period the caller already spent.
-        let _ = taskkill(pid, true, true);
-    }
+/// Immediate cleanup of a helper spawned into its own process group.
+pub fn kill_tree(pid: u32) -> bool {
+    let killed = tracked(pid)
+        .and_then(|t| t.identity.map(|identity| (identity, t.group)))
+        .is_some_and(|(identity, group)| {
+            same_process(&identity) && signal_target(pid, group, TermSignal::Kill)
+        });
+    forget_spawned(pid);
+    killed
 }
 
 pub enum TermSignal {
     Term,
     Kill,
-}
-
-#[cfg(unix)]
-fn signal_pid(pid: u32, signal: TermSignal) -> bool {
-    let sig = match signal {
-        TermSignal::Term => libc::SIGTERM,
-        TermSignal::Kill => libc::SIGKILL,
-    };
-    unsafe { libc::kill(pid as i32, sig) == 0 }
 }
 
 /// Keeps a console program spawned by this GUI app from flashing a window.
@@ -344,6 +550,37 @@ mod win {
         fn GetExitCodeProcess(handle: Handle, code: *mut u32) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
         fn GetLastError() -> u32;
+        fn GetProcessTimes(
+            handle: Handle,
+            created: *mut u64,
+            exited: *mut u64,
+            kernel: *mut u64,
+            user: *mut u64,
+        ) -> i32;
+        fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+    }
+
+    pub fn start_marker(pid: u32) -> Option<String> {
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            let (mut created, mut exited, mut kernel, mut user) = (0u64, 0u64, 0u64, 0u64);
+            let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+            CloseHandle(handle);
+            (ok != 0).then(|| format!("windows:{pid}:{created}"))
+        }
+    }
+
+    pub fn replace_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0x1 | 0x8) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// True while the pid is a running process.
@@ -393,14 +630,8 @@ fn taskkill(pid: u32, tree: bool, force: bool) -> bool {
 }
 
 #[cfg(unix)]
-fn kill_signal(pid: u32, signal: Option<TermSignal>) -> bool {
-    let sig = match signal {
-        None => return pid_alive(pid),
-        Some(TermSignal::Term) => libc::SIGTERM,
-        Some(TermSignal::Kill) => libc::SIGKILL,
-    };
-    // Negative pid targets the process group created by `process_group(0)`.
-    unsafe { libc::kill(-(pid as i32), sig) == 0 || libc::kill(pid as i32, sig) == 0 }
+fn kill_signal(pid: u32) -> bool {
+    pid_alive(pid)
 }
 
 /// True while the pid is a running process.
@@ -427,12 +658,8 @@ fn pid_alive(pid: u32) -> bool {
 /// made `terminate` sit out the whole grace period and then report failure), termination
 /// through `taskkill` — graceful first, `/F` only after the grace period.
 #[cfg(windows)]
-fn kill_signal(pid: u32, signal: Option<TermSignal>) -> bool {
-    match signal {
-        None => win::alive(pid),
-        Some(TermSignal::Term) => taskkill(pid, true, false),
-        Some(TermSignal::Kill) => taskkill(pid, true, true),
-    }
+fn kill_signal(pid: u32) -> bool {
+    win::alive(pid)
 }
 
 /// Keep a file only this user can read. Used for the state file and for config.json, whose
