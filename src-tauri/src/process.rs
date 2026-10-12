@@ -605,11 +605,6 @@ mod win {
 /// Windows has no SIGTERM: `taskkill` without `/F` asks the process to close (the closest
 /// thing to a graceful stop), `/F` is the force-kill counterpart of SIGKILL.
 #[cfg(windows)]
-fn signal_pid(pid: u32, signal: TermSignal) -> bool {
-    taskkill(pid, false, matches!(signal, TermSignal::Kill))
-}
-
-#[cfg(windows)]
 fn taskkill(pid: u32, tree: bool, force: bool) -> bool {
     use std::os::windows::process::CommandExt;
     let mut command = std::process::Command::new("taskkill");
