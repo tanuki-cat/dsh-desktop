@@ -87,14 +87,10 @@ fn drops_variables_that_would_run_code_in_the_child() {
 /// An ordinary identifier that merely starts with the same letters is not a loader hook.
 #[test]
 fn dangerous_matching_is_exact() {
-    for key in [
-        "NODE_OPTIONS_HELP",
-        "node_options",
-        "LD_PRELOADER",
-        "MY_LD_PRELOAD",
-    ] {
+    for key in ["NODE_OPTIONS_HELP", "LD_PRELOADER", "MY_LD_PRELOAD"] {
         assert!(!is_dangerous(key), "{key} 不是危险键");
     }
+    assert_eq!(is_dangerous("node_options"), cfg!(windows));
 }
 
 #[test]

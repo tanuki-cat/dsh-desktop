@@ -171,7 +171,13 @@ fn npm_calls_are_pinned_to_the_public_registry() {
         "NPM_CONFIG_USERCONFIG",
     ] {
         assert!(
-            removed.contains(&key.to_string()),
+            removed.iter().any(|actual| {
+                if cfg!(windows) {
+                    actual.eq_ignore_ascii_case(key)
+                } else {
+                    actual == key
+                }
+            }),
             "{key} 必须被清除：{removed:?}"
         );
     }

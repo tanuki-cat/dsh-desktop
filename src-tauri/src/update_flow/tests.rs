@@ -138,7 +138,7 @@ fn a_staged_update_swaps_the_tree_and_an_unconfirmed_one_is_rolled_back() {
 
     // The live tree, in the shadow prefix layout the shell updates.
     let prefix = runtime.join("prefix");
-    let live = prefix.join("lib/node_modules/@deepseek-ai/dsh");
+    let live = package_dir_in(&prefix);
     std::fs::create_dir_all(live.join("lib")).unwrap();
     std::fs::write(live.join("lib/bin.js"), "old\n").unwrap();
     std::fs::write(live.join("package.json"), r#"{"name":"@deepseek-ai/dsh"}"#).unwrap();
@@ -146,7 +146,7 @@ fn a_staged_update_swaps_the_tree_and_an_unconfirmed_one_is_rolled_back() {
     // What `stage_core_update` leaves behind once npm and the verifier are done: a complete
     // tree inside the staging prefix, verified by name and version.
     let staging = transaction::Staging::create(&paths.staging, "0.1.6").unwrap();
-    let staged_dir = staging.prefix().join("lib/node_modules/@deepseek-ai/dsh");
+    let staged_dir = package_dir_in(&staging.prefix());
     std::fs::create_dir_all(staged_dir.join("lib")).unwrap();
     std::fs::write(staged_dir.join("lib/bin.js"), "new\n").unwrap();
     std::fs::write(

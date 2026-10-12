@@ -315,7 +315,7 @@ fn state_round_trip() {
     let state = HarnessState {
         pid: 4242,
         port: 3080,
-        cwd: "/tmp".into(),
+        cwd: dir.to_string_lossy().into_owned(),
         started_at: 7,
         started_marker: None,
     };
@@ -323,6 +323,7 @@ fn state_round_trip() {
     let back = read_state(&dir).unwrap();
     assert_eq!(back.pid, 4242);
     assert_eq!(back.port, 3080);
+    assert_eq!(back.cwd, state.cwd);
     clear_state(&dir);
     assert!(read_state(&dir).is_none());
     let _ = std::fs::remove_dir_all(&dir);
