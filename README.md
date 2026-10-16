@@ -86,7 +86,11 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   `plugin update available: dshmarket 1.45.1 -> 1.46.1, installing`、`plugin updated: dshmarket 1.45.1 -> 1.46.1`，
   随后 harness 重启并正常服务；profile 的依赖范围被改写为 `^1.46.1`、`node_modules` 内实装 1.46.1，
   且 `plugin-check.json` 与核心的 `update-check.json` 各自独立（时间戳与内容互不影响）。
-- 离线测试：`cargo test` **222 passed**，另有 **7 个集成用例**（在真实 node 引擎里跑兼容层与探测脚本）。单测覆盖：URL 解析含 LAN 后缀、凭据脱敏（`Bearer`/`api_key`/`Cookie` 等）、状态文件往返、locator 软链解析与
+- 空白弹窗交接实机确认（2026-10-16，macOS，dsh 0.2.1-alpha.4）：点账户登录后浏览器自动打开授权页，
+  日志记 `navigation blocked, opening externally: https://platform.deepseek.com/dsh/authorize?...`；
+  修复前同一次点击只留下一条 `new window request, opening externally: about:blank` —— 地址从未离开页面，
+  所以只能手动复制链接。终端里的 OSC 链接是同一个形状，未单独实机确认。
+- 离线测试：`cargo test` **255 passed**，另有 **7 个集成用例**（在真实 node 引擎里跑兼容层与探测脚本）。单测覆盖：URL 解析含 LAN 后缀、凭据脱敏（`Bearer`/`api_key`/`Cookie` 等）、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
   缓存落盘往返与旧缓存文件兼容（含新增的 tags 字段缺失时判为不新鲜）、"装到别处 → 同窗口与跨窗口都不重复安装"、
   **标签选择**（默认覆盖上游全部渠道、alpha 可以是最新版本、alpha 落后时 latest 仍胜出、
@@ -151,7 +155,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   另有一条专门复现 GUI 失败场景的回归测试（把进程 PATH 换成不含 node 的值、npm cache 指向临时目录）：
   先断言裸调 `npm` 会 exit 127，再断言走修复后的路径能正常查到 registry。
 
-**待实机点击确认**：附件上传、下载、`window.open` 实际效果（含 2026-10-16 的空白弹窗交接 —— 点账户登录应自动打开浏览器、终端里点 OSC 链接同理）、macOS TCC 授权归因，以及 2026-09-18 修复
+**待实机点击确认**：附件上传、下载、macOS TCC 授权归因，以及 2026-09-18 修复
 的两条路径 —— ① 手动重载（菜单 View → 重新加载界面 / ⌘R）真的重新加载当前会话；② 用 IDE 盖住 harness
 窗口 5 分钟再切回：日志出现 `页面停止绘制：计时器仍在运行`、标题出现"已暂停绘制"、**没有**触发重载，
 且切回时内容**已经追平**（这是渲染兜底要证的那条）；③ **正看着窗口切换会话，立刻切到别的应用停留两分钟
