@@ -54,7 +54,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 - **渲染兜底**：建 Harness 窗口时注入一段 ES5 垫片，**包裹** `requestAnimationFrame`：页面自报 `hidden` 且 250ms 内没有原生帧时，用定时器顶一帧并取消那个已无意义的原生帧。垫片持有**全部在途请求**并监听 `visibilitychange`，所以**在窗口被遮挡之前就排好队的那一帧也会被补上** —— 前端的刷新是一条帧接帧的链，少一环整条就停，而"正看着窗口切会话、然后去看编辑器"恰好命中这一环。被遮挡期间流式输出因此继续推进，切回窗口时内容已经追平，不必重载；重新可见会撤掉还没触发的兜底（原生帧更好）。垫片同时把原生 `requestAnimationFrame` 留在 `__dshNativeRaf` 上供看护探测使用。可见页面上垫片不建任何定时器；`config.json` 的 `render_fallback: false` 可关掉它
 - 看护线程：启动成功后继续 `wait` 子进程，Harness 意外退出会清掉 state.json 并**自动把它拉起来**：先给 8s（崩溃/被杀只给 2s）等一次"交接"——插件市场的「立即重启」就是宿主干净退出、由 detached helper 在同一端口拉起替代进程；端口重新服务时先停掉那个替代进程（它的 cwd 是 CLI 目录、不是本壳配置的 workspace），再按本壳的 runtime/workspace/凭据启动自己的实例，成功后直接把窗口切到新的 token URL。连续 3 次短命重启都没稳定下来才弹终态状态页；运行满 60s 记一次健康、计数归零。状态页带「重新启动 Harness」按钮（同一进程内重跑启动流程），此时另起一个实例（single-instance 回调）或点 Dock 图标（macOS 的 `RunEvent::Reopen`）也等价于按这个按钮；浏览器回退页没有按钮、也不响应这两个入口
 - 残留自愈：只有强杀/崩溃这类拿不到回调的场景才靠下次启动清理；state.json 0600。记录的 pid 仍监听记录的端口时才发信号；仍服务**本次端口**的记录会保留，让启动流程直接复用而不是重启；pid 已不拥有该端口时，只有"命令行含 `--profile web`/`dsh`，且父进程已消失或由 launchd / `systemd --user` 接管"的残留才会被清理（pid 复用、以及别人正在跑的会话都不动）
-- 安全：Harness 窗口零 capability、导航限定当次 authority、外链与 `window.open` 只把 `http`/`https` 交系统浏览器（`file:`、自定义 scheme 记 `external scheme blocked` 后丢弃）
+- 安全：Harness 窗口零 capability、导航限定当次 authority、外链与 `window.open` 只把 `http`/`https` 交系统浏览器（`file:`、自定义 scheme 记 `external scheme blocked` 后丢弃）。`window.open` 的**空白弹窗**（页面先在点击里开 `about:blank`、拿到地址后再写 `location` —— 账户登录与终端 OSC 链接都是这个形状）改由垫片接管：返回一个保持存活的句柄，页面后写的地址变成一次隐藏帧导航，仍走同一道导航围栏（2026-10-16）
 - CSP：本地 splash 页面走 `tauri.conf.json` 的 `app.security.csp`（无 `unsafe-inline`/`unsafe-eval`，Tauri 为页面内联脚本自动补 sha256、为样式补 nonce）。**作用范围仅限本地资产**：harness 窗口加载的是 `http://127.0.0.1:<port>/`，Tauri 不参与该请求，也就无法给它加 CSP —— 那一边靠的是零 capability + 导航围栏。
 - 下载：`on_download` 落盘到 `~/Downloads`，同名文件自动加 `-1`/`-2` 后缀（不静默覆盖）；
   附件上传由 wry 的 `runOpenPanel` 原生处理
@@ -128,6 +128,8 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   **重试判据的子进程存活测试**（`try_wait` 的三条答复：已退出、已被外部 reap 掉（`ECHILD`）、仍在运行；
   这条用例经过变异验证 —— 把 `ECHILD` 读成"还在跑"，它会失败）、
   未读完的输出丢掉残行、
+  空白弹窗交接（ES5 纪律与单次安装、真实地址仍走原生 `on_new_window`、`about:blank` 返回可写 `location`/可 `close` 的句柄、
+  后写的地址只交一次并落成一个隐藏帧、无参数的 `window.open()`、`location.replace` 与整赋值 `popup.location = url` 三种写法都生效）、
   滚动锚定垫片（ES5 纪律与单次安装、按 UA 只在 WebKit 上安装而放过已会补偿的 Chromium/Gecko、
   上方内容收起/展开后读者正在看的行留在原处且偏移按插入高度补偿、第二次回调不再补一次、
   跟尾与贴底留给页面、读者滚动不被抵消））；
@@ -149,7 +151,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   另有一条专门复现 GUI 失败场景的回归测试（把进程 PATH 换成不含 node 的值、npm cache 指向临时目录）：
   先断言裸调 `npm` 会 exit 127，再断言走修复后的路径能正常查到 registry。
 
-**待实机点击确认**：附件上传、下载、`window.open` 实际效果、macOS TCC 授权归因，以及 2026-09-18 修复
+**待实机点击确认**：附件上传、下载、`window.open` 实际效果（含 2026-10-16 的空白弹窗交接 —— 点账户登录应自动打开浏览器、终端里点 OSC 链接同理）、macOS TCC 授权归因，以及 2026-09-18 修复
 的两条路径 —— ① 手动重载（菜单 View → 重新加载界面 / ⌘R）真的重新加载当前会话；② 用 IDE 盖住 harness
 窗口 5 分钟再切回：日志出现 `页面停止绘制：计时器仍在运行`、标题出现"已暂停绘制"、**没有**触发重载，
 且切回时内容**已经追平**（这是渲染兜底要证的那条）；③ **正看着窗口切换会话，立刻切到别的应用停留两分钟
@@ -429,6 +431,7 @@ macOS 的 app data 目录为 `~/Library/Application Support/com.deepseek.dsh.des
 | 页面完全无响应（渲染进程被杀 / 主线程卡死） | 探测连续 3 次收不到应答 → 同样重新加载（最多 3 次）。**无应答不算"正在输入"**：能回答"我在输入"的代码正是已经停掉的那部分，所以静默一律按需要恢复处理；macOS 上渲染进程被系统结束时会立刻重载（日志记 `WebView 渲染进程已结束`，崩溃报告在 `~/Library/Logs/DiagnosticReports`）。加载完成后标题自动恢复；3 次仍不回来 → 标题停在"页面已停止刷新，请重启应用"并记日志 |
 | 手动恢复界面 | 菜单 **View → 重新加载界面**（⌘R）：重新加载 Harness 当前 URL。**重载会告诉看护它手里的读数已经作废** —— 新文档的帧计数从零开始，拿旧读数去比会让一次成功的重载在下一个周期被判成"停止绘制"（崩溃恢复与首次加载重试同理）。与看护走同一条路径，丢掉页面内存里的东西（滚动位置、展开的 Think 行、未发出的草稿），但**不丢会话**——会话在 Harness 进程里。这是"页面只是被暂停绘制"时唯一需要的手段，也是不必退出应用就能拿到新文档的入口 |
 | 页面里的非 http/https 链接（`file:`、自定义 scheme…） | 不交给系统：日志记 `external scheme blocked: <scheme> (...)` 后丢弃 |
+| 账户登录点了不自动打开浏览器（只能「复制登录链接」） | 登录是**两段式弹窗**：点击时 `window.open("about:blank")` 预开，RPC 回来后才把真实地址写进 `popup.location`。WebKit 在 `window.open` 那一刻只报得出 `about:blank`，它被 scheme 白名单挡掉、壳又回 `Deny`（`window.open` 因此得到 `null`），第二段写入整句失效 —— 地址从没到达 `on_navigation`，浏览器自然没得开。修法是注入的 ES5 垫片接管空白弹窗（2026-10-16 实测：日志只有一条 `new window request, opening externally: about:blank`，没有后续外链条目）；终端里的 OSC 链接（`window.open()` + `location.href`）是同一个形状，一并修好 |
 | 有新版 dsh 但端口上是外部实例且不允许接管 | 跳过本次更新（不重写别人正在用的树），实例继续服务，日志记 `update deferred`。允许接管时同样**先弹面板**：拒绝接管即跳过本次更新，而不是先停掉对方再失败 |
 | 下载同名文件 | 自动改名 `name-1.ext`，不覆盖已有文件 |
 | 关闭状态页（启动失败时） | 直接退出应用（此时没有 Harness 窗口，不会留下无窗口进程）；应用自己移除该窗口走 `destroy`，不触发这条 |

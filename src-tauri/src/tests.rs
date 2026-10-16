@@ -891,9 +891,10 @@ fn only_a_clear_field_lets_the_staged_tree_be_committed() {
     assert!(swap_blocked(true, true, true));
 }
 
-/// The three injected scripts are independently switchable, and each appears at most once: a
-/// duplicate console wrapper would double every diagnostic line, and a duplicate rAF wrapper
-/// would deliver every frame twice.
+/// Each injected script follows its own switch and appears at most once: a duplicate console
+/// wrapper would double every diagnostic line, and a duplicate rAF wrapper would deliver every
+/// frame twice. The blank-popup handoff has no switch — it is the shell's window model rather than
+/// a workaround for one page, so it is there even with every optional script off.
 #[test]
 fn each_injected_script_follows_its_own_switch() {
     let data_dir = test_dir("harness-scripts");
@@ -924,6 +925,11 @@ fn each_injected_script_follows_its_own_switch() {
     assert_eq!(diagnostics, 1, "页面诊断只能注入一份：{all:?}");
     assert_eq!(menu, 1, "菜单补焦点只能注入一份：{all:?}");
     assert_eq!(anchor, 1, "滚动锚定只能注入一份：{all:?}");
+    let handoff = all
+        .iter()
+        .filter(|s| s.contains("__dshPopupHandoff"))
+        .count();
+    assert_eq!(handoff, 1, "空白弹窗交接只能注入一份：{all:?}");
     // Diagnostics observe a page the other layers have finished setting up.
     let order = |needle: &str| all.iter().position(|s| s.contains(needle));
     assert!(
@@ -950,6 +956,13 @@ fn each_injected_script_follows_its_own_switch() {
     assert!(
         !off.iter().any(|s| s.contains("__dshScrollAnchor")),
         "{off:?}"
+    );
+    assert_eq!(
+        off.iter()
+            .filter(|s| s.contains("__dshPopupHandoff"))
+            .count(),
+        1,
+        "空白弹窗交接没有开关，全关时也必须在：{off:?}"
     );
 
     // One off, one on: no switch may carry another.

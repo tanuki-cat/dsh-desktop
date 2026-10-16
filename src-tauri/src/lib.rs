@@ -2823,6 +2823,10 @@ fn harness_scripts(config: &Config) -> Vec<String> {
             scripts.push(compat);
         }
     }
+    // The shell's window model rather than a workaround for one page: the UI pre-opens a blank
+    // tab for every address it can only learn later (account sign-in, terminal links), and this is
+    // what lets that tab's address reach `on_navigation` at all.
+    scripts.push(window::popup_handoff_script());
     if config.render_fallback {
         scripts.push(window::render_fallback_script());
     }

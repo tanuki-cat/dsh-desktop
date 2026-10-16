@@ -2227,3 +2227,112 @@ fn the_scroll_anchor_shim_leaves_the_page_and_the_reader_alone() {
         "跟尾、贴底与读者滚动都必须留给页面"
     );
 }
+
+/// The handoff runs on the same engines the compat layer exists for, installs once, and leaves an
+/// address the page already knows on the native path.
+#[test]
+fn the_popup_handoff_stays_es5_and_installs_once() {
+    let script = popup_handoff_script();
+    for syntax in ["=>", "`", "??", "const ", "let ", "class "] {
+        assert!(
+            !script.contains(syntax),
+            "空白弹窗交接必须保持 ES5，发现 {syntax:?}"
+        );
+    }
+    assert!(script.contains("__dshPopupHandoff === true"), "{script}");
+
+    let probe = r#"
+      var native = [];
+      var stub = {
+        open: function () {
+          native.push([].slice.call(arguments).join("+"));
+          return null;
+        }
+      };
+      global.window = stub;
+      __SCRIPT__
+      __SCRIPT__
+      stub.open("https://example.com/docs", "_blank", "noopener,noreferrer");
+      process.stdout.write(native.join("|") + "/" + String(stub.__dshPopupHandoff === true));
+    "#
+    .replace("__SCRIPT__", &script);
+    assert_eq!(
+        run_shim("", &probe),
+        "https://example.com/docs+_blank+noopener,noreferrer/true",
+        "真实地址必须留在原生通道，且重复注入只装一次"
+    );
+}
+
+/// The reported bug, driven in a real engine: a blank open has to answer a live handle, and what
+/// the page writes into it afterwards has to reach the shell as a navigation — the only way
+/// `on_navigation` ever learns the address, and therefore the only way the browser opens.
+#[test]
+fn a_blank_popup_hands_its_later_address_to_the_shell() {
+    let dom = r#"
+      var frames = [];
+      var timers = [];
+      var removed = 0;
+      var body = {
+        appendChild: function (node) {
+          node.parentNode = body;
+          frames.push(node);
+        },
+        removeChild: function (node) {
+          node.parentNode = null;
+          removed += 1;
+        }
+      };
+      var stub = {
+        open: function () { return null; },
+        document: {
+          body: body,
+          createElement: function () {
+            return {
+              style: {},
+              attrs: {},
+              parentNode: null,
+              src: "",
+              setAttribute: function (name, value) { this.attrs[name] = value; }
+            };
+          }
+        },
+        setTimeout: function (fn) { timers.push(fn); return timers.length; }
+      };
+      global.window = stub;
+    "#;
+    let drive = r#"
+      var out = [];
+      // A blank open inside the click, then the address the RPC answered with: the sign-in flow.
+      var popup = window.open("about:blank", "_blank");
+      out.push(popup && popup.closed === false ? "handle" : "no-handle");
+      popup.opener = null;
+      popup.location.replace("https://platform.deepseek.com/authorize?client=dsh");
+      out.push(frames.length + ":" + frames[0].src);
+      out.push("hidden=" + frames[0].attrs["aria-hidden"]);
+      // A second write must not open the browser twice.
+      popup.location.href = "https://platform.deepseek.com/authorize?client=other";
+      out.push(frames.length);
+      // The terminal's shape: no arguments, then href. It has to work the same way.
+      var second = window.open();
+      second.location.href = "https://example.com/osc";
+      out.push(frames.length + ":" + frames[1].src);
+      // A wholesale assignment (popup.location = url) is the other shape in the wild.
+      var third = window.open("", "_blank");
+      third.location = "https://example.com/assigned";
+      out.push(frames.length + ":" + frames[2].src);
+      popup.close();
+      out.push(popup.closed === true ? "closed" : "open");
+      timers[0]();
+      out.push(removed);
+      process.stdout.write(out.join(" | "));
+    "#;
+    let script = format!(
+        "{dom}\n{handoff}\n{drive}",
+        handoff = popup_handoff_script()
+    );
+    assert_eq!(
+        run_shim("", &script),
+        "handle | 1:https://platform.deepseek.com/authorize?client=dsh | hidden=true | 1 | 2:https://example.com/osc | 3:https://example.com/assigned | closed | 1",
+        "空白弹窗必须把后续地址交给壳，且只交一次"
+    );
+}

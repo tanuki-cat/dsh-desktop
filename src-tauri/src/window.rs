@@ -1249,6 +1249,122 @@ pub fn menu_focus_guard_script() -> String {
     MENU_FOCUS_GUARD_SCRIPT.to_string()
 }
 
+/// Hand a pre-opened blank tab over to the shell once the page knows where it points.
+///
+/// **Why a blank tab exists at all.** WebKit only lets a page open a window while a user click is
+/// still being handled, so anything whose address arrives later has to pre-open `about:blank`
+/// inside the click and point it somewhere once the answer comes back. Two flows in the Harness do
+/// exactly that: the account sign-in (`BrowserLogin` pre-opens the tab, then writes `location`
+/// from the RPC response) and the terminal's OSC link handler (`window.open()`, then
+/// `location.href`).
+///
+/// **What the shell did to them.** WebKit resolves the URL at `window.open` time, so the native
+/// new-window hook only ever sees `about:blank`: [`may_open`] refuses the scheme, and the
+/// [`NewWindowResponse::Deny`] that follows is what makes `window.open` answer `null`. Both
+/// pages read that as "the popup was blocked" and drop the navigation — the real address never
+/// reaches `on_navigation` and the system browser is never opened (field report 2026-10-16:
+/// sign-in could only offer its link for copying, one log line `new window request, opening
+/// externally: about:blank` and no follow-up).
+///
+/// **What this does.** A blank open answers a stub handle that stays alive, and the later
+/// `location` write becomes a hidden-frame navigation. That navigation travels the same fence as
+/// every other off-origin navigation (`on_navigation`): the page gains no capability, only
+/// `http`/`https` still leaves the shell, and the frame is discarded either way. A real URL is
+/// left on the native path, which is already handled.
+///
+/// ES5 on purpose, like the other injected scripts.
+const POPUP_HANDOFF_SCRIPT: &str = r#"
+(function () {
+  var w = window;
+  if (w.__dshPopupHandoff === true) return;
+  if (typeof w.open !== "function") return;
+  w.__dshPopupHandoff = true;
+  var nativeOpen = w.open;
+  var blank = function (url) {
+    return url === undefined || url === null || url === "" || url === "about:blank";
+  };
+  // A hidden frame rather than window.location: the shell cancels this navigation and opens it, so
+  // the worst case is an invisible frame instead of a session that navigated away.
+  var handOver = function (url) {
+    if (typeof url !== "string" || url === "") return;
+    var d = w.document;
+    var host = d && (d.body || d.documentElement);
+    if (!host) return;
+    var frame = d.createElement("iframe");
+    frame.setAttribute("aria-hidden", "true");
+    frame.style.position = "fixed";
+    frame.style.left = "-10000px";
+    frame.style.width = "1px";
+    frame.style.height = "1px";
+    frame.src = url;
+    host.appendChild(frame);
+    // The shell cancels the load, so no event on the frame is guaranteed to fire; this timer is
+    // what bounds the frame's lifetime either way.
+    w.setTimeout(function () {
+      if (frame.parentNode) frame.parentNode.removeChild(frame);
+    }, 60000);
+  };
+  var popup = function (name) {
+    var handle = {
+      closed: false,
+      opener: null,
+      name: name || "",
+      focus: function () {},
+      blur: function () {},
+      postMessage: function () {},
+      close: function () {
+        handle.closed = true;
+      }
+    };
+    var sent = false;
+    var point = function (url) {
+      // One tab, one destination: a stub that forwarded twice would open the browser twice.
+      if (sent) return;
+      sent = true;
+      handOver(url);
+    };
+    var where = {
+      replace: point,
+      assign: point,
+      toString: function () {
+        return "about:blank";
+      }
+    };
+    Object.defineProperty(where, "href", {
+      get: function () {
+        return "about:blank";
+      },
+      set: point,
+      enumerable: true,
+      configurable: true
+    });
+    // Both write shapes forward: popup.location.replace(url), which sign-in uses, and a whole
+    // assignment of popup.location, which is the shape older callers reach for.
+    Object.defineProperty(handle, "location", {
+      get: function () {
+        return where;
+      },
+      set: point,
+      enumerable: true,
+      configurable: true
+    });
+    return handle;
+  };
+  w.open = function (url, name) {
+    // Everything the page already knows the address of keeps the native path: on_new_window opens
+    // it in the system browser.
+    if (!blank(url)) return nativeOpen.apply(w, arguments);
+    return popup(name);
+  };
+})();
+"#;
+
+/// The blank-popup handoff. A plain constant today; it stays behind a function so callers do not
+/// depend on whether it needs substitution, like the others.
+pub fn popup_handoff_script() -> String {
+    POPUP_HANDOFF_SCRIPT.to_string()
+}
+
 /// Give the conversation back the scroll anchoring WebKit never implemented.
 ///
 /// **The gap.** WebKit has no CSS scroll anchoring at all — the feature is absent from every
