@@ -307,15 +307,19 @@ jobs:
 
           ### 本版更新
 
-          - **账户登录自动打开浏览器**：dsh 0.2.1-alpha.4 的登录改成了两段式 —— 点击时先开一个空白标签页（WebKit 只在用户手势里放行），拿到授权地址后再写进它。壳此前把一切新窗口都判成外链，而单独的 `about:blank` 又被 scheme 白名单挡掉，于是真实地址从未离开页面，只能手动复制链接。现在壳注入的垫片接管空白弹窗：返回一个保持存活的句柄，页面后写入的地址转成一次隐藏帧导航，仍然走同一道导航围栏（零 capability、只有 http/https 出壳）。
-          - **终端 OSC 链接**：xterm 的链接处理是同一个形状（`window.open()` 后赋 `location.href`），一并修好。
-          - 真实地址的 `window.open` 行为不变；弹窗被拒时的「复制登录链接」兜底仍在。
+          - **自带运行时升级**：随包的 dsh 核心 `0.2.0-rc.2` → **`0.2.1-rc.1`**，插件市场 `1.66.17` → **`1.66.32`**（新机器首启播种该版本）。这一代核心明显更大：干净 staging 从约 751–775 MB 涨到 **1087 MB / 69,259 个文件**（dsh 树本身 855 MB，与同版本普通 `npm install -g` 逐项一致），因此自带运行时版的分发包也随之变大 —— 精简版不受影响。
+          - **账户登录自动打开浏览器**（v0.4.14 的修复，本版继续带着）：登录是两段式弹窗（点击时先开空白标签页，拿到授权地址后再写进去），壳此前把新窗口一律判成外链、`about:blank` 又被 scheme 白名单挡掉，于是地址从未离开页面。现在由注入的垫片接管空白弹窗：返回一个保持存活的句柄，页面后写入的地址转成一次隐藏帧导航，仍走同一道导航围栏（零 capability、只有 http/https 出壳）。终端里的 OSC 链接是同一个形状，一并修好。
+          - **overlay 去掉失效的 `trustedHosts`**：0.2.1 把浏览器信任清单从 web-runtime 行挪到了调用侧，该键已不在行的 config 里；壳从不传 `--trusted-host`，它一直是空数组，去掉只是不再携带上游已不读的键。
+          - **「已是最新」日志说清已装版本**：更新检查打印的是 registry 头，已装版本比所有标签都新时（例如 `latest` 停在 0.2.0-rc.2、机器上装的是 `next` 的 0.2.1-rc.1）那行读起来像倒退。现在两者不同时写明 `installed … ahead of the newest tagged …`，相等时保持原样。
+          - **发版预检覆盖插件市场版本**：`Makefile` / `scripts/stage-runtime.sh` / `windows-portable.yml` 三处的 dsh、Node、插件市场版本任一漏改，preflight 直接失败，不再可能让同一个 tag 下的 Windows 便携包与 macOS/Linux 包带上不同的市场版本。
 
           ### 验证与范围
 
-          实机确认（2026-10-16，macOS，dsh 0.2.1-alpha.4）：点账户登录后浏览器自动打开授权页，壳日志记 `navigation blocked, opening externally: https://platform.deepseek.com/dsh/authorize?...`；修复前同一次点击只留下一条 `new window request, opening externally: about:blank`。发布门禁 `make fmt-check` / `make check` / `make clippy --all-targets -D warnings` / `make test` 全绿（单测 255 + 集成 7），新增 2 个单测在 node 里按登录与终端的真实调用形状驱动垫片。
+          与 dsh 0.2.1-rc.1 的接口逐字比对过（取 npm 上的 0.2.1-alpha.4 与已装的 rc.1 对拍）：CLI 入口 `dsh/lib/**` 整目录 diff 为空，web-app 的旗标解析、web-runtime 行与 URL 行、浏览器侧产物 sha256 全部一致，登录弹窗代码逐字相同 —— 壳依赖的每个接口都没有变。
 
-          Windows／Linux 上这条路径未做端到端实测（垫片是不依赖引擎的 ES5，行为由单测覆盖），不把单测当作实机验证。本标签的各平台门禁与打包结果见对应发布工作流。
+          真实 staging（2026-10-17，macOS arm64）：`make runtime-stage` 用新钉版本装出 dsh 0.2.1-rc.1 与 dshmarket 1.66.32，必需文件、可执行位、符号链接、quarantine、模板内 store 与文件数/体积闸门全部通过（69,259 个文件 / 1087 MB）。本机门禁 `fmt-check` / `check` / `clippy -D warnings` / `test`（255 个单测 + 7 个集成）全绿；两个 workflow 过 YAML 解析；本地复跑 preflight 的一致性检查三处全绿，并故意改坏过一处确认它真的会失败。
+
+          Windows / Linux 的 staging 与打包由本标签的流水线验证：体积上限按 macOS 实测留了约四成余量，若某个平台偏出会直接失败而不是静默发出一个不完整的包。
 
           已知 Linux 上游 Wry 0.55.1 下载失败状态可能跨请求残留：失败或取消后，后续成功下载可能被误报为失败。本版未修复该上游问题。
 
