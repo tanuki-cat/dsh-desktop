@@ -13,9 +13,9 @@ set -eu
 
 out=${1:?用法: stage-runtime.sh <runtime 目录>}
 node_version=${NODE_VERSION:-22.23.2}
-dsh_version=${DSH_VERSION:-0.2.0-rc.2}
+dsh_version=${DSH_VERSION:-0.2.1-rc.1}
 pnpm_version=${PNPM_VERSION:-12.3.4}
-market_version=${DSHMARKET_VERSION:-1.66.17}
+dshmarket_version=${DSHMARKET_VERSION:-1.66.32}
 cache=${CACHE_DIR:-.runtime-cache}
 python=${PYTHON:-python3}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -92,7 +92,7 @@ echo "安装 pnpm $pnpm_version 到 tools"
 "$node_bin" "$npm_cli" install -g --prefix "$out/tools" \
   --cache "$cache/npm" --no-fund --no-audit --loglevel=error "pnpm@$pnpm_version"
 
-echo "生成 profile 模板（含插件市场 dshmarket@${market_version}）"
+echo "生成 profile 模板（含插件市场 dshmarket@${dshmarket_version}）"
 # `cache` defaults to the RELATIVE `.runtime-cache`, and make-profile-template.sh runs
 # `pnpm install` from inside `$dest`. pnpm resolves a relative --store-dir against the project
 # directory, so the store landed in `profile-template/.runtime-cache/pnpm-store`: shipped in the
@@ -110,12 +110,12 @@ tools_bin="$out/tools/bin"
 # template is built by the node that ships rather than whatever happens to be on PATH.
 node_dir=$(cd "$(dirname "$node_bin")" && pwd)
 PATH="$node_dir:$PATH" PNPM_STORE_DIR="$store_dir" sh "$here/make-profile-template.sh" \
-  "$out/profile-template" "$market_version" "$tools_bin"
+  "$out/profile-template" "$dshmarket_version" "$tools_bin"
 
 if command -v xattr >/dev/null 2>&1; then
   xattr -cr "$out" 2>/dev/null || true
 fi
 "$python" "$here/write_third_party_notices.py" \
-  "$out" "$node_version" "$dsh_version" "$pnpm_version" "$market_version"
+  "$out" "$node_version" "$dsh_version" "$pnpm_version" "$dshmarket_version"
 sh "$here/check-runtime-stage.sh" "$out"
 du -sh "$out" 2>/dev/null || true

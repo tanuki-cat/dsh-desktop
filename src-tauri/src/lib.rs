@@ -2130,8 +2130,20 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
                             }
                         }
                     }
-                    update::Status::UpToDate { version: current } => {
-                        harness::app_log(&format!("dsh is up to date: {current}"));
+                    update::Status::UpToDate { version: latest } => {
+                        // `latest` is the registry head, not what is running: with the configured
+                        // tags narrowed to a channel the newest build is not on, or a hand-installed
+                        // build ahead of every tag, the two differ — and naming only the head reads
+                        // as if the shell had gone backwards (2026-10-17: head 0.2.0-rc.2 on
+                        // `latest`, installed 0.2.1-rc.1 on `next`). The head is still what the
+                        // cache stores; only the line says both.
+                        if latest == version {
+                            harness::app_log(&format!("dsh is up to date: {version}"));
+                        } else {
+                            harness::app_log(&format!(
+                                "dsh is up to date: installed {version} ahead of the newest tagged {latest}"
+                            ));
+                        }
                     }
                     update::Status::Skipped => {}
                     update::Status::Failed { reason } => {
@@ -2238,10 +2250,21 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
                                     just_updated = true;
                                 }
                             }
-                            update::Status::UpToDate { version } => harness::app_log(&format!(
-                                "plugin {} is up to date: {version}",
-                                update::MARKET_PLUGIN
-                            )),
+                            update::Status::UpToDate { version: latest } => {
+                                // Same rule as the core check above: name what is installed, and
+                                // the head only when it differs.
+                                if latest == current {
+                                    harness::app_log(&format!(
+                                        "plugin {} is up to date: {current}",
+                                        update::MARKET_PLUGIN
+                                    ));
+                                } else {
+                                    harness::app_log(&format!(
+                                        "plugin {} is up to date: installed {current} ahead of the newest tagged {latest}",
+                                        update::MARKET_PLUGIN
+                                    ));
+                                }
+                            }
                             update::Status::Skipped => {}
                             update::Status::Failed { reason } => harness::app_log(&format!(
                                 "plugin update check failed, keeping v{current}: {reason}"
@@ -2562,9 +2585,16 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
     }
 
     // 4) Force the startup URL line with a launcher-level overlay patch.
+    //
+    // Only the keys this shell actually needs are written. `trustedHosts` used to be listed here
+    // because the web-app row owned the browser-trust list; 0.2.1 moved that to the invocation
+    // (`webStartup` → `connection`), so the key is no longer part of the row's config. It always
+    // held `[]` anyway — this shell never passes `--trusted-host` — and schemastery merges
+    // unknown keys rather than rejecting them, so the entry was inert rather than harmful; it is
+    // gone so the overlay does not carry a key upstream stopped reading (2026-10-17).
     std::fs::write(
         &overlay,
-        "- id: web-runtime\n  config:\n    openBrowser: !!js ctx.webStartup.openBrowser\n    printUrl: true\n    surfaceContext: true\n    trustedHosts: !!js ctx.webStartup.trustedHosts\n",
+        "- id: web-runtime\n  config:\n    openBrowser: !!js ctx.webStartup.openBrowser\n    printUrl: true\n    surfaceContext: true\n",
     )
     .map_err(|e| format!("写入 overlay 失败: {e}"))?;
 

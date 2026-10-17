@@ -189,9 +189,9 @@ distclean: clean
 #   make runtime-clean    回收 staging 与下载缓存
 # staging 必须按平台各自执行：dsh 树里有平台相关的原生模块。
 NODE_VERSION      ?= 22.23.2
-DSH_VERSION       ?= 0.2.0-rc.2
+DSH_VERSION       ?= 0.2.1-rc.1
 PNPM_VERSION      ?= 12.3.4
-DSHMARKET_VERSION ?= 1.66.17
+DSHMARKET_VERSION ?= 1.66.32
 RUNTIME_DIR       := $(TAURI_DIR)/runtime
 RUNTIME_CACHE     := .runtime-cache
 # 交叉编译时（TARGET 非空）必须按**目标**平台 staging：在 arm64 runner 上打 x64 包却塞进 arm64 的
@@ -273,7 +273,7 @@ runtime-stage: runtime-fetch
 		"$(RUNTIME_DIR)/profile-template" "$(DSHMARKET_VERSION)" "$(RUNTIME_DIR)/tools/bin"
 	@xattr -cr $(RUNTIME_DIR) 2>/dev/null || true
 	@$(PYTHON) scripts/write_third_party_notices.py "$(RUNTIME_DIR)" "$(NODE_VERSION)" "$(DSH_VERSION)" "$(PNPM_VERSION)" "$(DSHMARKET_VERSION)"
-	@DSH_RUNTIME_MAX_FILES=45000 DSH_RUNTIME_MAX_MB=900 sh scripts/check-runtime-stage.sh "$(RUNTIME_DIR)"
+	@DSH_RUNTIME_MAX_FILES=100000 DSH_RUNTIME_MAX_MB=1500 sh scripts/check-runtime-stage.sh "$(RUNTIME_DIR)"
 	@du -sh $(RUNTIME_DIR) 2>/dev/null || true
 
 # 打包"无需预装 node/dsh"的版本：bundle.resources 会把 runtime/ 一起塞进 .app。

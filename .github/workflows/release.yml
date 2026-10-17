@@ -46,7 +46,9 @@ jobs:
           # scripts/stage-runtime.sh（Windows 的 staging）、以及 windows-portable.yml 里两份
           # workflow 默认值（workflow_dispatch 与 workflow_call 各一份）。它们此前没有任何
           # 门禁 —— 改了 Makefile 却漏改 workflow 默认值时，同一个 tag 下 Windows 便携包与
-          # macOS/Linux 包会带不同版本的 dsh / Node，而 Release 正文仍宣称单一版本（review B6）。
+          # macOS/Linux 包会带不同版本的 dsh / Node / 插件市场，而 Release 正文仍宣称单一
+          # 版本（review B6）。插件市场在 2026-10-17 一并纳入：它与 dsh 核心一样是随包播种的
+          # 一份依赖，漏改时新机器首启装到的市场版本与其余平台不同。
           #
           # The awk below walks each input block: the key line sets the indentation, and the
           # first `default:` at a deeper one is its value. Plain `grep -A2` was tried first and
@@ -62,7 +64,7 @@ jobs:
                 }
               }' .github/workflows/windows-portable.yml | sort -u
           }
-          for name in NODE_VERSION DSH_VERSION; do
+          for name in NODE_VERSION DSH_VERSION DSHMARKET_VERSION; do
             make_value=$(grep -m1 "^$name " Makefile | awk '{ print $3 }')
             lower=$(printf %s "$name" | tr "A-Z" "a-z")
             script_value=$(grep -m1 "^${lower}=" scripts/stage-runtime.sh | sed -e "s/^[^:]*:-//" -e "s/}.*$//")
@@ -324,7 +326,7 @@ jobs:
           macOS / Linux 每个平台都有两种产物，Windows 只有一种（它本身就是免安装的）：
 
           - **自带运行时版**（文件名带 `-bundled`）：随包附带 Node 22 与 dsh 核心，**目标机器无需
-            安装任何东西**，解压 / 安装后双击即用；分发包较大（压缩后约 150–330 MB）。
+            安装任何东西**，解压 / 安装后双击即用；分发包较大（随包的 Node 与完整 dsh 插件树合计约 1.1 GB，压缩后仍有数百 MB）。
           - **精简版**（文件名不带后缀）：只有桌面壳，**目标机器需自备 node 与 dsh**，体积小。
 
           | 平台 | 自带运行时版（推荐） | 精简版（需自备 node/dsh） |

@@ -192,8 +192,8 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 | `make icons` | 由 `icon.png` 重生成 `icon.icns` | 仅 macOS（`sips` + `iconutil`）；Linux 打包直接用 png |
 | `make icon-art` | 由 `src-tauri/icons/make_icon.py` 重绘 `icon.png` | 自绘小黑鲸，需 `python3` + Pillow；改设计改脚本，不要手改 png |
 | `make runtime-fetch` | 下载官方 Node，并**对照仓库里的 `src-tauri/runtime.lock`** 校验 SHA256 | 缓存到 `.runtime-cache/`（48 MB，可复用）；只校验下载来的 `SHASUMS256.txt` 挡不住清单被换 |
-| `make runtime-stage` | 组装 `src-tauri/runtime/`：Node + dsh 树 + pnpm + profile 模板 + 许可清单 | 约 **520 MB**；先清空整个 `runtime/`（只留 README.md），再跑脚本自检 + 必需文件/悬空链接/**绝对链接**/quarantine/**文件数与体积**闸门 |
-| `make bundle-bundled` | `runtime-stage` + 打包 | 产出**无需预装 node/dsh** 的安装包（macOS `.app` 约 598 MB，Linux `.deb` 同量级）；macOS 上额外把 `minimumSystemVersion` 覆盖为 **11.0**（随包 node 是 `minos 11.0`）。带 `TARGET=` 交叉编译时按**目标**架构 stage 运行时（`x86_64-apple-darwin` → darwin-x64） |
+| `make runtime-stage` | 组装 `src-tauri/runtime/`：Node + dsh 树 + pnpm + profile 模板 + 许可清单 | 约 **1.1 GB**（2026-10-17 实测 dsh 0.2.1-rc.1：69,259 个文件 / 1087 MB，其中 dsh 树 855 MB）；先清空整个 `runtime/`（只留 README.md），再跑脚本自检 + 必需文件/悬空链接/**绝对链接**/quarantine/**文件数与体积**闸门 |
+| `make bundle-bundled` | `runtime-stage` + 打包 | 产出**无需预装 node/dsh** 的安装包（macOS `.app` 约等于随包运行时再加壳；2026-09-13 的 0.1.5 那代实测 598 MB，0.2.1-rc.1 的运行时本身已 1087 MB）；macOS 上额外把 `minimumSystemVersion` 覆盖为 **11.0**（随包 node 是 `minos 11.0`）。带 `TARGET=` 交叉编译时按**目标**架构 stage 运行时（`x86_64-apple-darwin` → darwin-x64） |
 | `make runtime-clean` | 回收 staging 与下载缓存 | 保留 `runtime/README.md` |
 | `make clean` | 清理构建产物 | `cargo clean` |
 | `make distclean` | 连依赖缓存一起清理 | 额外删 `node_modules`、`.pnpm-store`、`.cargo-home`、`src-tauri/gen` |
@@ -264,7 +264,7 @@ src-tauri/src/harness.rs        -> src-tauri/src/harness/tests.rs
   全新 DSH_HOME + 模板播种 → `dsh web` **6 秒**出 URL、stderr 干净、`.dsh-market` 出现；
 - 实测：`make bundle-bundled` 产出 598 MB 的 `.app`，包内 node 可直接执行、31,064 个文件；
   macOS 上还会用 `--config` 把 `minimumSystemVersion` 覆盖为 11.0（随包 node 是 `minos 11.0`）；
-- 模板随包钉住打包时的 `DSHMARKET_VERSION`（当前 1.46.1）：新机器首启播种该版本，之后由
+- 模板随包钉住打包时的 `DSHMARKET_VERSION`（当前 1.66.32）：新机器首启播种该版本，之后由
   插件市场自动更新跟到 registry 最新。
 
 **运行时解析已接进启动流程**（`src-tauri/src/runtime.rs` + `lib.rs::resolve_runtime`）：
@@ -584,8 +584,9 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
 
 | 输入 | 默认 | 说明 |
 |---|---|---|
-| `dsh_version` | `0.1.5-rc.2` | 随包附带的 dsh 版本 |
+| `dsh_version` | `0.2.1-rc.1` | 随包附带的 dsh 版本 |
 | `node_version` | `22.23.2` | 随包附带的 Node 版本 |
+| `dshmarket_version` | `1.66.32` | 随包附带的插件市场版本（随 profile 模板播种） |
 | `build_ref` | `main` | 从哪个分支/tag 构建 |
 | `attach_to_release` | 空 | 填一个已存在的 Release tag 就把 zip 一并传上去；留空只作为 workflow artifact |
 
@@ -665,7 +666,7 @@ Linux 侧能否在干净机器上启动尚未实机确认（见下节）。精�
 
 代价与做法（摘要）：
 
-- 解压后约 **490 MB**（Node 187 + dsh 树 289 + 壳 11），分发包约 150–250 MB；
+- 解压后约 **1.05 GB**（2026-10-17 实测 dsh 0.2.1-rc.1：Node 187 + dsh 树 855 + 壳 11 MB；0.1.5 那代是 490 MB），分发包随之变大；
   自带运行时版本的最低系统版本要提到 **macOS 11.0**（实测 node 22.23.2 的 `minos 11.0`，当前壳声明的是 10.15）；
 - **只读 seed + 可写影子前缀**：seed 放在 `Contents/Resources/runtime/`，dsh 核心更新落到
   `app-data/runtime/prefix`（不写签名的 bundle）；
