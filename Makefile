@@ -189,9 +189,9 @@ distclean: clean
 #   make runtime-clean    回收 staging 与下载缓存
 # staging 必须按平台各自执行：dsh 树里有平台相关的原生模块。
 NODE_VERSION      ?= 22.23.2
-DSH_VERSION       ?= 0.2.1-rc.1
+DSH_VERSION       ?= 0.2.1-rc.4
 PNPM_VERSION      ?= 12.3.4
-DSHMARKET_VERSION ?= 1.66.32
+DSHMARKET_VERSION ?= 1.73.1
 RUNTIME_DIR       := $(TAURI_DIR)/runtime
 RUNTIME_CACHE     := .runtime-cache
 # 交叉编译时（TARGET 非空）必须按**目标**平台 staging：在 arm64 runner 上打 x64 包却塞进 arm64 的

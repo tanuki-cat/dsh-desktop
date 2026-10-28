@@ -13,9 +13,9 @@ set -eu
 
 out=${1:?用法: stage-runtime.sh <runtime 目录>}
 node_version=${NODE_VERSION:-22.23.2}
-dsh_version=${DSH_VERSION:-0.2.1-rc.1}
+dsh_version=${DSH_VERSION:-0.2.1-rc.4}
 pnpm_version=${PNPM_VERSION:-12.3.4}
-dshmarket_version=${DSHMARKET_VERSION:-1.66.32}
+dshmarket_version=${DSHMARKET_VERSION:-1.73.1}
 cache=${CACHE_DIR:-.runtime-cache}
 python=${PYTHON:-python3}
 here=$(cd "$(dirname "$0")" && pwd)
