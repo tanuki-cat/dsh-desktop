@@ -258,8 +258,18 @@ pub fn failure_window_secs(failures: u32) -> u64 {
 /// then-newest 0.2.1-alpha.1 — so the shell refused to boot the version its own update check had
 /// just been told to follow. Every 0.2.1 prerelease sorts below `0.2.1`, so the whole line stays
 /// admitted while the release itself still needs its own verification.
+///
+/// Raised to `0.2.2` on 2026-10-28 together with the bundled core moving to 0.2.1-rc.4. The five
+/// contracts are what the bound protects, and they were measured against the next line before the
+/// bound moved: 0.2.2-alpha.2 (published 2026-10-27) diffed clean against 0.2.1-rc.4 for
+/// `dsh/lib/**` apart from content-hashed chunk names, and its web-app `lib/index.js`,
+/// `lib/startup.js` and the `web-runtime` row (`openBrowser` / `printUrl` / `surfaceContext`),
+/// its login popup (`window.open("about:blank")` → `location.replace`) and the
+/// `dsh web authentication required` fence are byte-identical; it was then booted through the
+/// shell's own command line (bundled node, seeded profile) and answered `dsh web:` plus the
+/// market API. The 0.2.2 release itself still needs its own check, exactly as 0.2.1 did.
 pub const TESTED_MIN: &str = "0.1.5-rc.1";
-pub const TESTED_MAX_EXCLUSIVE: &str = "0.2.1";
+pub const TESTED_MAX_EXCLUSIVE: &str = "0.2.2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {

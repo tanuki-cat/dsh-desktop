@@ -878,12 +878,17 @@ fn compatibility_flags_versions_outside_the_tested_range() {
     assert_eq!(compatibility("0.2.0"), Compatibility::Tested);
     assert_eq!(compatibility("0.2.1-alpha.1"), Compatibility::Tested);
     assert_eq!(compatibility("0.2.1-alpha.2"), Compatibility::Tested);
+    assert_eq!(compatibility("0.2.1"), Compatibility::Tested);
+    // The next line's prereleases are what the default tags actually follow, so the bound was
+    // raised to 0.2.2 alongside the bundled core (0.2.1-rc.4); 0.2.2-alpha.2 was measured
+    // against the five contracts and booted through the shell's own command line before it was.
+    assert_eq!(compatibility("0.2.2-alpha.2"), Compatibility::Tested);
     assert!(matches!(
         compatibility("0.1.4"),
         Compatibility::Older { .. }
     ));
     assert!(matches!(
-        compatibility("0.2.1"),
+        compatibility("0.2.2"),
         Compatibility::Newer { .. }
     ));
     assert!(matches!(
@@ -906,6 +911,11 @@ fn compatibility_flags_versions_outside_the_tested_range() {
 /// then refused to start the CLI its own update check had been told to follow, on a machine where
 /// nothing about the CLI had changed: the five contracts (four launcher flags and the `dsh web:`
 /// line) were all still satisfied by that version when it was measured against them.
+///
+/// The bound moved to `0.2.2` on 2026-10-28 for the same reason it moved then: `alpha` had moved
+/// to `0.2.2-alpha.2` (published 2026-10-27) while the bound still named `0.2.1`, so a machine on
+/// the default tag set was being told the newest build was untested. Only the *bound* moved — the
+/// release it names still needs its own verification.
 ///
 /// The spellings are derived from the bound rather than written out, so raising the bound to the
 /// next line keeps this test meaningful instead of making it a list of dead versions.
@@ -946,6 +956,8 @@ fn a_version_that_would_not_be_run_is_not_installed() {
     assert!(may_install("0.2.0", true));
     assert!(may_install("0.2.1-alpha.1", true));
     assert!(may_install("0.2.1-alpha.2", true));
+    assert!(may_install("0.2.1", true));
+    assert!(may_install("0.2.2-alpha.2", true));
     // The bound itself and everything above it: a version the startup check would refuse is never
     // installed either, which is the whole point of the two sharing one range.
     assert!(!may_install(TESTED_MAX_EXCLUSIVE, true));
