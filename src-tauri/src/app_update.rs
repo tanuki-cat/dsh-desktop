@@ -943,7 +943,15 @@ pub fn report(app: &AppHandle, data_dir: &Path, config: &Config, bundled: bool, 
                 // the same window the first answer would have reached.
                 if let Some(latest) = cache.latest.as_deref() {
                     if Version::parse(latest) > Version::parse(current) {
-                        window::announce_app_update(app, latest);
+                        // A launch that already downloaded this release left the package in
+                        // ready/. Saying "there is a newer one" then points at the check item,
+                        // while the useful click is the install one — so say "ready" whenever
+                        // the package is actually here.
+                        if verified_package(&Paths::new(data_dir)).is_some() {
+                            window::announce_app_update_ready(app, latest);
+                        } else {
+                            window::announce_app_update(app, latest);
+                        }
                     }
                 }
                 harness::app_log(&format!(
