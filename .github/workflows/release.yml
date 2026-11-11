@@ -307,18 +307,22 @@ jobs:
 
           ### 本版更新
 
-          - **自带运行时升级**：随包的 dsh 核心 `0.2.1-rc.1` → **`0.2.1-rc.4`**，插件市场 `1.66.32` → **`1.73.1`**（新机器首启播种该版本）。核心相对 rc.1 在界面上新增两个客户端插件（区域「更多」菜单的 `entry-customization`、模型标签的 `deepseek-model-label-1017`），`dsh-base` 的 web 检索新增 `web-deepseek-api` 一行；市场这版带待处理更新修复、日志路径脱敏、可选依赖识别与重启端点的信任主机判定，包体反而小了一截。整体体积基本不变：干净 staging **1086 MB / 69,333 个文件**（dsh 树 856 MB），分发包大小与上一版一致 —— 精简版不受影响。
-          - **本版继续带着的既有修复**：账户登录两段式弹窗由注入的垫片接管（空白弹窗改成隐藏帧导航，仍走零 capability、只有 http/https 出壳的导航围栏，终端 OSC 链接同样生效）；overlay 不再写上游已挪走、且一直为空的 `trustedHosts`；「已是最新」日志在已装版本领先于 registry 头时写明已装版本；发版预检把插件市场版本也纳入一致性校验。
+          - **桌面应用自更新**（[issue #2](https://github.com/tanuki-cat/dsh-desktop/issues/2)）：壳自己也有版本了。启动后在 Harness 窗口出现之后用后台线程查 GitHub Releases，按平台/架构/是否自带运行时**精确**选资产（不做跨架构的降级猜测），下载后与 Release 的 `SHA256SUMS` 逐字比对，只有校验通过的包才进 `app-update/ready/`。`app_update` 默认 `notify`——标题与日志里提示，菜单「视图 → 检查桌面应用更新…」当场查；`download` 自动准备；`install` 在 macOS 上继续装好并重启（`ditto` 解包 → 校验 bundle id/版本 → 备份旧 `.app` → 换入 → 清 quarantine → 重启），Linux/Windows 停在「已校验的包在这里」，由菜单「安装已下载的更新…」给出手动命令。刻意不引入 `tauri-plugin-updater`：它要 minisign 私钥与 `.app.tar.gz`，与本仓库未签名、出 `.app.zip`/`.deb`/便携 zip 的发布形状对不上。
+          - **可切换的应用图标**（同上）：菜单「外观」里有默认 + 深海 / 极夜 / 晨雾 四套（全部 `include_bytes!` 内嵌，精简版与自带运行时版表现一致），以及「选择自定义图片…」。自定义 PNG 先解码整理——调色板/灰度/16 位由解码器展开，非正方形按中心裁切，超过 1024 px 用面积平均缩放，短边小于 64 px 才拒绝——整理后的图存进 `<app-data>/icons/custom.png`，选完不依赖原文件。macOS 走 `NSApplication.setApplicationIconImage`（Dock 与 ⌘Tab），Windows/Linux 走窗口图标；选择写 `appearance.json`，每次启动重新应用，不改包里的 `.icns`/`.ico`（那会破坏签名）。
+          - **修掉的既有问题**：更新后重启与单实例插件的竞态（新实例在旧进程退出前连上 socket 会自己退出，导致两个都没了——改为 `open -n` 之后立刻释放 socket）；`download` 策略在 macOS 上装不上（新增「安装已下载的更新…」入口、复用已校验的包、拒绝把旧包装成降级）；下载失败只剩一个退出码（curl 的错误现在并进 stdout，缺工具不再被误报成超时）；自定义图片被拒时界面毫无反应（现在弹原因）；备份按**被替换**的版本命名且只留最新一份；Dock 位图改用预乘 alpha（半透明边缘不再发白）。
+          - **随包运行时未变**：仍是 dsh `0.2.1-rc.4` / Node `22.23.2` / dshmarket `1.73.1`；装好之后的 dsh 核心与插件市场照旧跟随 npm registry 自动更新。
 
           ### 验证与范围
 
-          与 dsh 0.2.1-rc.4 的接口逐字比对过（本机已装的 rc.1 树与 rc.4 新装树对拍）：CLI 入口 `dsh/lib/**` 整目录 diff 为空；web-app 的启动产物 `lib/index.js`、`lib/startup.js` 与 `cordis.patch.yml` 的 web-runtime 行（`openBrowser` / `printUrl` / `surfaceContext`）逐字相同；登录弹窗（`window.open("about:blank")` → `location.replace`）与 `dsh web authentication required` 鉴权围栏逐字相同；前端产物对现代 Web API 的依赖集合与 rc.1 完全一致（新增的只有两个插件的界面代码），兼容层覆盖的能力清单没有变化。
+          离线门禁全绿：`make fmt-check` / `make clippy --all-targets -D warnings` / `make test`（**304 passed**，比上一版多 49 条），`tests/webkit_compat_shim.rs` 另有 5 条在真实 node 引擎里跑兼容层与状态页脚本。
 
-          插件市场同样对拍过：1.73.1 的清单 `cordis.patch.yml` 与 `dsh.client.inject` 与 1.66.32 逐字相同，壳依赖的恢复页 `/dsh-market/recovery`（`"recovery":true` 标记）与放行端点形状不变；它的 peer 范围从这一版起显式接受 `^0.2.1-rc.1`，与随包的 rc.4 对得上（1.66.32 的写法则停在 `0.2.1-alpha.3`）。
+          新增覆盖：资产命名与真实 Release 逐字比对、渠道选择、无资产不降级、`SHA256SUMS` 解析、校验失败即删、已校验包复用、备份命名、安装前拒绝降级、重启与单实例 socket 的顺序、PNG 灰度/16 位展开、中心裁切、超限缩放、预乘 alpha、标题三态。
 
-          真实 staging（2026-10-28，macOS arm64）：`make runtime-stage` 用新钉版本装出 dsh 0.2.1-rc.4 与 dshmarket 1.73.1，必需文件、可执行位、符号链接、quarantine、模板内 store 与文件数/体积闸门全部通过（69,333 个文件 / 1086 MB）。同一天用壳的实际启动形状（`<随包 node> <bin.js> --profile web --patch <overlay> --no-open --port N` + 模板播种的 DSH_HOME）跑通：rc.4 在预期时间内打印 `dsh web:` 行，页面与前端产物取回 200，市场接口 `/dsh-market/api/v1/capabilities` 正常应答并自报 `marketVersion 1.73.1`，profile 里落的 `dshmarket/package.json` 也是 1.73.1。本机门禁 `fmt-check` / `check` / `clippy -D warnings` / `test` 全绿；两个 workflow 过 YAML 解析；本地复跑 preflight 的一致性检查三处全绿。
+          联网（`DSH_DESKTOP_LIVE_TESTS=1`）：3 条走真实 GitHub Release——列表可取、`SHA256SUMS` 可解析且含本机构建对应的条目、完整下载 7.86 MB 的 `linux-x64.deb` 并校验后落到 `ready/`；另用同一套 `curl` 参数复核过 `dsh-desktop_0.4.15_linux-x64.deb` 的 SHA256 与清单逐字相同。
 
-          Windows / Linux 的 staging 与打包由本标签的流水线验证：体积上限按 macOS 实测留了约四成余量，若某个平台偏出会直接失败而不是静默发出一个不完整的包。
+          实机（macOS arm64，上一版构建）：菜单构建、预设图标切换（Dock 图标随之变化）、后台更新检查跑通、Harness 正常启停与回收。自定义图片的问题正是从这台机器的日志里定位的——三张图分别被「不是正方形」和「超过 1024 像素」拒绝，而 macOS 上只写了日志、界面上没有提示；本版按此改了规则与反馈。
+
+          **待实机点击确认**：本版修复后的自定义图片选择；`app_update: install` 的完整链路（下载 → 装 → 重启后版本号变化）需要打包后的 `.app` 才能点；Dock 之外的 ⌘Tab / 强制退出窗口里的图标同步。
 
           已知 Linux 上游 Wry 0.55.1 下载失败状态可能跨请求残留：失败或取消后，后续成功下载可能被误报为失败。本版未修复该上游问题。
 
