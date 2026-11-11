@@ -65,6 +65,15 @@ fn terminate_stops_a_spawned_process_group() {
     let pid = child.id();
     assert!(is_alive(pid));
     remember_spawned(pid);
+    // Pin the precondition `terminate` depends on. A missing identity makes it refuse to signal
+    // anything and report failure, which used to surface only as "terminate must report
+    // success" — true of the symptom, useless for the cause. The child's own process group is
+    // *not* asserted here on purpose: it is set from inside the child, so a parent that looked
+    // immediately could observe the race this test exists to survive.
+    assert!(
+        saved_marker(pid).is_some(),
+        "the identity has to be capturable right after spawn"
+    );
 
     let started = Instant::now();
     assert!(

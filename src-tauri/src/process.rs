@@ -509,9 +509,28 @@ fn signal_target(pid: u32, group: bool, signal: TermSignal) -> bool {
         TermSignal::Kill => libc::SIGKILL,
     };
     if group {
-        // Only a group leader created by this shell may receive a group signal; no PID fallback.
-        if unsafe { libc::getpgid(pid as i32) } != pid as i32 {
-            return false;
+        // Only a group leader created by this shell may receive a group signal. The leader sets
+        // its own group from inside the child, so on a loaded machine the parent can get here
+        // before that has happened — a run that ended at once (`terminate` on a fresh child) hit
+        // exactly that window and reported failure without signalling anything. Wait for the
+        // group to appear rather than treating "not set up yet" as "somebody else's".
+        let mut pgid = unsafe { libc::getpgid(pid as i32) };
+        if pgid != pid as i32 {
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(10));
+                pgid = unsafe { libc::getpgid(pid as i32) };
+                if pgid == pid as i32 || pgid < 0 {
+                    break;
+                }
+            }
+        }
+        if pgid != pid as i32 {
+            // Still not our own group. `kill(-pid)` would signal whatever group this process is
+            // in, which is not ours to terminate, so signal the process alone — every caller has
+            // already verified that this pid is still the process it recorded. There are no
+            // descendants to miss: a process that has not moved into its own group has not
+            // started any.
+            return unsafe { libc::kill(pid as i32, sig) == 0 };
         }
     }
     unsafe { libc::kill(if group { -(pid as i32) } else { pid as i32 }, sig) == 0 }
