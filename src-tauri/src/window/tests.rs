@@ -2444,7 +2444,9 @@ fn a_blank_popup_hands_its_later_address_to_the_shell() {
 /// Harness window.
 #[test]
 fn the_message_page_does_not_close_the_harness_window() {
-    let source = include_str!("../window.rs");
+    // Line endings follow the checkout: `core.autocrlf` on Windows gives CRLF, and a scan for a
+    // line that is only `}` would then find nothing.
+    let source = include_str!("../window.rs").replace("\r\n", "\n");
     let start = source
         .find("pub fn show_message(")
         .expect("show_message exists");

@@ -294,7 +294,9 @@ fn the_version_is_read_from_the_asset_name() {
 /// there is no seam here that would not exist only for this test.
 #[test]
 fn the_relaunch_releases_the_singleton_before_the_process_leaves() {
-    let source = include_str!("../app_update.rs");
+    // Line endings follow the checkout: `core.autocrlf` on Windows gives CRLF, and a scan for a
+    // line that is only `}` would then find nothing. Normalized along with the rest of this test.
+    let source = include_str!("../app_update.rs").replace("\r\n", "\n");
     let start = source
         .find("pub fn relaunch_into_update(")
         .expect("relaunch_into_update exists");
