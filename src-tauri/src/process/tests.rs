@@ -5,6 +5,35 @@
 
 use super::*;
 
+/// A helper that is not installed has to be reported as that, not as a timeout: the two send the
+/// user in opposite directions, and the download path used to fold them into one sentence.
+#[test]
+fn a_missing_helper_is_a_spawn_failure_not_a_timeout() {
+    let mut command = std::process::Command::new("dsh-desktop-no-such-helper");
+    let failure = run_within(&mut command, Duration::from_secs(1), 4096).unwrap_err();
+    match failure {
+        RunFailure::Spawn(_) => {}
+        other => panic!("a missing program must not read as {other:?}"),
+    }
+    // And the lossy wrapper still answers "nothing usable", so its callers are unchanged.
+    let mut command = std::process::Command::new("dsh-desktop-no-such-helper");
+    assert!(output_within(&mut command, Duration::from_secs(1), 4096).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_helper_that_outlives_its_budget_is_a_timeout() {
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args(["-c", "sleep 5"]);
+    let started = Instant::now();
+    let failure = run_within(&mut command, Duration::from_millis(200), 4096).unwrap_err();
+    assert!(matches!(failure, RunFailure::Timeout), "{failure:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the child was killed"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn short_helpers_do_not_receive_implicit_node_hooks() {

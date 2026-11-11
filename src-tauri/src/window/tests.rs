@@ -1447,20 +1447,121 @@ fn a_watcher_stops_acting_once_its_window_was_rebuilt() {
 fn the_title_carries_the_update_notice_without_losing_the_drawing_message() {
     let notice = "有新版本 v0.1.6-alpha.2 可用（未自动安装）";
     // The ordinary case: nothing to say.
-    assert_eq!(compose_title(None, false), "DeepSeek Harness");
+    assert_eq!(compose_title_with(None, None, false), "DeepSeek Harness");
     // A notice, with the plain title as its prefix so the window is still identifiable.
     assert_eq!(
-        compose_title(Some(notice), false),
+        compose_title_with(Some(notice), None, false),
         format!("DeepSeek Harness（{notice}）")
     );
     // Not drawing outranks the notice, and says so instead of merging the two sentences.
-    assert_eq!(compose_title(None, true), NOT_DRAWING_TITLE);
-    assert_eq!(compose_title(Some(notice), true), NOT_DRAWING_TITLE);
+    assert_eq!(compose_title_with(None, None, true), NOT_DRAWING_TITLE);
+    assert_eq!(
+        compose_title_with(Some(notice), None, true),
+        NOT_DRAWING_TITLE
+    );
     // Recovering from a stopped page keeps a pending notice rather than resetting to the plain
     // title — that is the composition the watchdog Alive arm performs.
     assert_eq!(
-        compose_title(Some(notice), false),
+        compose_title_with(Some(notice), None, false),
         format!("DeepSeek Harness（{notice}）")
+    );
+}
+
+/// The desktop application's notice is a second slot, and it outranks the CLI one without
+/// erasing it: the two describe different objects and can be true at once.
+#[test]
+fn the_title_carries_both_version_notices_and_prefers_the_application() {
+    let cli = "有新版本 v0.1.6-alpha.2 可用（未自动安装）";
+    let app = AppUpdateNotice {
+        text: "桌面应用有新版本 v0.4.16（菜单：视图 → 检查桌面应用更新…）".to_string(),
+    };
+    // Only the CLI's notice: unchanged from before this feature existed.
+    assert_eq!(
+        compose_title_with(Some(cli), None, false),
+        format!("DeepSeek Harness（{cli}）")
+    );
+    // Only the application's.
+    assert_eq!(
+        compose_title_with(None, Some(&app), false),
+        format!("DeepSeek Harness（{}）", app.text)
+    );
+    // Both: the application wins, because that is the one this window can act on.
+    assert_eq!(
+        compose_title_with(Some(cli), Some(&app), false),
+        format!("DeepSeek Harness（{}）", app.text)
+    );
+    // A page that is not drawing still wins over both: it hides the output right now.
+    assert_eq!(
+        compose_title_with(Some(cli), Some(&app), true),
+        NOT_DRAWING_TITLE
+    );
+    // And clearing the application's notice restores the CLI's rather than the plain title.
+    assert_eq!(
+        compose_title_with(Some(cli), None, false),
+        format!("DeepSeek Harness（{cli}）")
+    );
+}
+
+/// The two announcements have to read differently, and each has to name the menu item that acts
+/// on it: "there is a newer one" and "it is verified and waiting" call for different actions.
+///
+/// Asserted through the functions the titles are built from rather than through copies of their
+/// sentences, which is what let this case pass even when both said the same thing.
+#[test]
+fn the_ready_notice_is_not_the_available_notice() {
+    let available = available_notice_text("0.4.16");
+    let ready = ready_notice_text("0.4.16");
+    assert_ne!(available, ready);
+    assert!(available.contains("检查桌面应用更新"), "{available}");
+    assert!(ready.contains("安装已下载的更新"), "{ready}");
+    assert!(available.contains("0.4.16") && ready.contains("0.4.16"));
+    // Neither may promise that restarting installs it: a restart is how the new version would
+    // start, not how the old one is replaced, and nothing on the startup path installs.
+    assert!(!ready.contains("重启"), "{ready}");
+}
+
+/// The picker eval has to survive the page not being parsed yet.
+///
+/// The status page it runs against may have been created moments earlier by the menu item that
+/// fell back to it, and a one-shot eval landing before the script block would be lost with no
+/// trace: the window would sit there doing nothing. `status_script` learned this first; the real
+/// engine case lives in `tests/webkit_compat_shim.rs`.
+#[test]
+fn the_picker_script_waits_for_the_page_to_define_it() {
+    let script = picker_script();
+    assert!(script.contains("window.__dshPickIcon"), "{script}");
+    assert!(script.contains("setInterval"), "{script}");
+    // The bound matters as much as the retry: a page that never answers must not leave a timer
+    // running for the life of the process.
+    assert!(
+        script.contains("attempts") && script.contains("> 40"),
+        "{script}"
+    );
+}
+
+/// The page's picker has to survive a second opening: an input that still holds a file fires no
+/// change event for the same one, and a user retrying a rejected image picks the same file again.
+#[test]
+fn the_page_picker_clears_its_input_before_opening() {
+    let html = include_str!("../../../src/index.html");
+    let picker = html
+        .split("window.__dshPickIcon = function ()")
+        .nth(1)
+        .expect("the status page defines the icon picker");
+    let cleared = picker
+        .find(r#"window.__iconInput.value = """#)
+        .expect("the input is cleared");
+    let clicked = picker
+        .find("window.__iconInput.click()")
+        .expect("the input is opened");
+    assert!(
+        cleared < clicked,
+        "the value has to be cleared before the picker opens"
+    );
+    assert!(picker.contains("image/png"), "only PNG is offered");
+    assert!(
+        picker.contains("dsh-desktop:icon-picked"),
+        "the page reports through the event the shell listens for"
     );
 }
 
@@ -1476,7 +1577,7 @@ fn a_cleared_notice_stays_cleared() {
         *pending = Some(seed);
     }
     assert!(pending_notice().is_some());
-    assert!(compose_title(pending_notice().as_deref(), false).contains("v9.9.9"));
+    assert!(compose_title_with(pending_notice().as_deref(), None, false).contains("v9.9.9"));
     // `clear_update_notice` needs a real window to retitle, so the state is cleared here exactly
     // as it does; the assertion is about the state, which is what the next launch reads.
     {
@@ -1487,7 +1588,7 @@ fn a_cleared_notice_stays_cleared() {
     }
     assert_eq!(pending_notice(), None);
     assert_eq!(
-        compose_title(pending_notice().as_deref(), false),
+        compose_title_with(pending_notice().as_deref(), None, false),
         "DeepSeek Harness"
     );
 }
@@ -2334,5 +2435,35 @@ fn a_blank_popup_hands_its_later_address_to_the_shell() {
         run_shim("", &script),
         "handle | 1:https://platform.deepseek.com/authorize?client=dsh | hidden=true | 1 | 2:https://example.com/osc | 3:https://example.com/assigned | closed | 1",
         "空白弹窗必须把后续地址交给壳，且只交一次"
+    );
+}
+
+/// The message page exists so an answer to a question the user asked does not cost them their
+/// window. That property is a source-level one — it cannot be observed without an app instance —
+/// so it is pinned here: the helper must not reach for `present_status_page`, which destroys the
+/// Harness window.
+#[test]
+fn the_message_page_does_not_close_the_harness_window() {
+    let source = include_str!("../window.rs");
+    let start = source
+        .find("pub fn show_message(")
+        .expect("show_message exists");
+    // The body runs to the next top-level item: the closing brace of the function.
+    let body = &source[start..];
+    let end = body.find("\n}\n").expect("the function ends");
+    let body = &body[..end];
+    assert!(
+        !body.contains("present_status_page("),
+        "show_message must not destroy the Harness window: {body}"
+    );
+    assert!(
+        body.contains("create_splash"),
+        "it opens the status window itself, without touching the Harness one"
+    );
+    // Nor may it replace a terminal page: that page explains why the shell gave up and offers
+    // the retry, and an answer to a question the user asked is not a reason to take both away.
+    assert!(
+        body.contains("FAILURE_SHOWN.load"),
+        "a terminal page outranks an informational one: {body}"
     );
 }

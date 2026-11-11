@@ -64,6 +64,21 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   npm 子进程显式带上 node 所在目录的 PATH（否则 GUI 启动下 `#!/usr/bin/env node` 必然 exit 127），
   且整个子进程有**进程级超时**（`--fetch-timeout` 只管单次请求；代理挂起、锁等待、生命周期脚本都可能
   让它永不返回，而那时 harness 已经被停掉了）
+- **桌面应用自更新**（issue #2）：壳自己也有版本。启动后**在 Harness 窗口出现之后**用后台线程查
+  GitHub Releases（`/repos/tanuki-cat/dsh-desktop/releases`），按 `os`/`arch`/是否自带运行时选资产
+  （`dsh-desktop_<ver>_<os>-<arch>[-bundled].app.zip|.deb`，Windows 是 `-portable.zip`），
+  下载后与 Release 的 `SHA256SUMS` 逐一比对，**只有校验通过的包**才会进入 `app-update/ready/`。
+  `app_update` 默认 `notify`（只在标题与日志里提示，菜单「视图 → 检查桌面应用更新…」可当场查）；
+  `download` 自动下载校验；`install` 在 macOS 上还会用 `ditto` 解包、核对 `CFBundleIdentifier`
+  与 `CFBundleShortVersionString`、把旧 `.app` 挪到 `app-update/backup/` 后换上新的、清掉
+  quarantine，再 `open -n` 重启（Linux 的 `.deb` 需要 root、Windows 不能覆盖运行中的 exe，这两处停在
+  「已校验的包在这里」）。刻意不引入 `tauri-plugin-updater`：它要 minisign 私钥与 `.app.tar.gz`，
+  与本仓库未签名、出 `.app.zip`/`.deb`/便携 zip 的发布形状对不上
+- **可切换的应用图标**（issue #2）：菜单「外观」里三套由 `icon.png` 派生的换色图标（深海 / 极夜 / 晨雾）
+  加「默认」，全部 `include_bytes!` 内嵌（精简版也有），另有「选择自定义图片…」。自定义 PNG 先解码校验
+  （正方形、64–1024 px、取消 32 MiB 上限）再**复制**到 `<app-data>/icons/custom.png`，原文件删掉也不影响。
+  macOS 走 `NSApplication.setApplicationIconImage`（Dock 与 ⌘Tab），Windows/Linux 走窗口图标；选择存
+  `<app-data>/appearance.json`，启动时重新应用 —— 不重写包里的 `.icns`（那会破坏签名，本仓库虽未签名也不做）
 - 打包：`pnpm tauri build --bundles app` → `DSH Desktop.app`
 
 **验证**
@@ -90,7 +105,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   日志记 `navigation blocked, opening externally: https://platform.deepseek.com/dsh/authorize?...`；
   修复前同一次点击只留下一条 `new window request, opening externally: about:blank` —— 地址从未离开页面，
   所以只能手动复制链接。终端里的 OSC 链接是同一个形状，未单独实机确认。
-- 离线测试：`cargo test` **255 passed**，另有 **7 个集成用例**（在真实 node 引擎里跑兼容层与探测脚本）。单测覆盖：URL 解析含 LAN 后缀、凭据脱敏（`Bearer`/`api_key`/`Cookie` 等）、状态文件往返、locator 软链解析与
+- 离线测试：`cargo test` **304 passed**，另有 **7 个集成用例**（在真实 node 引擎里跑兼容层与探测脚本）。单测覆盖：URL 解析含 LAN 后缀、凭据脱敏（`Bearer`/`api_key`/`Cookie` 等）、状态文件往返、locator 软链解析与
   `DSH_DESKTOP_DSH` 优先级、6 个 semver 比较用例、Linux `ss` 输出解析、judge 判定、缓存新鲜度规则、
   缓存落盘往返与旧缓存文件兼容（含新增的 tags 字段缺失时判为不新鲜）、"装到别处 → 同窗口与跨窗口都不重复安装"、
   **标签选择**（默认覆盖上游全部渠道、alpha 可以是最新版本、alpha 落后时 latest 仍胜出、
@@ -167,11 +182,38 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 `process.rs` 的存活探测用的是 `OpenProcess` + `GetExitCodeProcess`。本机可用
 `cargo clippy --target x86_64-pc-windows-gnu` 对 `cfg(windows)` 代码做回归（只检查类型与 lint，不能运行 PE）。
 
-**未做**：签名与公证（对外分发必需）、多 workspace 切换 UI、"回退 + last-known-good"（方案 §2.3 规则 2，
-即更新事务/原子切换/失败回滚）。这三项都不在代码层可独立完成：前两项需要开发者证书，第三项是独立特性。
+**未做**：签名与公证（对外分发必需）、多 workspace 切换 UI。这两项需要开发者证书，不在代码层可独立完成。
+**桌面应用自更新**已按 issue #2 落地（默认只提示，`app_update` 可开自动下载/安装，见
+[桌面应用自更新与图标](#桌面应用自更新与图标issue-2)）；它替换的是**壳自己**，与 dsh 核心的更新事务是两件不同的事。
 **自带运行时（打包 Node/dsh）**已随 `feat/bundled-runtime` 并入 `main`（2026-09-13）：macOS `.app`
 本机实测可跑、Windows 免安装包实机验证通过，见下方[自带运行时](#自带运行时已并入-main)一节。
 
+
+### 桌面应用自更新与图标（issue #2）
+
+设计见 [`docs/design-task-feat-app-updates-and-icons.md`](docs/design-task-feat-app-updates-and-icons.md)。
+两件事都只作用于**壳自己**，与上面的 dsh 核心/插件市场更新互不影响（各自独立缓存与失败退避）：
+
+- **自更新**：`app_update` 默认 `notify`。检查在 Harness 窗口出现后才跑，不占启动路径；
+  新版提示落在窗口标题（与 dsh 核心的提示分两个槽位，应用那条优先且不会抹掉另一条）。
+  菜单两项：「检查桌面应用更新…」无视缓存当场查；「安装已下载的更新…」消费 `app-update/ready/`
+  里那份已经校验过的包。下载走 `curl`（Windows 用 PowerShell），校验走 Release 的 `SHA256SUMS`；
+  `ready/` 里哈希仍匹配的包直接复用，不重复下载。
+  `install` 只对 macOS 就地完成（`ditto` 解包 → 校验 bundle id/版本 → 备份旧 `.app` → 换入 → 清 quarantine →
+  先销毁单实例 socket 再 `open -n` 重启），Linux/Windows 停在「已校验的包在这里」，因为 `.deb` 要 root、
+  运行中的 exe 覆盖不了。
+- **图标**：菜单「外观」，三套派生配色 + 默认 + 自定义 PNG。预置图标由
+  `make icon-presets`（`scripts/make-icon-presets.py`，纯标准库）从 `icon.png` 重新生成并
+  `include_bytes!` 内嵌；自定义图片先解码整理（灰度/调色板/16 位展开、非正方形按中心裁切、
+  超过 1024 px 缩到 1024，短边小于 64 px 才拒绝），整理结果存到 `<app-data>/icons/custom.png`。
+  macOS 改的是运行期 Dock 图标，Windows/Linux 改窗口图标；选择存 `appearance.json`，每次启动重新应用。
+
+验证：`cargo test` 覆盖资产命名（与真实 Release 逐字比对）、渠道选择、无资产不降级、
+`SHA256SUMS` 解析、校验失败不留文件、缓存/失败退避矩阵、PNG 解码边界、自定义图标复制与往返、
+标题三态组合、picker 脚本在真引擎里等页面就绪；`make test-live` 另有三条联网用例走真实 GitHub
+Release、真实校验和清单与一次完整的下载 → 校验 → 落盘
+（2026-11-11 实测：Release 头 `v0.4.15`，11 个资产，`macos-arm64-bundled.app.zip` 等命名与选择器一致；
+`dsh-desktop_0.4.15_linux-arm64.deb` 的 SHA256 与清单逐字相同）。
 ## 构建（Makefile，支持 macOS 与 Linux）
 
 `make` 是统一构建入口；平台由 `uname -s` 自动判定（`Darwin` → `app`，`Linux` → `deb`）。
@@ -182,7 +224,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 | `make doctor` | 检查工具链与平台依赖 | Linux 用 `pkg-config` 查 `webkit2gtk-4.1` / `gtk+-3.0` / `libsoup-3.0` 并给出 Debian/Fedora/Arch 安装命令；macOS 提示装 Xcode CLT |
 | `make check` | `cargo check --all-targets` | 与 CI 口径一致 |
 | `make fmt` / `make fmt-check` / `make clippy` | 格式化 / 只检查格式（CI 门禁用，不改工作区）/ lint（`clippy -D warnings`） | |
-| `make test` | `make test-scripts` ＋ 离线单元测试（当前 **203** 个）＋ 在真实 JS 引擎里跑兼容层的集成测试 | 不联网；集成测试需要 PATH 上有 `node`，**没有就失败**（曾经的静默跳过会让 3 个用例 0 断言地报 ok） |
+| `make test` | `make test-scripts` ＋ 离线单元测试（当前 **304** 个）＋ 在真实 JS 引擎里跑兼容层的集成测试 | 不联网；集成测试需要 PATH 上有 `node`，**没有就失败**（曾经的静默跳过会让 3 个用例 0 断言地报 ok） |
 | `make test-scripts` | `scripts/` 自检：用假目录验证 staging 闸门本身仍然会失败 | 纯 shell，不依赖构建产物；`make test` 会先跑它 |
 | `make test-live` | 联网集成测试（全部） | 自动设 `DSH_DESKTOP_LIVE_TESTS=1`：查真实 registry、对比冷/热缓存耗时，并在「PATH 里没有 node」的模拟 GUI 环境下验证 npm 仍可运行 |
 | `make dev` | 运行 debug 版 | 等价 `cargo run --manifest-path src-tauri/Cargo.toml` |
@@ -360,6 +402,8 @@ src-tauri/src/harness.rs        -> src-tauri/src/harness/tests.rs
 | `keep_menu_focus` | `true` | 点击菜单弹层时原地按住焦点，修掉 WebKit 上模型/思考强度点了没反应（见[已知坑](#已知坑)）。`false` 恢复引擎自己的焦点行为 |
 | `page_diagnostics` | `true` | 把页面内的未捕获错误、未处理 rejection 与 `console.error/warn` 带回壳日志（Harness 窗口本身没有控制台，见[已知坑](#已知坑)）。`false` 不注入 |
 | `scroll_anchor` | `true` | WebKit 没有实现 CSS 滚动锚定，这个垫片替它补上：读者上方的展开/收起改变高度时，按被观察行移动的距离补偿滚动偏移（见[已知坑](#已知坑)）。`false` 恢复引擎自己的行为，用于对照 |
+| `app_update` | `"notify"` | 桌面应用**自己**的更新策略（与上面管的 dsh 核心无关）：`off` 不自动检查（菜单仍可手动查）；`notify` 只提示（默认，替换用户刚打开的应用不是启动路径该擅自决定的事）；`download` 下载并校验到 `app-update/ready/`，由菜单「安装已下载的更新…」完成安装；`install` 再在 macOS 上装好并重启（Linux/Windows 等价于 `download`，因为 `.deb` 要 root、运行中的 exe 覆盖不了） |
+| `app_update_channel` | `"stable"` | 跟随哪个渠道：`stable` 跳过 prerelease 与 draft；`prerelease` 取最新的一个（含预发布） |
 | `runtime` | `"auto"` | 运行时来源：`auto` 用系统已装的（通过门槛时），否则用自带；`bundled` 强制自带；`system` 保持旧行为（开发用） |
 | —— | —— | **候选必须真的是 `@deepseek-ai/dsh`**：PATH 上同名但不是这个 npm 包的 `dsh`（Homebrew 的 Dancer's shell、自定义 shim…）会被跳过并记日志；全部候选都不合格时报错页，而不是随便监管一个同名程序。识别不出来的 node 启动脚本只有在 `--version` 真的打印出版本号时才被采用（旧布局的兜底） |
 | `env` | `{}` | 显式追加/覆盖传给 harness 的环境变量，优先级最高，如 `{"DEEPSEEK_API_KEY": "sk-…"}` |
@@ -686,7 +730,8 @@ Linux 侧能否在干净机器上启动尚未实机确认（见下节）。精�
 - 首启更新策略待定：默认 `auto_update` 会在首启就下载整棵依赖树，与"离线首启"的宣传冲突（方案 §4 给了两个选项）；
 - 分阶段：P1 macOS arm64（无 node 可跑）✅ → P2 签名公证（未做）→
   P3 Linux x64/arm64（CI 已产出 `-bundled` 包，实机未验证）→
-  P4 universal/Windows/自更新（Windows 免安装包已实机验证；dsh 核心与插件市场的自动更新均已落地）。
+  P4 universal/Windows/自更新（Windows 免安装包已实机验证；dsh 核心、插件市场与**桌面应用本身**的自更新均已落地，
+  issue #2 见[桌面应用自更新与图标](#桌面应用自更新与图标issue-2)）。
 
 ## 开机自启
 

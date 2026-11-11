@@ -276,6 +276,7 @@ pub fn stdout_within(command: &mut std::process::Command, timeout: Duration) -> 
 ///
 /// Distinct from `update::Captured`, which is a bounded *pipe* buffer for a long-running install:
 /// this one is the decoded answer to a short helper call.
+#[derive(Debug)]
 pub struct HelperOutput {
     /// The child's stdout, decoded lossily and capped at the caller's limit.
     pub text: String,
@@ -288,6 +289,28 @@ pub struct HelperOutput {
     pub status: Option<std::process::ExitStatus>,
 }
 
+/// Why a bounded helper run produced no output at all.
+///
+/// The two are different answers and must not be reported as one: a missing tool is a fact about
+/// the machine, while a tool that ran too long is a fact about the network or the filesystem.
+/// Folding them together tells the user to retry something no retry can fix.
+#[derive(Debug)]
+pub enum RunFailure {
+    /// The child never started: the program is missing from PATH, or the OS refused it.
+    Spawn(std::io::Error),
+    /// The budget ran out and the child was killed.
+    Timeout,
+}
+
+/// Whether the command ran to completion, discarding the reason when it did not.
+pub fn output_within(
+    command: &mut std::process::Command,
+    timeout: Duration,
+    limit: usize,
+) -> Option<HelperOutput> {
+    run_within(command, timeout, limit).ok()
+}
+
 /// Run a command under a whole-process budget and collect a bounded slice of its stdout.
 ///
 /// The pipe is always read to the end on its own thread — a reader that stopped early would leave
@@ -298,11 +321,11 @@ pub struct HelperOutput {
 /// *any* process holds the write end: a login shell exits immediately, but an agent or daemon its
 /// rc file started in the background inherited stdout, so `join` would block until that process
 /// exits — turning a one-second budget into an unbounded wait on the startup thread.
-pub fn output_within(
+pub fn run_within(
     command: &mut std::process::Command,
     timeout: Duration,
     limit: usize,
-) -> Option<HelperOutput> {
+) -> Result<HelperOutput, RunFailure> {
     crate::shellenv::sanitize_command(command);
     command.stdin(std::process::Stdio::null());
     // Central, so no caller has to remember it: the shipped exe is `windows_subsystem =
@@ -317,8 +340,11 @@ pub fn output_within(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .ok()?;
-    let stdout = child.stdout.take()?;
+        .map_err(RunFailure::Spawn)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RunFailure::Spawn(std::io::Error::other("stdout pipe unavailable")))?;
     // Published as it is read rather than sent once at the end: the pipe can outlive the child,
     // so waiting for the reader to finish before looking at what it read would throw away output
     // that has already arrived.
@@ -360,8 +386,8 @@ pub fn output_within(
         }
     };
     // The budget ran out and the child was killed: the command did not run to completion, which
-    // is the one thing `None` means to every caller.
-    let status = status?;
+    // is the one thing an error means to every caller.
+    let status = status.ok_or(RunFailure::Timeout)?;
 
     // Bounded even after the child exited: the pipe may outlive it (see the doc above). What was
     // already read stays available either way, because the reader published it.
@@ -376,7 +402,7 @@ pub fn output_within(
         &drained.bytes[..]
     };
     // Lossy: a path with a non-UTF-8 byte must not turn into "no output at all".
-    Some(HelperOutput {
+    Ok(HelperOutput {
         text: String::from_utf8_lossy(kept).into_owned(),
         truncated,
         status: Some(status),

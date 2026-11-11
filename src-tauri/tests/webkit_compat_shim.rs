@@ -548,6 +548,48 @@ fn a_choice_that_never_reaches_rust_says_so() {
     println!("{}", stdout.trim());
 }
 
+/// The icon picker's fallback path: the page is not parsed when the eval lands.
+///
+/// `show_picker` may be running against a status window it created a moment earlier, so the eval
+/// has to wait for the entry point instead of firing once into an empty global — which is how this
+/// path failed silently before it learned the same retry `status_script` uses.
+const PICKER_DRIVER: &str = r#"
+const assert = require("assert");
+const fs = require("fs");
+const vm = require("vm");
+
+globalThis.window = globalThis;
+let calls = 0;
+
+// The page has not been parsed yet: there is nothing to call.
+vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"), { filename: "picker.js" });
+assert.strictEqual(calls, 0, "the eval must not invent an entry point");
+
+// The page finishes parsing, well inside the script's retry window.
+setTimeout(function () {
+  globalThis.__dshPickIcon = function () { calls += 1; };
+}, 100);
+
+setTimeout(function () {
+  assert.strictEqual(calls, 1, "the picker must run once the page defines it, exactly once");
+  console.log("picker ok: " + calls + " call(s)");
+}, 1200);
+"#;
+
+#[test]
+fn the_picker_waits_for_a_page_that_is_still_parsing() {
+    let stdout = run_in_node(
+        "dsh-desktop-picker-wait-test",
+        PICKER_DRIVER,
+        window::picker_script(),
+        None,
+    );
+    // The driver asserts everything that matters; this only proves it ran at all, so a silently
+    // skipped case can never be read as a passing one.
+    assert!(!stdout.trim().is_empty(), "the driver must report");
+    println!("{}", stdout.trim());
+}
+
 /// The other half of the contract: the shell only installs what the probe noticed.
 #[test]
 fn the_probe_reports_what_an_old_engine_lacks() {

@@ -2196,7 +2196,14 @@ pub fn create_harness(
                 load_signals.finished.store(true, Ordering::SeqCst);
                 // A load that finished is the proof the page is back: undo the "unresponsive"
                 // title a recovery put there, so the window never lies about its own state.
-                set_title_if(&window, &compose_title(pending_notice().as_deref(), false));
+                set_title_if(
+                    &window,
+                    &compose_title_with(
+                        pending_notice().as_deref(),
+                        pending_app_notice().as_ref(),
+                        false,
+                    ),
+                );
             }
         })
         // macOS needs a user-selected path to grant WebKit write access to protected folders.
@@ -2473,7 +2480,14 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64, wake: Receiver
                 stuck = false;
                 // Recomposed rather than reset: a pending update notice is the other thing
                 // this title carries, and clearing the drawing message must not erase it.
-                set_title_if(&window, &compose_title(pending_notice().as_deref(), false));
+                set_title_if(
+                    &window,
+                    &compose_title_with(
+                        pending_notice().as_deref(),
+                        pending_app_notice().as_ref(),
+                        false,
+                    ),
+                );
             }
             // The task queue runs and only frames stopped, which is what WebKit does to a window
             // it believes nobody is watching. Reloading would throw away a working session to
@@ -2486,7 +2500,10 @@ fn watch_page_liveness(app: AppHandle, url: Url, generation: u64, wake: Receiver
                     harness::app_log(&format!(
                         "Harness 页面停止绘制：计时器仍在运行，说明是被 WebKit 暂停绘制（窗口被遮挡、最小化或不在前台）而非卡死；露出窗口即可恢复，不重新加载（本轮渲染兜底顶起 {stood_in} 帧，页面仍在等 {waiting} 帧）"
                     ));
-                    set_title_if(&window, &compose_title(None, true));
+                    set_title_if(
+                        &window,
+                        &compose_title_with(None, pending_app_notice().as_ref(), true),
+                    );
                 }
                 stuck = true;
             }
@@ -2588,7 +2605,14 @@ pub fn reload_harness(app: &AppHandle) {
     note_external_reload();
     // Recomposed, not reset: reloading the page says nothing about whether a newer version is
     // still out there, so a pending notice survives it.
-    set_title_if(&window, &compose_title(pending_notice().as_deref(), false));
+    set_title_if(
+        &window,
+        &compose_title_with(
+            pending_notice().as_deref(),
+            pending_app_notice().as_ref(),
+            false,
+        ),
+    );
     if let Err(error) = window.navigate(target) {
         harness::app_log(&format!("手动重新加载失败: {error}"));
     }
@@ -2618,6 +2642,15 @@ const NOT_DRAWING_TITLE: &str =
 /// stops being the newest one — or until the user acts on it.
 static PENDING_UPDATE: Mutex<Option<String>> = Mutex::new(None);
 
+/// The same notice for the desktop application itself.
+///
+/// A second slot rather than one merged string: the two messages are about different things and
+/// appear independently — a newer CLI with an older shell is a normal state, and so is the
+/// reverse — so each has to be able to clear itself without erasing the other. The title shows
+/// whichever is set; when both are, the one about the application wins, because that is the one
+/// the user can act on from this window (see [`compose_title`]).
+static PENDING_APP_UPDATE: Mutex<Option<AppUpdateNotice>> = Mutex::new(None);
+
 /// Remember the version the user has not been told about yet, and say it in the title.
 ///
 /// Called once the Harness window exists, so the message lands on a window that stays: the splash
@@ -2633,7 +2666,12 @@ pub fn announce_update(app: &AppHandle, to: &str) {
     let Some(window) = app.get_webview_window(HARNESS) else {
         return;
     };
-    set_title_if(&window, &compose_title(Some(&text), false));
+    // Recomposed with the application's notice in hand, exactly like every other writer of this
+    // title: announcing one thing must not erase the other.
+    set_title_if(
+        &window,
+        &compose_title_with(Some(&text), pending_app_notice().as_ref(), false),
+    );
 }
 
 /// Forget the notice: the version it named is installed, so there is nothing left to tell.
@@ -2652,19 +2690,29 @@ pub fn clear_update_notice(app: &AppHandle) {
     let Some(window) = app.get_webview_window(HARNESS) else {
         return;
     };
-    set_title_if(&window, &compose_title(None, false));
+    set_title_if(
+        &window,
+        &compose_title_with(None, pending_app_notice().as_ref(), false),
+    );
 }
 
-/// What the window title should read, given the two things the shell may have to say.
+/// The same composition with the desktop application's notice in hand.
 ///
-/// One slot, two messages, and the drawing problem wins: a page that is not painting hides the
-/// model's output *now*, while a newer version only means the next launch could be better. Both
-/// are the shell's own sentences — the page's `document.title` never reaches this window, because
-/// wry only forwards it when a handler is registered and this shell registers none — so
-/// composing them here cannot fight the document.
-fn compose_title(notice: Option<&str>, not_drawing: bool) -> String {
+/// Three messages, one slot. The drawing problem still wins: a page that is not painting hides
+/// the model's output *now*, while every version notice only means the next launch could be
+/// better. Of the two version notices the application's wins, because it is the one this window
+/// can act on (its menu carries the install entry), while the CLI's is an explanation of why the
+/// shell is where it is.
+fn compose_title_with(
+    notice: Option<&str>,
+    app: Option<&AppUpdateNotice>,
+    not_drawing: bool,
+) -> String {
     if not_drawing {
         return NOT_DRAWING_TITLE.to_string();
+    }
+    if let Some(app) = app {
+        return format!("{DEFAULT_TITLE}（{}）", app.text);
     }
     match notice {
         Some(text) => format!("{DEFAULT_TITLE}（{text}）"),
@@ -3257,6 +3305,219 @@ fn shell_execute(url: &Url) {
             ));
         }
     });
+}
+
+/// The 「检查桌面应用更新…」 and 「安装已下载的更新…」 items. Ids are named here, beside
+/// `RELOAD_MENU_ID`, because the menu builder in `lib.rs` and the handlers that answer them are in
+/// different modules.
+pub const CHECK_APP_UPDATE_MENU_ID: &str = "check-app-update";
+pub const INSTALL_APP_UPDATE_MENU_ID: &str = "install-app-update";
+
+/// Prefix of the 「外观」 menu items, one per preset choice: the suffix is `icon::Choice::key`.
+pub const ICON_MENU_PREFIX: &str = "icon-choice-";
+
+/// 「选择自定义图片…」 and 「移除自定义图片」.
+pub const ICON_PICK_MENU_ID: &str = "icon-pick";
+pub const ICON_REMOVE_MENU_ID: &str = "icon-remove";
+
+/// The page reports a chosen icon file through this event; the payload is the data URL.
+pub const ICON_PICKED_EVENT: &str = "dsh-desktop:icon-picked";
+
+/// What the title says about the desktop application, and whether it can be installed from here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppUpdateNotice {
+    text: String,
+}
+
+/// The notice currently held for the application, if any.
+fn pending_app_notice() -> Option<AppUpdateNotice> {
+    PENDING_APP_UPDATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Compose the title from both notices and the drawing state, and put it on the Harness window.
+fn retitle(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(HARNESS) else {
+        return;
+    };
+    set_title_if(
+        &window,
+        &compose_title_with(
+            pending_notice().as_deref(),
+            pending_app_notice().as_ref(),
+            false,
+        ),
+    );
+}
+
+/// Say in the title that a newer desktop application exists.
+///
+/// Same reasoning as [`announce_update`]: the splash that could have drawn it is destroyed
+/// moments later, and the window title is the surface this shell already uses for "the frame
+/// knows something the page cannot say".
+pub fn announce_app_update(app: &AppHandle, to: &str) {
+    announce_app_update_with(app, &available_notice_text(to));
+}
+
+/// The sentence for "a newer release exists, and the menu is where to act on it".
+pub fn available_notice_text(to: &str) -> String {
+    format!("桌面应用有新版本 v{to}（菜单：视图 → 检查桌面应用更新…）")
+}
+
+/// Say that the package is verified and waiting to be installed.
+///
+/// A different sentence from [`announce_app_update`] on purpose: "there is a newer one" and "the
+/// newer one is on disk, verified, ready" call for different actions. It names the menu item
+/// rather than promising that a restart installs it, because nothing on the startup path does —
+/// a restart is how the *new* version would start, not how the old one would be replaced.
+pub fn announce_app_update_ready(app: &AppHandle, to: &str) {
+    announce_app_update_with(app, &ready_notice_text(to));
+}
+
+/// The sentence for "the package is here and verified". One wording for every platform: the menu
+/// item behind it installs in place on macOS and prints the command elsewhere.
+pub fn ready_notice_text(to: &str) -> String {
+    format!("桌面应用 v{to} 已下载并校验（菜单：视图 → 安装已下载的更新…）")
+}
+
+fn announce_app_update_with(app: &AppHandle, text: &str) {
+    {
+        let mut pending = PENDING_APP_UPDATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *pending = Some(AppUpdateNotice {
+            text: text.to_string(),
+        });
+    }
+    retitle(app);
+}
+
+/// Forget both application notices: whatever they named is no longer true.
+pub fn clear_app_update_notices(app: &AppHandle) {
+    let had = PENDING_APP_UPDATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .is_some();
+    if had {
+        retitle(app);
+    }
+}
+
+/// A short confirmation for a check the user asked for by hand: "nothing newer" has to be said
+/// somewhere, and the status line of a window that is already gone is not that place.
+pub fn app_update_up_to_date(app: &AppHandle, current: &str) {
+    harness::app_log(&format!("桌面应用已是最新版本: {current}"));
+    if let Some(window) = app.get_webview_window(HARNESS) {
+        let _ = window.set_title(&format!(
+            "{DEFAULT_TITLE}（桌面应用已是最新版本 {current}）"
+        ));
+        // Back to whatever the other notices say after a moment: this is an acknowledgement, not
+        // a state. The thread is detached and the window may be gone by then, which is fine.
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(6));
+            retitle(&handle);
+        });
+    }
+}
+
+/// Ask the page to open its icon file input.
+///
+/// The status page is the only IPC surface the splash window has (`capabilities/splash.json` grants
+/// it `core:default`, enough for `plugin:event|emit`), and an `eval`ed script cannot hand a `File`
+/// back over IPC — so the element, its handler and the read live in `src/index.html`, and this is
+/// only the knock on the door. The chosen file comes back through
+/// [`ICON_PICKED_EVENT`] as a data URL.
+pub fn picker_script() -> &'static str {
+    // The same wait `status_script` does, for the same reason: the page that was just created
+    // has not parsed its script block yet, and a one-shot eval would land before the entry point
+    // exists and be lost. The retry costs nothing when the page is ready.
+    "(function () {\n\
+     var open = function () {\n\
+     if (!window.__dshPickIcon) return false;\n\
+     window.__dshPickIcon();\n\
+     return true;\n\
+     };\n\
+     if (open()) return;\n\
+     var attempts = 0;\n\
+     var timer = setInterval(function () {\n\
+     if (open() || ++attempts > 40) clearInterval(timer);\n\
+     }, 25);\n\
+     })()"
+}
+
+/// A one-off informational page, for an answer the user asked for by hand.
+///
+/// Distinct from [`show_notice`], which latches: that one carries a terminal explanation that no
+/// later page may overwrite. This one is a reply, so it replaces whatever was on screen and is
+/// replaced by whatever comes next. It yields to a terminal page that is already up — see below.
+pub fn show_message(app: &AppHandle, status: &str, detail: &str) {
+    // Deliberately not `present_status_page`: that one destroys the Harness window, which is
+    // right for a terminal failure and wrong for an answer the user asked for — their session is
+    // still running, and closing the window over it would end the very thing they were using.
+    //
+    // Nor may it replace a terminal page that is already up: that page is the explanation of why
+    // the shell gave up, and clearing its retry offer to show a download status would throw away
+    // both the reason and the button. The status goes to the log instead.
+    if FAILURE_SHOWN.load(Ordering::SeqCst) {
+        harness::app_log(&format!(
+            "终端页正在显示，改在日志里报告: {status} — {detail}"
+        ));
+        return;
+    }
+    if app.get_webview_window(SPLASH).is_none() && create_splash(app).is_err() {
+        harness::app_log(&format!("无法打开状态窗口，只在日志里报告: {status}"));
+        return;
+    }
+    RETRY_OFFERED.store(false, Ordering::SeqCst);
+    eval_status(app, "__setStatus", status, detail);
+}
+
+/// Ask the status page to open its file input.
+///
+/// Used on the platforms whose menu item cannot present a native panel from Rust (Windows shows a
+/// PowerShell dialog, Linux needs zenity/kdialog, and both are handled in `icon::pick_png`); this
+/// is the fallback for a machine where neither is available, and the page is always there.
+pub fn show_picker(app: &AppHandle) -> bool {
+    // Deliberately not `present_status_page`: that one destroys the Harness window so the status
+    // page is the only thing left, which is right for a terminal failure and wrong here — the
+    // user is picking an icon for a running app, not ending their session.
+    //
+    // A terminal page owns the window while it is up, and this would paint over the explanation.
+    if FAILURE_SHOWN.load(Ordering::SeqCst) {
+        harness::app_log("终端页正在显示，图标选择改到失败页关闭之后");
+        return false;
+    }
+    if app.get_webview_window(SPLASH).is_none() {
+        if let Err(error) = create_splash(app) {
+            harness::app_log(&format!("could not open the icon picker: {error}"));
+            return false;
+        }
+    }
+    let Some(window) = app.get_webview_window(SPLASH) else {
+        return false;
+    };
+    // A window created for this still reads "正在启动…": say what it is waiting for before the
+    // panel opens, so the window behind it is not lying about the state of the launch.
+    set_status(app, "选择应用图标", "选一张正方形 PNG（64–1024 px）");
+    let _ = window.eval(picker_script());
+    true
+}
+
+/// The payload the page reports after the user picked a file.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IconPick {
+    /// The file as a `data:image/png;base64,...` URL.
+    pub data: String,
+}
+
+impl IconPick {
+    pub fn parse(payload: &str) -> Option<IconPick> {
+        serde_json::from_str(payload).ok()
+    }
 }
 
 #[cfg(test)]

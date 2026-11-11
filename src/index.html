@@ -232,6 +232,54 @@
         }
       });
 
+      // The icon picker lives on this page because the page is the only surface holding a core
+      // capability (capabilities/splash.json). It exists for the platforms whose menu item cannot
+      // open a native panel from Rust; where one can, the menu opens that instead and this block
+      // is never reached.
+      window.__dshPickIcon = function () {
+        if (!window.__iconInput) {
+          window.__iconInput = document.createElement("input");
+          window.__iconInput.type = "file";
+          window.__iconInput.accept = "image/png";
+          window.__iconInput.style.display = "none";
+          document.body.appendChild(window.__iconInput);
+          window.__iconInput.addEventListener("change", function () {
+            var field = window.__iconInput;
+            var file = field.files && field.files[0];
+            if (!file) return;
+            var detail = document.getElementById("detail");
+            if (file.size > 32 * 1024 * 1024) {
+              if (detail) detail.textContent = "图片超过 32 MiB，请换一张小的";
+              return;
+            }
+            var reader = new FileReader();
+            reader.onerror = function () {
+              if (detail) detail.textContent = "无法读取所选图片";
+            };
+            reader.onload = function () {
+              var failed = function () {
+                if (detail) detail.textContent = "图标没有送达，请重试";
+              };
+              try {
+                window.__TAURI_INTERNALS__
+                  .invoke("plugin:event|emit", {
+                    event: "dsh-desktop:icon-picked",
+                    payload: { data: String(reader.result) }
+                  })
+                  .catch(failed);
+              } catch (error) {
+                failed();
+              }
+            };
+            reader.readAsDataURL(file);
+          });
+        }
+        // Clearing first is what lets the same file be picked twice: an input that already holds
+        // a file fires no `change` event for it.
+        window.__iconInput.value = "";
+        window.__iconInput.click();
+      };
+
       window.__applyStatus();
       window.__applyChoice();
     </script>

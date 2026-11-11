@@ -46,7 +46,7 @@ PNPM_STORE ?=
 CARGO_ENV         := $(if $(CARGO_HOME),CARGO_HOME=$(CARGO_HOME),)
 PNPM_INSTALL_ARGS := $(if $(PNPM_STORE),--store-dir=$(PNPM_STORE),)
 
-.PHONY: help doctor check fmt fmt-check clippy test test-live test-scripts dev build bundle node-deps run icons clean distclean
+.PHONY: help doctor check fmt fmt-check clippy test test-live test-scripts dev build bundle node-deps run icons icon-art icon-ico icon-presets clean distclean
 
 help:
 	@echo "dsh-desktop 构建入口（平台: $(PLATFORM)，打包目标: $(BUNDLE_TARGETS)）"
@@ -63,6 +63,7 @@ help:
 	@echo "  make run         构建后启动"
 	@echo "  make icons       重新生成 icon.icns（仅 macOS）"
 	@echo "  make icon-art    重新绘制 icon.png（需 python3 + Pillow）"
+	@echo "  make icon-presets 由 icon.png 派生可切换的换色图标（只需 python3）"
 	@echo "  make runtime-stage / bundle-bundled / runtime-clean   自带运行时（无需预装 node/dsh）"
 	@echo "  make clean / distclean"
 	@echo ''
@@ -154,6 +155,12 @@ icon-art:
 	$(PYTHON) $(TAURI_DIR)/icons/make_icon.py $(TAURI_DIR)/icons/icon.png 1024
 	@$(MAKE) --no-print-directory icons
 	@$(MAKE) --no-print-directory icon-ico
+	@$(MAKE) --no-print-directory icon-presets
+
+# 菜单里那几套换色图标：由 icon.png 派生，内嵌进二进制（见 src-tauri/src/icon.rs）。
+# 只依赖标准库，所以没有 Pillow 的机器上也能重跑；配色改 PRESETS，不要手改 png。
+icon-presets:
+	$(PYTHON) scripts/make-icon-presets.py $(TAURI_DIR)/icons/icon.png $(TAURI_DIR)/icons/presets
 
 # Windows 目标的 exe 资源需要 .ico（tauri-build 在 Windows target 下强制要求）
 icon-ico:

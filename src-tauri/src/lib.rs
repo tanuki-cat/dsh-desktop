@@ -4,7 +4,9 @@
 // `process.rs` probes liveness with `OpenProcess` + `GetExitCodeProcess`, and
 // `.github/workflows/windows-portable.yml` stages a bundled runtime on a Windows runner.
 
+pub mod app_update;
 pub mod harness;
+pub mod icon;
 pub mod identity;
 pub mod locator;
 pub mod process;
@@ -30,7 +32,7 @@ use takeover::{
     resolve_foreign_action, terminal_page, wait_for_handoff, wait_for_port_free, ForeignAction,
     Retry, TerminalPage,
 };
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Listener, Manager, RunEvent};
 use update_flow::{
     clear_stale_staging, commit_core_update, confirm_core_update, recover_pending_swap,
@@ -177,10 +179,22 @@ pub struct Config {
     /// behaviour, for comparing against it or for a page the shim disagrees with.
     #[serde(default = "default_scroll_anchor")]
     pub scroll_anchor: bool,
+    /// What to do about a newer *desktop application* — the shell itself, not the dsh core it
+    /// supervises (that one is `auto_update`). `notify` by default: replacing the application
+    /// the user just launched is not a decision a startup path makes on their behalf.
+    #[serde(default = "default_app_update")]
+    pub app_update: app_update::Policy,
+    /// Which releases that check follows: `stable` (default) skips prereleases.
+    #[serde(default)]
+    pub app_update_channel: app_update::Channel,
 }
 
 fn default_scroll_anchor() -> bool {
     true
+}
+
+fn default_app_update() -> app_update::Policy {
+    app_update::Policy::Notify
 }
 
 fn default_render_fallback() -> bool {
@@ -373,6 +387,8 @@ impl Config {
             page_diagnostics: default_page_diagnostics(),
             keep_menu_focus: default_keep_menu_focus(),
             scroll_anchor: default_scroll_anchor(),
+            app_update: default_app_update(),
+            app_update_channel: app_update::Channel::Stable,
         };
         // The same repair a loaded file gets, so the value seeded here is already usable
         // (a `HOME` that is relative or gone would otherwise become the workspace).
@@ -548,6 +564,27 @@ fn window_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     match target {
         Some(view) => {
             view.prepend(&reload)?;
+            // The desktop update is about the application, not the page, so it sits beside the
+            // reload under the same menu rather than in the application menu: the two are the
+            // only items here that act on the shell itself.
+            //
+            // Checking and installing are separate items on purpose: under `app_update:
+            // download` the package is fetched and verified in the background, and the user is
+            // the one who decides when to replace the application they are using.
+            view.prepend(&MenuItem::with_id(
+                app,
+                window::INSTALL_APP_UPDATE_MENU_ID,
+                "安装已下载的更新…",
+                true,
+                None::<&str>,
+            )?)?;
+            view.prepend(&MenuItem::with_id(
+                app,
+                window::CHECK_APP_UPDATE_MENU_ID,
+                "检查桌面应用更新…",
+                true,
+                None::<&str>,
+            )?)?;
             view.prepend(&PredefinedMenuItem::separator(app)?)?;
         }
         // A menu this shell cannot find is a reason to still offer the reload, not to drop it:
@@ -555,9 +592,94 @@ fn window_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         None => {
             harness::app_log("默认菜单里没有 View 子菜单，重新加载项放到顶层");
             menu.append(&reload)?;
+            menu.append(&MenuItem::with_id(
+                app,
+                window::CHECK_APP_UPDATE_MENU_ID,
+                "检查桌面应用更新…",
+                true,
+                None::<&str>,
+            )?)?;
+            menu.append(&MenuItem::with_id(
+                app,
+                window::INSTALL_APP_UPDATE_MENU_ID,
+                "安装已下载的更新…",
+                true,
+                None::<&str>,
+            )?)?;
         }
     }
+    // The icon picker is its own submenu. It has no accelerator on purpose: switching the icon is
+    // not something a shortcut should be able to do to a running app by accident.
+    let appearance = appearance_menu(app)?;
+    menu.append(&appearance)?;
     Ok(menu)
+}
+
+/// The 「外观」 submenu: one check item per preset plus the two custom-image entries.
+///
+/// Built from the same list the runtime uses (`icon::Choice::PRESETS`), so a preset added to the
+/// enum cannot be missing here. The ticks are refreshed by `refresh_appearance_menu` after a choice.
+fn appearance_menu(app: &AppHandle) -> tauri::Result<Submenu<tauri::Wry>> {
+    let current = current_icon_choice();
+    let mut items: Vec<Box<dyn IsMenuItem<tauri::Wry>>> = Vec::new();
+    for choice in icon::Choice::PRESETS {
+        items.push(Box::new(CheckMenuItem::with_id(
+            app,
+            appearance_menu_id(choice),
+            choice.label(),
+            true,
+            choice == current,
+            None::<&str>,
+        )?));
+    }
+    items.push(Box::new(PredefinedMenuItem::separator(app)?));
+    items.push(Box::new(MenuItem::with_id(
+        app,
+        window::ICON_PICK_MENU_ID,
+        "选择自定义图片…",
+        true,
+        None::<&str>,
+    )?));
+    items.push(Box::new(MenuItem::with_id(
+        app,
+        window::ICON_REMOVE_MENU_ID,
+        "移除自定义图片",
+        true,
+        None::<&str>,
+    )?));
+    let refs: Vec<&dyn IsMenuItem<tauri::Wry>> = items.iter().map(|item| item.as_ref()).collect();
+    Submenu::with_items(app, "外观", true, &refs)
+}
+
+/// The menu id of a preset. One function, so the builder and the event handler cannot disagree.
+fn appearance_menu_id(choice: icon::Choice) -> String {
+    format!("{}{}", window::ICON_MENU_PREFIX, choice.key())
+}
+
+/// The choice the running process is wearing, for the ticks.
+///
+/// Read from the process-wide cell rather than from `appearance.json`: this runs while the menu is
+/// being built inside `Builder::build`, where the app's path resolver is not managed yet (asking
+/// for it panics), and the cell is what every change to the choice updates.
+fn current_icon_choice() -> icon::Choice {
+    icon::current()
+}
+
+/// Redraw the ticks after a choice was made.
+fn refresh_appearance_menu(app: &AppHandle) {
+    let current = current_icon_choice();
+    let Some(menu) = app.menu() else {
+        return;
+    };
+    for choice in icon::Choice::PRESETS {
+        let id = appearance_menu_id(choice);
+        if let Some(item) = menu
+            .get(&id)
+            .and_then(|item| item.as_check_menuitem().cloned())
+        {
+            let _ = item.set_checked(choice == current);
+        }
+    }
 }
 
 pub fn run() {
@@ -571,8 +693,23 @@ pub fn run() {
     builder
         .menu(window_menu)
         .on_menu_event(|app, event| {
-            if event.id() == window::RELOAD_MENU_ID {
+            let id = event.id().0.as_str();
+            if id == window::RELOAD_MENU_ID {
                 window::reload_harness(app);
+            } else if id == window::CHECK_APP_UPDATE_MENU_ID {
+                check_app_update_from_menu(app);
+            } else if id == window::INSTALL_APP_UPDATE_MENU_ID {
+                install_ready_update(app);
+            } else if id == window::ICON_PICK_MENU_ID {
+                choose_icon_from_menu(app);
+            } else if id == window::ICON_REMOVE_MENU_ID {
+                remove_custom_icon(app);
+            } else if let Some(key) = id.strip_prefix(window::ICON_MENU_PREFIX) {
+                // Only ids built by `appearance_menu_id` get here, and every one of them names a
+                // preset: an unknown suffix is dropped rather than guessed at.
+                if let Some(choice) = icon::Choice::parse(key) {
+                    select_icon(app, choice);
+                }
             }
         })
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -607,8 +744,24 @@ pub fn run() {
             app.listen(window::CHOICE_EVENT, |event| {
                 window::record_choice(event.payload());
             });
+
+            // A custom icon chosen in the status page arrives as a data URL. The bytes are
+            // decoded and validated here, then copied into app data, so the persisted choice never
+            // points at a file the user may later move.
+            let icon_handle = app.handle().clone();
+            app.listen(window::ICON_PICKED_EVENT, move |event| {
+                record_picked_icon(&icon_handle, event.payload());
+            });
+
             let handle = app.handle().clone();
             window::create_splash(&handle)?;
+            // The icon is a choice made in a previous session: drawing it here is what makes it
+            // survive a relaunch, since nothing inside the bundle is rewritten. The menu was
+            // built before this point (inside `Builder::build`), so its ticks are refreshed too.
+            if let Ok(dir) = handle.path().app_data_dir() {
+                icon::restore(&handle, &dir);
+                refresh_appearance_menu(&handle);
+            }
             std::thread::spawn(move || startup(handle));
             Ok(())
         })
@@ -2337,6 +2490,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
                         let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
                         window::create_harness(app, &url, port, &scripts)
                             .map_err(|e| e.to_string())?;
+                        apply_saved_icon(app, data_dir);
                         // This branch returns without reaching the announcement below.
                         announce_pending_update(
                             app,
@@ -2351,6 +2505,7 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
                         // Nothing was spawned here, so there is no output of our own to show;
                         // the failure page says what is known instead of quoting an empty log.
                         let ring = harness::Ring::new();
+                        spawn_app_update_check(app, data_dir, &config);
                         std::thread::spawn(move || watch_reused(handle, watched_dir, pid, ring));
                         return Ok(());
                     }
@@ -2784,7 +2939,14 @@ fn start(app: &AppHandle, data_dir: &Path) -> Result<(), StartError> {
     if let Err(error) = window::create_harness(app, &url, actual_port, &scripts) {
         return abort_start(pid, error.to_string());
     }
+    // Same reason as the reuse branch: this window is newer than the startup icon pass.
+    apply_saved_icon(app, data_dir);
     announce_pending_update(app, pending_update_notice.as_deref(), core_swapped);
+
+    // The desktop application's own update check runs last and off this thread: the window is up,
+    // so the answer has somewhere to land, and a slow GitHub reply must not sit in front of a
+    // Harness the user is waiting for.
+    spawn_app_update_check(app, data_dir, &config);
 
     // The CLI outlives this function, so hand the child to a watchdog: an unexpected exit
     // must be visible rather than leaving the window on a dead page.
@@ -2885,6 +3047,232 @@ fn harness_scripts(config: &Config) -> Vec<String> {
 #[cfg(test)]
 pub(crate) fn test_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
+}
+
+/// Handle 「检查桌面应用更新…」: ignore the cache and report the answer where the user is looking.
+fn check_app_update_from_menu(app: &AppHandle) {
+    let Ok(data_dir) = app.path().app_data_dir() else {
+        harness::app_log("无法获取应用数据目录，忽略更新检查");
+        return;
+    };
+    window::set_status(app, "正在检查桌面应用更新…", "");
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let config = Config::load(&data_dir);
+        app_update::report(&handle, &data_dir, &config, bundled_build(&handle), true);
+    });
+}
+
+/// Handle 「安装已下载的更新…」: finish an update `app_update: download` prepared.
+///
+/// The check and the install are two decisions. `download` fetches and verifies in the
+/// background, and this is where the user spends the one action that replaces the application
+/// they are running — which is also the only way a package left in `ready/` by an earlier
+/// session ever gets used.
+fn install_ready_update(app: &AppHandle) {
+    let Ok(data_dir) = app.path().app_data_dir() else {
+        harness::app_log("无法获取应用数据目录，忽略安装请求");
+        return;
+    };
+    let paths = app_update::Paths::new(&data_dir);
+    let Some(package) = app_update::verified_package(&paths) else {
+        window::show_message(
+            app,
+            "没有已下载的更新包",
+            "先在「视图 → 检查桌面应用更新…」里检查一次更新；\n\
+             把 config.json 的 \"app_update\" 设为 \"download\" 或 \"install\" 可以让它自动准备。",
+        );
+        return;
+    };
+    if !app_update::install_supported() {
+        window::show_message(
+            app,
+            "本平台需要手动安装",
+            &app_update::manual_install_hint(&package),
+        );
+        return;
+    }
+    // Off the menu thread: unpacking a bundled `.app` is most of a gigabyte of `ditto` work, and
+    // the menu handler runs on the main thread. The page says what is happening first, so the
+    // window paints it before the unpack starts.
+    window::show_message(app, "正在安装桌面应用更新…", &package.display().to_string());
+    let handle = app.clone();
+    std::thread::spawn(
+        move || match app_update::install_package(&package, &paths) {
+            Ok(installed) => {
+                harness::app_log(&format!("已安装已下载的更新: {}", installed.display()));
+                window::show_message(&handle, "桌面应用更新已安装", "正在重启以载入新版本…");
+                app_update::relaunch_into_update(&handle, &installed);
+            }
+            Err(reason) => {
+                harness::app_log(&format!("安装已下载的更新失败: {reason}"));
+                window::show_message(&handle, "安装失败", &reason);
+            }
+        },
+    );
+}
+
+/// Handle a preset entry in the 「外观」 menu.
+fn select_icon(app: &AppHandle, choice: icon::Choice) {
+    let Ok(data_dir) = app.path().app_data_dir() else {
+        harness::app_log("无法获取应用数据目录，忽略图标切换");
+        return;
+    };
+    match icon::select(app, &data_dir, choice) {
+        Ok(()) => refresh_appearance_menu(app),
+        Err(reason) => harness::app_log(&format!("切换图标失败: {reason}")),
+    }
+}
+
+/// Handle 「选择自定义图片…」.
+///
+/// The native picker is the primary path on every platform (`icon::pick_png`), and the status
+/// page is the fallback for a machine that has none of them — on macOS this handler already runs
+/// on the main thread, which is what AppKit requires, and what is stored is the *fitted* icon
+/// rather than the file itself, so the icon neither depends on the original staying put nor
+/// carries a 4000 px screenshot into every launch.
+fn choose_icon_from_menu(app: &AppHandle) {
+    let Ok(data_dir) = app.path().app_data_dir() else {
+        harness::app_log("无法获取应用数据目录，忽略图标选择");
+        return;
+    };
+    // Two failures look nothing alike and used to share one arm: "this machine has no file
+    // panel" (fall back to the page's own picker) and "that image cannot be an icon" (say why).
+    let source = match icon::pick_png() {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            harness::app_log("用户取消了图标选择");
+            return;
+        }
+        Err(reason) => {
+            // The page owns the other picker: it is the only surface holding a core capability,
+            // and the only one that can hand a `File` over IPC.
+            harness::app_log(&format!("打开本机文件选择器失败（{reason}），改用状态页"));
+            window::show_picker(app);
+            return;
+        }
+    };
+    match icon::adopt_custom(&data_dir, &source)
+        .and_then(|_| icon::select(app, &data_dir, icon::Choice::Custom))
+    {
+        Ok(()) => refresh_appearance_menu(app),
+        Err(reason) => {
+            harness::app_log(&format!("自定义图标没有生效: {reason}"));
+            // On screen, on every platform. A menu item that only writes to a log file is, to the
+            // person who clicked it, a menu item that does nothing — which is exactly how a run of
+            // refused images was reported as "自定义图片替换 icon 不生效".
+            window::show_message(app, "图标没有更新", &reason);
+        }
+    }
+}
+
+/// Handle 「移除自定义图片」: drop the stored copy and fall back to the default artwork.
+fn remove_custom_icon(app: &AppHandle) {
+    let Ok(data_dir) = app.path().app_data_dir() else {
+        return;
+    };
+    let stored = icon::custom_path(&data_dir);
+    if let Err(error) = std::fs::remove_file(&stored) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            harness::app_log(&format!("删除自定义图标失败: {error}"));
+        }
+    }
+    select_icon(app, icon::Choice::Default);
+}
+
+/// Store and apply an icon the status page reported.
+///
+/// Validation happens here rather than in the page: the decoder is the authority on what an icon
+/// is, and a page that could decide would be a second rule to keep in sync.
+fn record_picked_icon(app: &AppHandle, payload: &str) {
+    let Some(pick) = window::IconPick::parse(payload) else {
+        harness::app_log("无法解析图标数据");
+        return;
+    };
+    let Ok(data_dir) = app.path().app_data_dir() else {
+        harness::app_log("无法获取应用数据目录，忽略图标选择");
+        return;
+    };
+    let bytes = match icon::decode_data_url(&pick.data) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            harness::app_log(&format!("图标数据无效: {reason}"));
+            return;
+        }
+    };
+    // Written to a temporary file and then adopted: `adopt_custom` is the one path that both
+    // validates and stores, and going around it here would leave two places that decide what a
+    // usable icon is.
+    // Unique per pick: a fixed name per process would let two picks in flight overwrite each
+    // other's bytes between the write and the copy.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let temporary =
+        std::env::temp_dir().join(format!("dsh-icon-{}-{stamp}.png", std::process::id()));
+    if let Err(error) = std::fs::write(&temporary, &bytes) {
+        harness::app_log(&format!("无法暂存图标数据: {error}"));
+        return;
+    }
+    let outcome = icon::adopt_custom(&data_dir, &temporary);
+    let _ = std::fs::remove_file(&temporary);
+    match outcome.and_then(|_| icon::select(app, &data_dir, icon::Choice::Custom)) {
+        Ok(()) => {
+            refresh_appearance_menu(app);
+            window::set_status(app, "图标已更新", "");
+        }
+        Err(reason) => {
+            harness::app_log(&format!("应用自定义图标失败: {reason}"));
+            window::set_status(app, "图标没有更新", &reason);
+        }
+    }
+}
+
+/// Start the desktop application update check on its own thread.
+///
+/// Deliberately detached and deliberately last: by the time this is called the Harness window is
+/// up, so whatever the check finds has somewhere to be shown, and a slow GitHub reply cannot delay
+/// a launch. A failure is a log line — the check is never a reason to leave the user without a
+/// window.
+fn spawn_app_update_check(app: &AppHandle, data_dir: &Path, config: &Config) {
+    if config.app_update == app_update::Policy::Off {
+        return;
+    }
+    let handle = app.clone();
+    let bundled = bundled_build(app);
+    let data_dir = data_dir.to_path_buf();
+    let config = config.clone();
+    std::thread::spawn(move || app_update::report(&handle, &data_dir, &config, bundled, false));
+}
+
+/// Whether this **build** ships a runtime, which is what decides the artifact name the update
+/// path looks for.
+///
+/// Not the same question as `ResolvedRuntime::bundled()`: that one answers "is the tree being
+/// supervised ours", which is false on a bundled build whose user pointed `DSH_DESKTOP_DSH` at
+/// their own install. The artifact name follows the *build*, because the package that replaces
+/// it is the one this pipeline produced.
+///
+/// It is still read through `seed_root_for`, which also accepts `DSH_DESKTOP_RUNTIME` and the
+/// `target/<profile>/runtime` layout a dev build sees: both mean "this process will run from a
+/// runtime it did not find on the machine", which is the same bet the artifact name makes.
+fn bundled_build(app: &AppHandle) -> bool {
+    seed_root_for(app.path().resource_dir().ok().as_deref()).is_some()
+}
+
+/// Re-apply the persisted icon to the window that now exists.
+///
+/// `set_icon` is per window, and the windows are built after the startup pass, so each new one
+/// has to be told. Off the calling thread because the startup path is the one that just spent
+/// seconds starting a Harness, and setting an icon is not worth adding to it.
+fn apply_saved_icon(app: &AppHandle, data_dir: &Path) {
+    let handle = app.clone();
+    let dir = data_dir.to_path_buf();
+    std::thread::spawn(move || {
+        let choice = icon::load(&dir).icon;
+        icon::apply(&handle, &dir, choice);
+    });
 }
 
 #[cfg(test)]

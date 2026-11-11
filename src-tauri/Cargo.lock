@@ -831,14 +831,16 @@ dependencies = [
 
 [[package]]
 name = "dsh-desktop"
-version = "0.4.15"
+version = "0.5.0"
 dependencies = [
  "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "png 0.18.1",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-single-instance",
