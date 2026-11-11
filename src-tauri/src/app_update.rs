@@ -50,11 +50,12 @@ const MAX_ASSET_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 pub enum Policy {
     /// Do not even look.
     Off,
-    /// Check, and say so in the window title and the log. The default: replacing the application
-    /// the user launched is not a decision a startup path takes on their behalf.
-    #[default]
+    /// Check, and say so in the window title and the log. Nothing is fetched.
     Notify,
-    /// Download and verify into `ready/`, then leave the install to the user.
+    /// Download and verify into `ready/`, then leave the install to the user. The default: it buys
+    /// the one click under `install` without spending it — a startup path may prepare an update on
+    /// its own, but replacing the application the user just launched is their decision.
+    #[default]
     Download,
     /// Download, verify, install and relaunch. Only macOS can do the last two in place (see
     /// `install_supported`); elsewhere this behaves as `Policy::Download`.

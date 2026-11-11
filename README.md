@@ -68,7 +68,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
   GitHub Releases（`/repos/tanuki-cat/dsh-desktop/releases`），按 `os`/`arch`/是否自带运行时选资产
   （`dsh-desktop_<ver>_<os>-<arch>[-bundled].app.zip|.deb`，Windows 是 `-portable.zip`），
   下载后与 Release 的 `SHA256SUMS` 逐一比对，**只有校验通过的包**才会进入 `app-update/ready/`。
-  `app_update` 默认 `notify`（只在标题与日志里提示，菜单「视图 → 检查桌面应用更新…」可当场查）；
+  `app_update` 默认 `download`（启动后在后台下载并校验到 `app-update/ready/`，菜单「安装已下载的更新…」一次点击装好；只想提示就设回 `notify`）；
   `download` 自动下载校验；`install` 在 macOS 上还会用 `ditto` 解包、核对 `CFBundleIdentifier`
   与 `CFBundleShortVersionString`、把旧 `.app` 挪到 `app-update/backup/` 后换上新的、清掉
   quarantine，再 `open -n` 重启（Linux 的 `.deb` 需要 root、Windows 不能覆盖运行中的 exe，这两处停在
@@ -183,7 +183,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 `cargo clippy --target x86_64-pc-windows-gnu` 对 `cfg(windows)` 代码做回归（只检查类型与 lint，不能运行 PE）。
 
 **未做**：签名与公证（对外分发必需）、多 workspace 切换 UI。这两项需要开发者证书，不在代码层可独立完成。
-**桌面应用自更新**已按 issue #2 落地（默认只提示，`app_update` 可开自动下载/安装，见
+**桌面应用自更新**已按 issue #2 落地（默认下载并校验、菜单一次点击安装，见
 [桌面应用自更新与图标](#桌面应用自更新与图标issue-2)）；它替换的是**壳自己**，与 dsh 核心的更新事务是两件不同的事。
 **自带运行时（打包 Node/dsh）**已随 `feat/bundled-runtime` 并入 `main`（2026-09-13）：macOS `.app`
 本机实测可跑、Windows 免安装包实机验证通过，见下方[自带运行时](#自带运行时已并入-main)一节。
@@ -194,7 +194,7 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 设计见 [`docs/design-task-feat-app-updates-and-icons.md`](docs/design-task-feat-app-updates-and-icons.md)。
 两件事都只作用于**壳自己**，与上面的 dsh 核心/插件市场更新互不影响（各自独立缓存与失败退避）：
 
-- **自更新**：`app_update` 默认 `notify`。检查在 Harness 窗口出现后才跑，不占启动路径；
+- **自更新**：`app_update` 默认 `download`。检查在 Harness 窗口出现后才跑，不占启动路径；
   新版提示落在窗口标题（与 dsh 核心的提示分两个槽位，应用那条优先且不会抹掉另一条）。
   菜单两项：「检查桌面应用更新…」无视缓存当场查；「安装已下载的更新…」消费 `app-update/ready/`
   里那份已经校验过的包。下载走 `curl`（Windows 用 PowerShell），校验走 Release 的 `SHA256SUMS`；
@@ -402,7 +402,7 @@ src-tauri/src/harness.rs        -> src-tauri/src/harness/tests.rs
 | `keep_menu_focus` | `true` | 点击菜单弹层时原地按住焦点，修掉 WebKit 上模型/思考强度点了没反应（见[已知坑](#已知坑)）。`false` 恢复引擎自己的焦点行为 |
 | `page_diagnostics` | `true` | 把页面内的未捕获错误、未处理 rejection 与 `console.error/warn` 带回壳日志（Harness 窗口本身没有控制台，见[已知坑](#已知坑)）。`false` 不注入 |
 | `scroll_anchor` | `true` | WebKit 没有实现 CSS 滚动锚定，这个垫片替它补上：读者上方的展开/收起改变高度时，按被观察行移动的距离补偿滚动偏移（见[已知坑](#已知坑)）。`false` 恢复引擎自己的行为，用于对照 |
-| `app_update` | `"notify"` | 桌面应用**自己**的更新策略（与上面管的 dsh 核心无关）：`off` 不自动检查（菜单仍可手动查）；`notify` 只提示（默认，替换用户刚打开的应用不是启动路径该擅自决定的事）；`download` 下载并校验到 `app-update/ready/`，由菜单「安装已下载的更新…」完成安装；`install` 再在 macOS 上装好并重启（Linux/Windows 等价于 `download`，因为 `.deb` 要 root、运行中的 exe 覆盖不了） |
+| `app_update` | `"download"` | 桌面应用**自己**的更新策略（与上面管的 dsh 核心无关）：`off` 不自动检查（菜单仍可手动查）；`notify` 只提示、不下载；`download` 下载并校验到 `app-update/ready/`，由菜单「安装已下载的更新…」完成安装（默认——准备好而不替你替换）；`install` 再在 macOS 上装好并重启（Linux/Windows 等价于 `download`，因为 `.deb` 要 root、运行中的 exe 覆盖不了） |
 | `app_update_channel` | `"stable"` | 跟随哪个渠道：`stable` 跳过 prerelease 与 draft；`prerelease` 取最新的一个（含预发布） |
 | `runtime` | `"auto"` | 运行时来源：`auto` 用系统已装的（通过门槛时），否则用自带；`bundled` 强制自带；`system` 保持旧行为（开发用） |
 | —— | —— | **候选必须真的是 `@deepseek-ai/dsh`**：PATH 上同名但不是这个 npm 包的 `dsh`（Homebrew 的 Dancer's shell、自定义 shim…）会被跳过并记日志；全部候选都不合格时报错页，而不是随便监管一个同名程序。识别不出来的 node 启动脚本只有在 `--version` 真的打印出版本号时才被采用（旧布局的兜底） |

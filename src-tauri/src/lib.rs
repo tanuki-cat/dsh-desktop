@@ -194,7 +194,10 @@ fn default_scroll_anchor() -> bool {
 }
 
 fn default_app_update() -> app_update::Policy {
-    app_update::Policy::Notify
+    // `download`: prepare the verified package in the background, install on one click. `notify`
+    // (only say there is a newer one) is still a config value, but it made the menu item look
+    // broken: the title said an update existed and nothing acted on it.
+    app_update::Policy::Download
 }
 
 fn default_render_fallback() -> bool {

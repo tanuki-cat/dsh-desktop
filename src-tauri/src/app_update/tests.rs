@@ -459,7 +459,7 @@ fn policy_and_channel_names_round_trip() {
         assert_eq!(policy.label(), text);
     }
     assert_eq!(Policy::parse("always"), None);
-    assert_eq!(Policy::default(), Policy::Notify);
+    assert_eq!(Policy::default(), Policy::Download);
     assert_eq!(Channel::parse("stable"), Some(Channel::Stable));
     assert_eq!(Channel::parse("prerelease"), Some(Channel::Prerelease));
     assert_eq!(Channel::parse("beta"), None);

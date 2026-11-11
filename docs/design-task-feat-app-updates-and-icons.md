@@ -109,12 +109,13 @@ Windows 解压替换）。这是平台限制，不是没做完。
 
 | 键 | 值 | 默认 | 含义 |
 |---|---|---|---|
-| `app_update` | `off` / `notify` / `download` / `install` | `notify` | 检查到之后做到哪一步 |
+| `app_update` | `off` / `notify` / `download` / `install` | `download` | 检查到之后做到哪一步 |
 | `app_update_channel` | `stable` / `prerelease` | `stable` | 跟随的发布渠道 |
 
 `off` 不做**自动**检查（菜单那一项仍然工作——那是用户明确的请求，不是启动路径的决定）；
-`notify` 只提示；`download` 自动下载 + 校验到 `ready/`，由菜单完成安装；
-`install` 在 macOS 上继续安装并重启（其他平台等价于 `download`）。
+`notify` 只提示；`download` 自动下载 + 校验到 `ready/`，由菜单完成安装（默认：启动路径可以
+替你**准备**更新，但不替你**替换**正在用的应用）；`install` 在 macOS 上继续安装并重启
+（其他平台等价于 `download`）。
 
 ## 3. 应用图标
 
