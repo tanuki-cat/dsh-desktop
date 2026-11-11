@@ -664,8 +664,8 @@ macOS/Linux 每个平台会先出精简版，再出 `-bundled` 的自带运行�
 
 | 运行器 | 平台标识 | 精简版（需自备 node/dsh） | 自带运行时版（`-bundled`，无需预装） |
 |---|---|---|---|
-| `macos-14` | `macos-arm64` | `dsh-desktop_<v>_macos-arm64.app.zip` | `dsh-desktop_<v>_macos-arm64-bundled.app.zip` |
-| `macos-14`（交叉 `x86_64-apple-darwin`） | `macos-x64` | `dsh-desktop_<v>_macos-x64.app.zip` | `dsh-desktop_<v>_macos-x64-bundled.app.zip` |
+| `macos-15`（arm64） | `macos-arm64` | `dsh-desktop_<v>_macos-arm64.app.zip` | `dsh-desktop_<v>_macos-arm64-bundled.app.zip` |
+| `macos-15`（交叉 `x86_64-apple-darwin`） | `macos-x64` | `dsh-desktop_<v>_macos-x64.app.zip` | `dsh-desktop_<v>_macos-x64-bundled.app.zip` |
 | `ubuntu-22.04` | `linux-x64` | `dsh-desktop_<v>_linux-x64.deb` | `dsh-desktop_<v>_linux-x64-bundled.deb` |
 | `ubuntu-24.04-arm` | `linux-arm64` | `dsh-desktop_<v>_linux-arm64.deb` | `dsh-desktop_<v>_linux-arm64-bundled.deb` |
 | `windows-latest`（复用 `windows-portable.yml`） | `windows-x64` | ——（Windows 只出免安装包） | `dsh-desktop_<v>_windows-x64-portable.zip` ＋ 同名 `.exe` |

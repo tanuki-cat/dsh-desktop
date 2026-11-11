@@ -92,14 +92,19 @@ jobs:
       fail-fast: false        # 一个平台失败不影响其它平台的产物
       matrix:
         include:
-          - os: macos-14          # Apple Silicon
+          # macos-15（arm64）而不是 macos-latest：发布流水线钉版本，避免 GitHub 换默认镜像
+          # 时构建环境悄悄变化。macos-14 已于 2026-11-02 退役，用它打 tag 时任务会在分配
+          # runner 阶段被取消（"The configuration 'macos-14-arm64-us-default' is not supported"）。
+          # 可用标签见 https://github.com/actions/runner-images#available-images —— 再退役时
+          # 这一行要跟着换（macOS 26 的 arm64 标签是 macos-26 / macos-latest）。
+          - os: macos-15          # Apple Silicon
             suffix: macos-arm64
             bundles: app
             target: ""
             timeout: 90
           # Intel 包在 arm64 runner 上交叉编译：macos-13（最后一个 x64 镜像）排队时间不可控，
           # 实测曾把整个 run 卡在 queued，导致 release job 永不执行。
-          - os: macos-14
+          - os: macos-15
             suffix: macos-x64
             bundles: app
             target: x86_64-apple-darwin
