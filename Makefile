@@ -195,10 +195,10 @@ distclean: clean
 #   make bundle-bundled   runtime-stage + 打包（.app 会带上整套运行时，约 490 MB）
 #   make runtime-clean    回收 staging 与下载缓存
 # staging 必须按平台各自执行：dsh 树里有平台相关的原生模块。
-NODE_VERSION      ?= 22.23.2
-DSH_VERSION       ?= 0.2.1-rc.4
+NODE_VERSION      ?= 24.22.2
+DSH_VERSION       ?= 0.2.2-rc.1
 PNPM_VERSION      ?= 12.3.4
-DSHMARKET_VERSION ?= 1.73.1
+DSHMARKET_VERSION ?= 1.73.17
 RUNTIME_DIR       := $(TAURI_DIR)/runtime
 RUNTIME_CACHE     := .runtime-cache
 # 交叉编译时（TARGET 非空）必须按**目标**平台 staging：在 arm64 runner 上打 x64 包却塞进 arm64 的
@@ -235,8 +235,9 @@ RUNTIME_LOCK      := $(TAURI_DIR)/runtime.lock
 # 自带运行时版才声明 resources：普通 `make bundle`（精简版）不该把 520 MB 的 staging 打进包 ——
 # 这正是桌面壳审查 §10 记过的陷阱（bundle.resources 常开 + 残留 payload = 静默变胖）。
 ifeq ($(PLATFORM),macos)
-# macOS 上还要声明 11.0：随包的 node 22 是 minos 11.0，写 10.15 会"能装、能开壳、一起 harness 就崩"。
-BUNDLED_CONFIG_JSON := {"bundle":{"resources":["runtime/**/*"],"macOS":{"minimumSystemVersion":"11.0"}}}
+# macOS 上还要声明 13.5：随包的 node 24.22.2 是 minos 13.5（node 22 时代是 11.0），
+# 写低了就是"能装、能开壳、一起 harness 就崩"。换 Node 大版本时用 otool -l <node> 复核这一行。
+BUNDLED_CONFIG_JSON := {"bundle":{"resources":["runtime/**/*"],"macOS":{"minimumSystemVersion":"13.5"}}}
 else
 BUNDLED_CONFIG_JSON := {"bundle":{"resources":["runtime/**/*"]}}
 endif

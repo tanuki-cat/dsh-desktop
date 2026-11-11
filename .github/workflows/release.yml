@@ -315,7 +315,8 @@ jobs:
           - **桌面应用自更新**（[issue #2](https://github.com/tanuki-cat/dsh-desktop/issues/2)）：壳自己也有版本了。启动后在 Harness 窗口出现之后用后台线程查 GitHub Releases，按平台/架构/是否自带运行时**精确**选资产（不做跨架构的降级猜测），下载后与 Release 的 `SHA256SUMS` 逐字比对，只有校验通过的包才进 `app-update/ready/`。`app_update` 默认 `notify`——标题与日志里提示，菜单「视图 → 检查桌面应用更新…」当场查；`download` 自动准备；`install` 在 macOS 上继续装好并重启（`ditto` 解包 → 校验 bundle id/版本 → 备份旧 `.app` → 换入 → 清 quarantine → 重启），Linux/Windows 停在「已校验的包在这里」，由菜单「安装已下载的更新…」给出手动命令。刻意不引入 `tauri-plugin-updater`：它要 minisign 私钥与 `.app.tar.gz`，与本仓库未签名、出 `.app.zip`/`.deb`/便携 zip 的发布形状对不上。
           - **可切换的应用图标**（同上）：菜单「外观」里有默认 + 深海 / 极夜 / 晨雾 四套（全部 `include_bytes!` 内嵌，精简版与自带运行时版表现一致），以及「选择自定义图片…」。自定义 PNG 先解码整理——调色板/灰度/16 位由解码器展开，非正方形按中心裁切，超过 1024 px 用面积平均缩放，短边小于 64 px 才拒绝——整理后的图存进 `<app-data>/icons/custom.png`，选完不依赖原文件。macOS 走 `NSApplication.setApplicationIconImage`（Dock 与 ⌘Tab），Windows/Linux 走窗口图标；选择写 `appearance.json`，每次启动重新应用，不改包里的 `.icns`/`.ico`（那会破坏签名）。
           - **修掉的既有问题**：更新后重启与单实例插件的竞态（新实例在旧进程退出前连上 socket 会自己退出，导致两个都没了——改为 `open -n` 之后立刻释放 socket）；`download` 策略在 macOS 上装不上（新增「安装已下载的更新…」入口、复用已校验的包、拒绝把旧包装成降级）；下载失败只剩一个退出码（curl 的错误现在并进 stdout，缺工具不再被误报成超时）；自定义图片被拒时界面毫无反应（现在弹原因）；备份按**被替换**的版本命名且只留最新一份；Dock 位图改用预乘 alpha（半透明边缘不再发白）。
-          - **随包运行时未变**：仍是 dsh `0.2.1-rc.4` / Node `22.23.2` / dshmarket `1.73.1`；装好之后的 dsh 核心与插件市场照旧跟随 npm registry 自动更新。
+          - **随包运行时升级**：dsh `0.2.1-rc.4` → **`0.2.2-rc.1`**，Node `22.23.2` → **`24.22.2`**（dsh 0.2.2 起声明 `engines.node >= 24.9.0`，所以 Node 必须跟着走），插件市场 dshmarket `1.73.1` → **`1.73.17`**（新机器首启播种该版本）。staging 实测 **1153 MB / 75,799 个文件**（Node 199 + dsh 树 910 + tools 37 + 市场模板 6.6 MB），仍在体积闸门内；装好之后的 dsh 核心与插件市场照旧跟随 npm registry 自动更新。
+          - **自带运行时版的最低系统版本从 macOS 11.0 提到 13.5**：Node 24.22.2 的 `minos` 是 13.5（Node 22 时代是 11.0），声明低了会在旧系统上「能装、能开壳、一起 harness 就崩」。精简版不受影响（仍是 10.15）。
 
           ### 验证与范围
 
@@ -353,7 +354,8 @@ jobs:
           dshmarket 之后跟随 npm registry 自动更新（插件市场的自动更新**默认关闭** —— 它会改写 profile 下的
           `package.json` 与锁文件，用 config.json 的 `auto_update_plugins` 开启；核心的 `auto_update` 不受影响）。
 
-          > 🖥 **macOS 的界面需要 Safari 16.4（macOS 13.3）或更新的 WebKit**：随包的 document-preview
+          > 🖥 **自带运行时版需要 macOS 13.5+**（随包 Node 24 的 `minos`）；精简版仍可装在 10.15，
+          > 但界面需要 Safari 16.4（macOS 13.3）或更新的 WebKit。随包的 document-preview
           > 插件在更旧的引擎上会在加载期抛 `Can't find variable: Iterator` 一类错误。壳会先探测缺什么，
           > **能补的（Iterator、Promise.try、Math.sumPrecise 等）自己注入兼容层**，补不了的语法
           > （macOS ≤ 12 缺 `class static block`）才改用系统浏览器并写明原因。
