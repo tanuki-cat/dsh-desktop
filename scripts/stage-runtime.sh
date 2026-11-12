@@ -13,9 +13,9 @@ set -eu
 
 out=${1:?用法: stage-runtime.sh <runtime 目录>}
 node_version=${NODE_VERSION:-24.22.2}
-dsh_version=${DSH_VERSION:-0.2.2-rc.1}
+dsh_version=${DSH_VERSION:-0.2.2-rc.2}
 pnpm_version=${PNPM_VERSION:-12.3.4}
-dshmarket_version=${DSHMARKET_VERSION:-1.73.17}
+dshmarket_version=${DSHMARKET_VERSION:-1.73.19}
 cache=${CACHE_DIR:-.runtime-cache}
 python=${PYTHON:-python3}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -87,6 +87,9 @@ npm_cli=$out/node/lib/node_modules/npm/bin/npm-cli.js
 echo "安装 dsh $dsh_version 到 dsh-prefix"
 "$node_bin" "$npm_cli" install -g --prefix "$out/dsh-prefix" \
   --cache "$cache/npm" --no-fund --no-audit --loglevel=error "@deepseek-ai/dsh@$dsh_version"
+
+echo "删除 dsh 树里的 source map（0.2.2-rc.2 起随包发布，运行时不需要）"
+find "$out/dsh-prefix" -name '*.map' -type f -delete
 
 echo "安装 pnpm $pnpm_version 到 tools"
 "$node_bin" "$npm_cli" install -g --prefix "$out/tools" \

@@ -192,13 +192,13 @@ distclean: clean
 # 目标：在没有 node / dsh 的机器上双击即用。
 #   make runtime-fetch    下载官方 Node 并校验 SHASUMS256.txt
 #   make runtime-stage    组装 src-tauri/runtime/{node,dsh-prefix,tools,profile-template,THIRD-PARTY-NOTICES.md}
-#   make bundle-bundled   runtime-stage + 打包（.app 会带上整套运行时，约 490 MB）
+#   make bundle-bundled   runtime-stage + 打包（.app 会带上整套运行时，约 1.4 GB）
 #   make runtime-clean    回收 staging 与下载缓存
 # staging 必须按平台各自执行：dsh 树里有平台相关的原生模块。
 NODE_VERSION      ?= 24.22.2
-DSH_VERSION       ?= 0.2.2-rc.1
+DSH_VERSION       ?= 0.2.2-rc.2
 PNPM_VERSION      ?= 12.3.4
-DSHMARKET_VERSION ?= 1.73.17
+DSHMARKET_VERSION ?= 1.73.19
 RUNTIME_DIR       := $(TAURI_DIR)/runtime
 RUNTIME_CACHE     := .runtime-cache
 # 交叉编译时（TARGET 非空）必须按**目标**平台 staging：在 arm64 runner 上打 x64 包却塞进 arm64 的
@@ -232,7 +232,7 @@ NODE_BASE_URL     := https://nodejs.org/dist/v$(NODE_VERSION)
 NODE_BIN          := $(abspath $(RUNTIME_DIR))/node/bin
 RUNTIME_LOCK      := $(TAURI_DIR)/runtime.lock
 
-# 自带运行时版才声明 resources：普通 `make bundle`（精简版）不该把 520 MB 的 staging 打进包 ——
+# 自带运行时版才声明 resources：普通 `make bundle`（精简版）不该把 1.4 GB 的 staging 打进包 ——
 # 这正是桌面壳审查 §10 记过的陷阱（bundle.resources 常开 + 残留 payload = 静默变胖）。
 ifeq ($(PLATFORM),macos)
 # macOS 上还要声明 13.5：随包的 node 24.22.2 是 minos 13.5（node 22 时代是 11.0），
@@ -272,6 +272,8 @@ runtime-stage: runtime-fetch
 	@echo "安装 dsh $(DSH_VERSION) 到 dsh-prefix …"
 	@PATH="$(NODE_BIN):$$PATH" $(RUNTIME_DIR)/node/bin/npm install -g --prefix $(RUNTIME_DIR)/dsh-prefix \
 		--cache $(RUNTIME_CACHE)/npm --no-fund --no-audit --loglevel=error @deepseek-ai/dsh@$(DSH_VERSION)
+	@echo "删除 dsh 树里的 source map（0.2.2-rc.2 起随包发布，运行时不需要）…"
+	@find $(RUNTIME_DIR)/dsh-prefix -name '*.map' -type f -delete
 	@echo "安装 pnpm $(PNPM_VERSION) 到 tools …"
 	@PATH="$(NODE_BIN):$$PATH" $(RUNTIME_DIR)/node/bin/npm install -g --prefix $(RUNTIME_DIR)/tools \
 		--cache $(RUNTIME_CACHE)/npm --no-fund --no-audit --loglevel=error pnpm@$(PNPM_VERSION)
@@ -281,7 +283,7 @@ runtime-stage: runtime-fetch
 		"$(RUNTIME_DIR)/profile-template" "$(DSHMARKET_VERSION)" "$(RUNTIME_DIR)/tools/bin"
 	@xattr -cr $(RUNTIME_DIR) 2>/dev/null || true
 	@$(PYTHON) scripts/write_third_party_notices.py "$(RUNTIME_DIR)" "$(NODE_VERSION)" "$(DSH_VERSION)" "$(PNPM_VERSION)" "$(DSHMARKET_VERSION)"
-	@DSH_RUNTIME_MAX_FILES=100000 DSH_RUNTIME_MAX_MB=1500 sh scripts/check-runtime-stage.sh "$(RUNTIME_DIR)"
+	@DSH_RUNTIME_MAX_FILES=100000 DSH_RUNTIME_MAX_MB=1600 sh scripts/check-runtime-stage.sh "$(RUNTIME_DIR)"
 	@du -sh $(RUNTIME_DIR) 2>/dev/null || true
 
 # 打包"无需预装 node/dsh"的版本：bundle.resources 会把 runtime/ 一起塞进 .app。

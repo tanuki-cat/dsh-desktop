@@ -24,12 +24,15 @@ set -eu
 #   0.2.1-rc.4  2026-10-28 本机复测（macOS arm64）：69,400 个文件 / 1088 MB（dsh 树 63,754
 #               个文件 / 856 MB + 188 MB node）；相对 rc.1 只是多出两个客户端插件，规模不变
 #   0.2.1-rc.4 + dshmarket 1.73.1（同日）：69,333 个文件 / 1086 MB —— 市场这版自身小了约 2 MB
-# 因此上限按最近一次实测留约 40% 余量：少一棵树（仅 dsh-prefix 就六万文件）或多出
-# 一个平台的 payload 仍会明显偏出，而"往 staging 里多放两万个文件"正是方案 §5（v3.1
-# 第 4 条）实测过的漏网场景。换 dsh 大版本后按实测值重新收紧。
+#   0.2.2-rc.2  2026-11-12 本机实测（macOS arm64，删除 dsh 树里的 *.map 后）：
+#               90,492 个文件 / 1480 MB（dsh 树 1.2 GB + node 199 MB + tools 37 MB +
+#               模板 6.6 MB）；map 是 rc.2 起随包发布的调试资源，运行时不需要。
+# 因此文件数上限按最近一次实测留约 10% 余量、体积上限 1600 MB（约 8% 余量）：少一棵树
+# （仅 dsh-prefix 就九万文件）或多出一个平台的 payload 仍会明显偏出，而"往 staging 里多放
+# 两万个文件"正是方案 §5（v3.1 第 4 条）实测过的漏网场景。换 dsh 大版本后按实测值重新收紧。
 min_files=${DSH_RUNTIME_MIN_FILES:-20000}
 max_files=${DSH_RUNTIME_MAX_FILES:-100000}
-max_mb=${DSH_RUNTIME_MAX_MB:-1500}
+max_mb=${DSH_RUNTIME_MAX_MB:-1600}
 
 root=$1
 [ -n "$root" ] || { echo "缺少 runtime 目录" >&2; exit 2; }

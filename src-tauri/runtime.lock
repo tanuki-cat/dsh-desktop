@@ -4,7 +4,7 @@
 # 新增/升级平台时：从 https://nodejs.org/dist/v<NODE_VERSION>/SHASUMS256.txt 抄对应行，
 # 保持与原文件逐字节一致（<sha256> + 两个空格 + 文件名），runtime-fetch 用 grep + cmp 比对。
 # 当前对应 NODE_VERSION = 24.22.2（Makefile 里的变量）。
-# 24 这条线是随 dsh 0.2.2-rc.1 一起来的：它声明 engines.node >= 24.9.0。
+# 24 这条线是随 dsh 0.2.2 线（rc.1/rc.2）一起来的：它声明 engines.node >= 24.9.0。
 aa9549349e47dffaa42dcf95d6e06ade8c4bdafc980979883b88767670df385a  node-v24.22.2-darwin-arm64.tar.gz
 d5e336d588c45be0c37dbd52cc29895593009ca4997a77a1fd02815131ed0e52  node-v24.22.2-darwin-x64.tar.gz
 48cc0e21e048790e54c0cf5749c2725005313d652651c40b7a21feb9697aaf75  node-v24.22.2-linux-x64.tar.xz

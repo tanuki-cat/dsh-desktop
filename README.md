@@ -234,8 +234,8 @@ Release、真实校验和清单与一次完整的下载 → 校验 → 落盘
 | `make icons` | 由 `icon.png` 重生成 `icon.icns` | 仅 macOS（`sips` + `iconutil`）；Linux 打包直接用 png |
 | `make icon-art` | 由 `src-tauri/icons/make_icon.py` 重绘 `icon.png` | 自绘小黑鲸，需 `python3` + Pillow；改设计改脚本，不要手改 png |
 | `make runtime-fetch` | 下载官方 Node，并**对照仓库里的 `src-tauri/runtime.lock`** 校验 SHA256 | 缓存到 `.runtime-cache/`（48 MB，可复用）；只校验下载来的 `SHASUMS256.txt` 挡不住清单被换 |
-| `make runtime-stage` | 组装 `src-tauri/runtime/`：Node + dsh 树 + pnpm + profile 模板 + 许可清单 | 约 **1.1 GB**（2026-10-28 实测 dsh 0.2.1-rc.4 + dshmarket 1.73.1：69,333 个文件 / 1086 MB，其中 dsh 树 856 MB）；先清空整个 `runtime/`（只留 README.md），再跑脚本自检 + 必需文件/悬空链接/**绝对链接**/quarantine/**文件数与体积**闸门 |
-| `make bundle-bundled` | `runtime-stage` + 打包 | 产出**无需预装 node/dsh** 的安装包（macOS `.app` 约等于随包运行时再加壳；2026-09-13 的 0.1.5 那代实测 598 MB，0.2.1-rc.4 的运行时本身已 1086 MB）；macOS 上额外把 `minimumSystemVersion` 覆盖为 **13.5**（随包 node 24.22.2 是 `minos 13.5`）。带 `TARGET=` 交叉编译时按**目标**架构 stage 运行时（`x86_64-apple-darwin` → darwin-x64） |
+| `make runtime-stage` | 组装 `src-tauri/runtime/`：Node + dsh 树 + pnpm + profile 模板 + 许可清单 | 约 **1.4 GB**（2026-11-12 实测 dsh 0.2.2-rc.2 + dshmarket 1.73.19，删除 dsh 树里的 source map 后：90,492 个文件 / 1480 MB，其中 dsh 树约 1.2 GB）；先清空整个 `runtime/`（只留 README.md），再跑脚本自检 + 必需文件/悬空链接/**绝对链接**/quarantine/**文件数与体积**闸门 |
+| `make bundle-bundled` | `runtime-stage` + 打包 | 产出**无需预装 node/dsh** 的安装包（macOS `.app` 约等于随包运行时再加壳；2026-09-13 的 0.1.5 那代实测 598 MB，0.2.2-rc.2 的运行时本身约 1.4 GB）；macOS 上额外把 `minimumSystemVersion` 覆盖为 **13.5**（随包 node 24.22.2 是 `minos 13.5`）。带 `TARGET=` 交叉编译时按**目标**架构 stage 运行时（`x86_64-apple-darwin` → darwin-x64） |
 | `make runtime-clean` | 回收 staging 与下载缓存 | 保留 `runtime/README.md` |
 | `make clean` | 清理构建产物 | `cargo clean` |
 | `make distclean` | 连依赖缓存一起清理 | 额外删 `node_modules`、`.pnpm-store`、`.cargo-home`、`src-tauri/gen` |
@@ -306,7 +306,7 @@ src-tauri/src/harness.rs        -> src-tauri/src/harness/tests.rs
   全新 DSH_HOME + 模板播种 → `dsh web` **6 秒**出 URL、stderr 干净、`.dsh-market` 出现；
 - 实测：`make bundle-bundled` 产出 598 MB 的 `.app`，包内 node 可直接执行、31,064 个文件；
   macOS 上还会用 `--config` 把 `minimumSystemVersion` 覆盖为 11.0（随包 node 是 `minos 11.0`）；
-- 模板随包钉住打包时的 `DSHMARKET_VERSION`（当前 1.73.17）：新机器首启播种该版本，之后由
+- 模板随包钉住打包时的 `DSHMARKET_VERSION`（当前 1.73.19）：新机器首启播种该版本，之后由
   插件市场自动更新跟到 registry 最新。
 
 **运行时解析已接进启动流程**（`src-tauri/src/runtime.rs` + `lib.rs::resolve_runtime`）：
@@ -375,6 +375,11 @@ src-tauri/src/harness.rs        -> src-tauri/src/harness/tests.rs
 行逐字相同，登录弹窗与 `dsh web authentication required` 围栏逐字相同；并用壳自己的命令行
 （随包 node + 播种的 profile）真跑通 `dsh web:` 与市场接口。正式版 `0.2.2` 仍与 `0.2.1` 一样
 需要单独验证。
+
+2026-11-12 按同一组契约验证了 `0.2.2-rc.2`：CLI、启动行、401 围栏、token 流程与
+`web-runtime` 行均未变；真正需要处理的是 rc.2 开始随包发布 `src/` 与 source map，staging 需要
+在安装后删除 `*.map`，并把体积闸门调到 1600 MB。详见
+[兼容性审查](docs/dsh-desktop-dsh-0.2.2-rc.2-compatibility-review.md)。
 
 启动 URL 的解析**不依赖**上游那行文案：优先按 `dsh web:` 前缀取第一个 token，前缀不在时就退化为
 「扫描行内第一个 loopback `http://127.0.0.1:…/?token=…`」，scheme/host/token query 仍然强校验。
@@ -636,9 +641,9 @@ pnpm tauri build --bundles app     # 产物：src-tauri/target/release/bundle/ma
 
 | 输入 | 默认 | 说明 |
 |---|---|---|
-| `dsh_version` | `0.2.2-rc.1` | 随包附带的 dsh 版本 |
+| `dsh_version` | `0.2.2-rc.2` | 随包附带的 dsh 版本 |
 | `node_version` | `24.22.2` | 随包附带的 Node 版本（dsh 0.2.2 声明 `engines.node >= 24.9.0`） |
-| `dshmarket_version` | `1.73.17` | 随包附带的插件市场版本（随 profile 模板播种） |
+| `dshmarket_version` | `1.73.19` | 随包附带的插件市场版本（随 profile 模板播种） |
 | `build_ref` | `main` | 从哪个分支/tag 构建 |
 | `attach_to_release` | 空 | 填一个已存在的 Release tag 就把 zip 一并传上去；留空只作为 workflow artifact |
 
@@ -718,7 +723,7 @@ Linux 侧能否在干净机器上启动尚未实机确认（见下节）。精�
 
 代价与做法（摘要）：
 
-- 解压后约 **1.15 GB / 75,799 个文件**（2026-11-11 实测 dsh 0.2.2-rc.1 + Node 24.22.2 + dshmarket 1.73.17：Node 199 + dsh 树 910 + tools 37 + 插件市场模板 6.6 MB + 壳 11 MB；0.1.5 那代是 490 MB），分发包随之变大；
+- 解压后约 **1.4 GB / 90,492 个文件**（2026-11-12 实测 dsh 0.2.2-rc.2 + Node 24.22.2 + dshmarket 1.73.19，删除 dsh 树里的 source map 后：Node 199 + dsh 树 1.2 GB + tools 37 + 插件市场模板 6.6 MB + 壳 11 MB；0.1.5 那代是 490 MB），分发包随之变大；
   自带运行时版本的最低系统版本要提到 **macOS 13.5**（实测 node 24.22.2 的 `minos 13.5`，壳自己声明的是 10.15）；
 - **只读 seed + 可写影子前缀**：seed 放在 `Contents/Resources/runtime/`，dsh 核心更新落到
   `app-data/runtime/prefix`（不写签名的 bundle）；

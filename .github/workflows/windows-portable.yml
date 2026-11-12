@@ -19,7 +19,7 @@ on:
         description: 随包附带的 dsh 版本
         required: false
         type: string
-        default: 0.2.2-rc.1
+        default: 0.2.2-rc.2
       node_version:
         description: 随包附带的 Node 版本
         required: false
@@ -29,7 +29,7 @@ on:
         description: 随包附带的插件市场 dshmarket 版本
         required: false
         type: string
-        default: 1.73.17
+        default: 1.73.19
       build_ref:
         description: 从哪个分支或 tag 构建
         required: false
@@ -47,7 +47,7 @@ on:
         description: 随包附带的 dsh 版本
         required: false
         type: string
-        default: 0.2.2-rc.1
+        default: 0.2.2-rc.2
       node_version:
         description: 随包附带的 Node 版本
         required: false
@@ -57,7 +57,7 @@ on:
         description: 随包附带的插件市场 dshmarket 版本
         required: false
         type: string
-        default: 1.73.17
+        default: 1.73.19
       build_ref:
         description: 从哪个分支或 tag 构建（release.yml 传 tag 名）
         required: false
