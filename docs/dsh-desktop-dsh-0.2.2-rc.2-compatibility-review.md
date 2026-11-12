@@ -195,4 +195,4 @@ DSH_RUNTIME_MAX_FILES=100000 DSH_RUNTIME_MAX_MB=1500 \
 - README 的版本、文件数、体积说明已同步；`runtime.lock` 注释更新；`THIRD-PARTY-NOTICES.md` 重新生成。
 - 验证：`make test-scripts` 通过；Makefile / stage-runtime.sh / windows-portable.yml 的三处版本一致性检查通过；用 staging 产物复跑 `--version` 为 `0.2.2-rc.2`，401/303/200 与 41,384 字节页面正常；市场模板为 `dshmarket@1.73.19`，`/dsh-market/status` 返回 `200`。
 
-未改：应用版本仍是 `0.5.1`；`release.yml` 中 v0.5.1 的历史发布说明未动；测试区间上界仍是 `< 0.2.2`，正式版 `0.2.2` 仍需单独验证。
+应用版本随本次发布升到 `0.5.2`，`release.yml` 的发版说明已换成 rc.2 的内容；测试区间上界仍是 `< 0.2.2`，正式版 `0.2.2` 仍需单独验证。
