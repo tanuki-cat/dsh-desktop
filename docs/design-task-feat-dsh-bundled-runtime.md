@@ -362,6 +362,10 @@ make runtime-clean     # 清理 staging（约 475MB）
 2. 若接受首启联网，可只带 Node、dsh 树改为首启从 registry 拉取（`.app` 降到 ~200 MB）——**但违背"离线首启"目标**，仅作为备选；
 3. 未来可用 `npm install --omit=dev --ignore-scripts` + 按平台过滤可选依赖做 CI 侧瘦身，需要逐平台验证启动。
 
+> **2026-11-13 更新**：上面第 1 条「不做手工裁剪」已被实测推翻——0.2.2-rc.2 的 dsh 树涨到 1.0 GB，
+> 其中 312 MB 的类型/TS 源码在运行时不参与解析，另有 393 MB 是同一份 zod 的 68 份副本。
+> 替代方案与实测数据见 `docs/design-task-fix-bundled-runtime-size.md`。本条保留为历史决策与理由。
+
 ---
 
 ## 7. 签名与公证（macOS）

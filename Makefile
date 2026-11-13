@@ -192,13 +192,17 @@ distclean: clean
 # 目标：在没有 node / dsh 的机器上双击即用。
 #   make runtime-fetch    下载官方 Node 并校验 SHASUMS256.txt
 #   make runtime-stage    组装 src-tauri/runtime/{node,dsh-prefix,tools,profile-template,THIRD-PARTY-NOTICES.md}
-#   make bundle-bundled   runtime-stage + 打包（.app 会带上整套运行时，约 1.4 GB）
+#   make bundle-bundled   runtime-stage + 打包（.app 会带上整套运行时，约 550 MB）
 #   make runtime-clean    回收 staging 与下载缓存
 # staging 必须按平台各自执行：dsh 树里有平台相关的原生模块。
+# 安装后按 docs/design-task-fix-bundled-runtime-size.md 的 P1+P2 裁剪：
+# 项目布局安装让 overrides 收敛 zod，prune-runtime.py 再删运行时不可达的载荷。
 NODE_VERSION      ?= 24.22.2
 DSH_VERSION       ?= 0.2.2-rc.2
 PNPM_VERSION      ?= 12.3.4
 DSHMARKET_VERSION ?= 1.73.19
+# 67 个 @deepseek-ai/* 精确 pin zod 4.6.6；保留覆盖变量，便于上游统一后快速对齐。
+DSH_ZOD_OVERRIDE  ?= 4.6.6
 RUNTIME_DIR       := $(TAURI_DIR)/runtime
 RUNTIME_CACHE     := .runtime-cache
 # 交叉编译时（TARGET 非空）必须按**目标**平台 staging：在 arm64 runner 上打 x64 包却塞进 arm64 的
@@ -220,6 +224,12 @@ endif
 ifneq ($(findstring windows,$(TARGET))$(filter windows,$(MAKECMDGOALS)),)
 NODE_OS           := win
 endif
+# prune-runtime.py 用 darwin/win32/linux 命名平台；staging 内部沿用 node 发行版的 win。
+ifneq ($(filter win,$(NODE_OS)),)
+PRUNE_PLATFORM    := win32
+else
+PRUNE_PLATFORM    := $(NODE_OS)
+endif
 ifeq ($(NODE_OS),win)
 NODE_TARBALL      := node-v$(NODE_VERSION)-win-$(NODE_ARCH).zip
 else ifeq ($(NODE_OS),darwin)
@@ -232,7 +242,7 @@ NODE_BASE_URL     := https://nodejs.org/dist/v$(NODE_VERSION)
 NODE_BIN          := $(abspath $(RUNTIME_DIR))/node/bin
 RUNTIME_LOCK      := $(TAURI_DIR)/runtime.lock
 
-# 自带运行时版才声明 resources：普通 `make bundle`（精简版）不该把 1.4 GB 的 staging 打进包 ——
+# 自带运行时版才声明 resources：普通 `make bundle`（精简版）不该把整份 staging（约 550 MB）打进包 ——
 # 这正是桌面壳审查 §10 记过的陷阱（bundle.resources 常开 + 残留 payload = 静默变胖）。
 ifeq ($(PLATFORM),macos)
 # macOS 上还要声明 13.5：随包的 node 24.22.2 是 minos 13.5（node 22 时代是 11.0），
@@ -269,21 +279,28 @@ runtime-stage: runtime-fetch
 	@if [ "$(NODE_OS)" = win ]; then unzip -q $(RUNTIME_CACHE)/$(NODE_TARBALL) -d $(RUNTIME_CACHE)/unpacked; \
 	else tar -xf $(RUNTIME_CACHE)/$(NODE_TARBALL) -C $(RUNTIME_CACHE)/unpacked; fi
 	@mv $(RUNTIME_CACHE)/unpacked/$(NODE_DIST_NAME) $(RUNTIME_DIR)/node
-	@echo "安装 dsh $(DSH_VERSION) 到 dsh-prefix …"
-	@PATH="$(NODE_BIN):$$PATH" $(RUNTIME_DIR)/node/bin/npm install -g --prefix $(RUNTIME_DIR)/dsh-prefix \
-		--cache $(RUNTIME_CACHE)/npm --no-fund --no-audit --loglevel=error @deepseek-ai/dsh@$(DSH_VERSION)
-	@echo "删除 dsh 树里的 source map（0.2.2-rc.2 起随包发布，运行时不需要）…"
-	@find $(RUNTIME_DIR)/dsh-prefix -name '*.map' -type f -delete
+	@echo "安装 dsh $(DSH_VERSION) 到 dsh-prefix（项目布局，overrides.zod=$(DSH_ZOD_OVERRIDE)）…"
+	@# 项目布局是为了让 npm 能应用 overrides：67 个包精确 pin zod 4.6.6，全局安装会为
+	@# 每个包各装一份（68 份 / 393 MB）。布局仍是 <prefix>/lib/node_modules，运行时和闸门都认。
+	@mkdir -p $(RUNTIME_DIR)/dsh-prefix/lib
+	@printf '%s\n' '{"name":"dsh-bundled-runtime","private":true,"version":"0.0.0","dependencies":{"@deepseek-ai/dsh":"$(DSH_VERSION)"},"overrides":{"zod":"$(DSH_ZOD_OVERRIDE)"}}' \
+		> $(RUNTIME_DIR)/dsh-prefix/lib/package.json
+	@cd $(RUNTIME_DIR)/dsh-prefix/lib && PATH="$(NODE_BIN):$$PATH" npm install --omit=dev \
+		--cache $(abspath $(RUNTIME_CACHE))/npm --no-fund --no-audit --loglevel=error
 	@echo "安装 pnpm $(PNPM_VERSION) 到 tools …"
 	@PATH="$(NODE_BIN):$$PATH" $(RUNTIME_DIR)/node/bin/npm install -g --prefix $(RUNTIME_DIR)/tools \
-		--cache $(RUNTIME_CACHE)/npm --no-fund --no-audit --loglevel=error pnpm@$(PNPM_VERSION)
+		--cache $(abspath $(RUNTIME_CACHE))/npm --no-fund --no-audit --loglevel=error pnpm@$(PNPM_VERSION)
 	@echo "生成 profile 模板（含插件市场 dshmarket@$(DSHMARKET_VERSION)）…"
+	@# tools/bin 必须传绝对路径：make-profile-template.sh 会 cd 进模板目录，相对 PATH 条目失效，
+	@# 模板就会用系统 pnpm 生成（与随包的 12.3.4 不一致）。store 同理，相对路径会落进产物。
 	@PATH="$(NODE_BIN):$$PATH" PNPM_STORE_DIR="$(abspath $(RUNTIME_CACHE))/pnpm-store" \
 		sh scripts/make-profile-template.sh \
-		"$(RUNTIME_DIR)/profile-template" "$(DSHMARKET_VERSION)" "$(RUNTIME_DIR)/tools/bin"
+		"$(RUNTIME_DIR)/profile-template" "$(DSHMARKET_VERSION)" "$(abspath $(RUNTIME_DIR)/tools/bin)"
+	@echo "裁剪运行时不可达载荷（类型/源码/pdb/外平台 prebuild/node 头文件/pnpm 重复）…"
+	@$(PYTHON) scripts/prune-runtime.py $(RUNTIME_DIR) --platform $(PRUNE_PLATFORM) --arch $(NODE_ARCH)
 	@xattr -cr $(RUNTIME_DIR) 2>/dev/null || true
 	@$(PYTHON) scripts/write_third_party_notices.py "$(RUNTIME_DIR)" "$(NODE_VERSION)" "$(DSH_VERSION)" "$(PNPM_VERSION)" "$(DSHMARKET_VERSION)"
-	@DSH_RUNTIME_MAX_FILES=100000 DSH_RUNTIME_MAX_MB=1600 sh scripts/check-runtime-stage.sh "$(RUNTIME_DIR)"
+	@sh scripts/check-runtime-stage.sh "$(RUNTIME_DIR)"
 	@du -sh $(RUNTIME_DIR) 2>/dev/null || true
 
 # 打包"无需预装 node/dsh"的版本：bundle.resources 会把 runtime/ 一起塞进 .app。

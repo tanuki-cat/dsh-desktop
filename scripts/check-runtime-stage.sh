@@ -27,15 +27,41 @@ set -eu
 #   0.2.2-rc.2  2026-11-12 本机实测（macOS arm64，删除 dsh 树里的 *.map 后）：
 #               90,492 个文件 / 1480 MB（dsh 树 1.2 GB + node 199 MB + tools 37 MB +
 #               模板 6.6 MB）；map 是 rc.2 起随包发布的调试资源，运行时不需要。
-# 因此文件数上限按最近一次实测留约 10% 余量、体积上限 1600 MB（约 8% 余量）：少一棵树
-# （仅 dsh-prefix 就九万文件）或多出一个平台的 payload 仍会明显偏出，而"往 staging 里多放
-# 两万个文件"正是方案 §5（v3.1 第 4 条）实测过的漏网场景。换 dsh 大版本后按实测值重新收紧。
-min_files=${DSH_RUNTIME_MIN_FILES:-20000}
-max_files=${DSH_RUNTIME_MAX_FILES:-100000}
-max_mb=${DSH_RUNTIME_MAX_MB:-1600}
+#   2026-11-13  P1+P2（类型/源码/pdb/外平台 prebuild/node 头文件/pnpm 重复 + zod 去重）：
+#               macOS arm64 实测 18,859 文件 / 537 MB（文件字节）/ 590 MB（du 块占用）。
+#               Linux 必须保留 LibreOffice wasm（没有原生包），预计多约 145 MB，所以
+#               Linux 的体积上限单独放宽到 800 MB；P3（office/语音/inspector 按需）未实施，
+#               实施后按新实测值继续收紧。
+# 上限的意义是"拦住混进来的东西"，不是"描述上游多大"：多一棵树（dsh-prefix 就一万多文件）
+# 或多出一个平台的 payload 仍会明显偏出。换 dsh 大版本后按实测值重新收紧。
+min_files=${DSH_RUNTIME_MIN_FILES:-12000}
+max_files=${DSH_RUNTIME_MAX_FILES:-40000}
 
 root=$1
 [ -n "$root" ] || { echo "缺少 runtime 目录" >&2; exit 2; }
+
+# 目标平台：staging 在哪台机器上跑就按哪台判定（交叉编译由调用方用 DSH_RUNTIME_PLATFORM 指定）。
+platform=${DSH_RUNTIME_PLATFORM:-}
+if [ -z "$platform" ]; then
+  case "$(uname -s)" in
+    Darwin) platform=darwin ;;
+    Linux) platform=linux ;;
+    MINGW*|MSYS*|CYGWIN*) platform=win32 ;;
+    *) platform=unknown ;;
+  esac
+fi
+case "$platform" in
+  win|windows) platform=win32 ;;
+esac
+
+# Linux 多一份 LibreOffice wasm（约 145 MB），其余平台走原生引擎。
+if [ -n "${DSH_RUNTIME_MAX_MB:-}" ]; then
+  max_mb=$DSH_RUNTIME_MAX_MB
+elif [ "$platform" = "linux" ]; then
+  max_mb=800
+else
+  max_mb=700
+fi
 
 fail=0
 missing=""
@@ -147,6 +173,96 @@ if command -v xattr >/dev/null 2>&1; then
     echo "  [ok]   无 quarantine 属性"
   fi
 fi
+
+# 裁剪规则闸门（docs/design-task-fix-bundled-runtime-size.md 第 5 节）：规则一旦失效，体积会
+# 静默回到 1.2 GB，而"能启动"看不出来 —— 类型/源码文件运行时根本不会被加载。
+echo "裁剪规则："
+prune_ok() { echo "  [ok]   $1"; }
+prune_bad() { echo "  [坏]   $1" >&2; fail=1; }
+
+# 白名单：被运行时条件引用的少量 .ts 由 prune-runtime.py 保留（实测 5 个）。
+types_count=$(find "$root" -type f \( -name '*.d.ts' -o -name '*.d.cts' -o -name '*.d.mts' \
+  -o -name '*.ts' -o -name '*.mts' -o -name '*.cts' -o -name '*.tsx' \) 2>/dev/null | wc -l | tr -d ' ')
+echo "类型/源码  : ${types_count} 个文件（白名单上限 20）"
+if [ "$types_count" -le 20 ]; then
+  prune_ok "类型声明与 TS 源码已裁剪"
+else
+  prune_bad "还有 ${types_count} 个类型/TS 源码文件：prune-runtime.py 没跑，或白名单失效"
+fi
+
+pdb_count=$(find "$root" -type f -name '*.pdb' 2>/dev/null | wc -l | tr -d ' ')
+if [ "$pdb_count" = "0" ]; then
+  prune_ok "无 *.pdb"
+else
+  prune_bad "仍有 ${pdb_count} 个 *.pdb（R3 未生效）"
+fi
+
+map_count=$(find "$root" -type f -name '*.map' 2>/dev/null | wc -l | tr -d ' ')
+if [ "$map_count" = "0" ]; then
+  prune_ok "无 *.map"
+else
+  prune_bad "仍有 ${map_count} 个 *.map（R8 未生效）"
+fi
+
+if [ "${DSH_RUNTIME_KEEP_NODE_HEADERS:-0}" = "1" ]; then
+  echo "  [skip] node/include（DSH_RUNTIME_KEEP_NODE_HEADERS=1）"
+elif [ -d "$root/node/include" ]; then
+  prune_bad "node/include 仍在（R5 未生效）"
+else
+  prune_ok "无 node/include"
+fi
+
+if [ "$platform" = "win32" ]; then
+  # Windows 的 pnpm 入口布局（.cmd shim 还是硬链接的 exe）没法在 macOS/Linux 上验证，
+  # 删错会让插件安装直接 127。R6 只在检测到 >1 MB 启动器时才动手，这里也不做强求。
+  echo "  [skip] @pnpm/exe-*（Windows 入口布局未验证，见方案 R6）"
+else
+  pnpm_dupes=$(find "$root/tools" -type d -name 'exe.*' 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$pnpm_dupes" = "0" ]; then
+    prune_ok "无 @pnpm/exe-* 重复载荷"
+  else
+    prune_bad "仍有 ${pnpm_dupes} 个 @pnpm/exe-* 目录（R6 未生效）"
+  fi
+fi
+
+zod_count=$(find "$root/dsh-prefix" -type d -name zod ! -path '*/zod/*' 2>/dev/null | wc -l | tr -d ' ')
+echo "zod 副本   : ${zod_count} 份（必须为 1）"
+if [ "$zod_count" = "1" ]; then
+  prune_ok "zod 已去重（overrides 生效）"
+else
+  prune_bad "zod 副本 ${zod_count} 份：项目布局/overrides 未生效，或上游依赖树变了"
+fi
+
+wasm_count=$(find "$root/dsh-prefix" -type d -name 'libreoffice-kit-wasm' 2>/dev/null | wc -l | tr -d ' ')
+case "$platform" in
+  linux)
+    if [ "$wasm_count" = "1" ]; then
+      prune_ok "保留 LibreOffice wasm（Linux 没有原生引擎）"
+    else
+      prune_bad "Linux 缺少 libreoffice-kit-wasm：office 转换全部不可用"
+    fi
+    linux_native=$(find "$root/dsh-prefix" -type d -name 'libreoffice-kit-linux-*' 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$linux_native" != "0" ]; then
+      prune_bad "Linux 不应带原生 LibreOffice 包"
+    fi
+    ;;
+  darwin|win32)
+    if [ "$wasm_count" = "0" ]; then
+      prune_ok "未带 LibreOffice wasm（走原生引擎）"
+    else
+      prune_bad "${platform} 仍有 libreoffice-kit-wasm（R7 未生效）"
+    fi
+    native_lo=$(find "$root/dsh-prefix" -type d -name "libreoffice-kit-${platform}-*" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$native_lo" -ge 1 ]; then
+      prune_ok "原生 LibreOffice 引擎存在"
+    else
+      prune_bad "缺少原生 LibreOffice 引擎：R7 删了 wasm，office 会全坏"
+    fi
+    ;;
+  *)
+    echo "  [skip] 未知平台 ${platform}，跳过 LibreOffice 检查"
+    ;;
+esac
 
 # 文件数与体积闸门：staging 残留会被 bundle.resources 静默打进包（实测 20,000 个文件 / 78 MB
 # 也不会报错），所以这里必须自己兜住。

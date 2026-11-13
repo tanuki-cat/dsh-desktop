@@ -14,7 +14,8 @@ gate=$(cd "$here/.." && pwd)/check-runtime-stage.sh
 # 两条实测过的失效路径各造一个反例，避免闸门再被无声地绕过（review P0-1 / P1-9）。
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-loose="DSH_RUNTIME_MIN_FILES=0 DSH_RUNTIME_MAX_FILES=99999999 DSH_RUNTIME_MAX_MB=99999"
+# 固定成 darwin：原生 LibreOffice 包与 wasm 的取舍随平台不同，测试要可移植地只验一条分支。
+loose="DSH_RUNTIME_MIN_FILES=0 DSH_RUNTIME_MAX_FILES=99999999 DSH_RUNTIME_MAX_MB=99999 DSH_RUNTIME_PLATFORM=darwin"
 
 mkdir -p "$tmp/missing/node/bin"
 printf '#!/bin/sh\necho v0.0.0\n' > "$tmp/missing/node/bin/node"
@@ -41,6 +42,11 @@ printf '#!/bin/sh\n' > "$full/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/lib/b
 : > "$full/profile-template/pnpm-lock.yaml"
 : > "$full/THIRD-PARTY-NOTICES.md"
 chmod +x "$full/tools/bin/pnpm"
+# P1+P2 之后 staging 的最低要求：单份 zod、macOS 走原生 LibreOffice 引擎。
+mkdir -p "$full/dsh-prefix/lib/node_modules/zod" \
+  "$full/dsh-prefix/lib/node_modules/@deepseek-ai/libreoffice-kit-darwin-arm64"
+: > "$full/dsh-prefix/lib/node_modules/zod/package.json"
+: > "$full/dsh-prefix/lib/node_modules/@deepseek-ai/libreoffice-kit-darwin-arm64/package.json"
 
 # 每条闸门各造一个反例：闸门失效是无声的，只有"必须失败"的用例能证明它还在工作。
 # $1 是反例名称，$2 是造出该状态后必须让闸门失败的说明。
@@ -104,7 +110,42 @@ env DSH_RUNTIME_MIN_FILES=0 DSH_RUNTIME_MAX_FILES=99999999 DSH_RUNTIME_MAX_MB=0 
 }
 rm -f "$full/node/bin/ballast"
 
-# 7) quarantine：只在有 xattr 的平台上可造（macOS）。
+# 7) 裁剪规则（docs/design-task-fix-bundled-runtime-size.md P1+P2）：规则失效时体积会静默
+#    回到 1.2 GB，而这几个检查是唯一能拦住它的地方。
+mkdir -p "$full/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/node_modules/zod"
+: > "$full/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/node_modules/zod/package.json"
+expect_fail "第二份 zod" "override 失效会重新带回 393 MB 副本"
+rm -rf "$full/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/node_modules"
+
+mkdir -p "$full/dsh-prefix/lib/node_modules/@deepseek-ai/libreoffice-kit-wasm"
+expect_fail "macOS 仍带 wasm 引擎" "wasm 与原生引擎同时随包会多 145 MB"
+rm -rf "$full/dsh-prefix/lib/node_modules/@deepseek-ai/libreoffice-kit-wasm"
+
+mv "$full/dsh-prefix/lib/node_modules/@deepseek-ai/libreoffice-kit-darwin-arm64" "$tmp/native-lo"
+expect_fail "缺原生 LibreOffice 引擎" "删了 wasm 又没有原生包时 office 全坏"
+mv "$tmp/native-lo" "$full/dsh-prefix/lib/node_modules/@deepseek-ai/libreoffice-kit-darwin-arm64"
+
+mkdir -p "$full/node/include/node"
+expect_fail "node/include 仍在" "C 头文件会让包大 58 MB"
+rm -rf "$full/node/include"
+
+: > "$full/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/leftover.pdb"
+expect_fail "残留 *.pdb" "Windows 调试符号会让包大 20 MB"
+rm -f "$full/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/leftover.pdb"
+
+mkdir -p "$full/tools/lib/node_modules/pnpm/node_modules/@pnpm/exe.darwin-arm64"
+expect_fail "@pnpm/exe 重复载荷" "同一份 33.8 MB 二进制会进包两次"
+rm -rf "$full/tools/lib/node_modules/pnpm"
+
+i=0
+while [ "$i" -lt 25 ]; do
+  : > "$full/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/src-$i.ts"
+  i=$((i + 1))
+done
+expect_fail "未裁剪的类型/TS 源码" "prune 没跑时体积会回到 1.2 GB"
+rm -f "$full/dsh-prefix/lib/node_modules/@deepseek-ai/dsh/src-"*.ts
+
+# 8) quarantine：只在有 xattr 的平台上可造（macOS）。
 if command -v xattr >/dev/null 2>&1; then
   xattr -w com.apple.quarantine "0081;00000000;test;" "$full/node/bin/node" 2>/dev/null || true
   if xattr "$full/node/bin/node" 2>/dev/null | grep -q quarantine; then

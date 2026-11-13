@@ -4,7 +4,11 @@
 # 用法: NODE_OS=win NODE_ARCH=x64 sh scripts/stage-runtime.sh <runtime 目录>
 #
 # 可覆盖：NODE_VERSION / NODE_OS / NODE_ARCH / DSH_VERSION / PNPM_VERSION /
-#         DSHMARKET_VERSION / CACHE_DIR / PYTHON
+#         DSHMARKET_VERSION / DSH_ZOD_OVERRIDE / CACHE_DIR / PYTHON
+#
+# 安装完 dsh 后先按 docs/design-task-fix-bundled-runtime-size.md 的 P1 规则裁剪
+# （类型声明 / TS 源码 / *.pdb / 外平台 prebuild / node 头文件 / pnpm 重复二进制 /
+# mac+win 的 LibreOffice wasm），再生成许可清单并过闸门。
 #
 # 与 Makefile 里的 runtime-stage 等价，但**不依赖 make**，因此能在 Windows 的 Git Bash 里跑：
 # 原生安装是唯一能拿到正确平台原生模块的方式（在 macOS 上用 --os=win32 装 koffi 会去编译，
@@ -16,6 +20,9 @@ node_version=${NODE_VERSION:-24.22.2}
 dsh_version=${DSH_VERSION:-0.2.2-rc.2}
 pnpm_version=${PNPM_VERSION:-12.3.4}
 dshmarket_version=${DSHMARKET_VERSION:-1.73.19}
+# 67 个 @deepseek-ai/* 包精确 pin zod 4.6.6，而 npm 全局安装没有 overrides，会为每个包
+# 各装一份（实测 68 份 / 393 MB）；项目布局安装 + 这个 override 才能收敛成一份。
+zod_override=${DSH_ZOD_OVERRIDE:-4.6.6}
 cache=${CACHE_DIR:-.runtime-cache}
 python=${PYTHON:-python3}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -47,6 +54,9 @@ esac
 base_url="https://nodejs.org/dist/v$node_version"
 
 mkdir -p "$cache"
+# npm 的 --cache 与 pnpm 的 --store-dir 都按**当前目录**解析相对路径：本脚本后面会 cd 进
+# dsh-prefix/lib 做项目安装，相对路径会把缓存写到产物里（review #12 的同类问题）。
+cache=$(cd "$cache" && pwd)
 if [ ! -f "$cache/$tarball" ]; then
   echo "下载 $tarball"
   curl -fsSL -o "$cache/$tarball" "$base_url/$tarball"
@@ -74,6 +84,8 @@ case "$node_os" in
   win) unzip -q "$cache/$tarball" -d "$cache/unpacked" ;;
   *) tar -xf "$cache/$tarball" -C "$cache/unpacked" ;;
 esac
+# 下面要在 dsh-prefix/lib 里 cd 安装，$out 若是相对路径会指错地方。
+out=$(cd "$out" && pwd)
 mv "$cache/unpacked/$dist" "$out/node"
 
 # 用自带 node 跑它自带的 npm：不依赖 PATH，也不依赖平台的 shim 脚本。
@@ -84,12 +96,26 @@ npm_cli=$out/node/lib/node_modules/npm/bin/npm-cli.js
 [ -f "$npm_cli" ] || npm_cli=$out/node/node_modules/npm/bin/npm-cli.js
 [ -f "$npm_cli" ] || { echo "自带 npm 不存在: $out/node" >&2; exit 3; }
 
-echo "安装 dsh $dsh_version 到 dsh-prefix"
-"$node_bin" "$npm_cli" install -g --prefix "$out/dsh-prefix" \
-  --cache "$cache/npm" --no-fund --no-audit --loglevel=error "@deepseek-ai/dsh@$dsh_version"
-
-echo "删除 dsh 树里的 source map（0.2.2-rc.2 起随包发布，运行时不需要）"
-find "$out/dsh-prefix" -name '*.map' -type f -delete
+echo "安装 dsh $dsh_version 到 dsh-prefix（项目布局，overrides.zod=${zod_override}）"
+# 项目布局（<prefix>/lib/node_modules）与原来的全局前缀一致：src-tauri/src/lib.rs 的
+# DSH_JS_SUFFIXES 两项都认，check-runtime-stage.sh 检查的路径也不变。区别只是多了一个
+# package.json，让 npm 能应用 overrides。
+mkdir -p "$out/dsh-prefix/lib"
+cat > "$out/dsh-prefix/lib/package.json" <<JSON
+{
+  "name": "dsh-bundled-runtime",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "@deepseek-ai/dsh": "$dsh_version"
+  },
+  "overrides": {
+    "zod": "$zod_override"
+  }
+}
+JSON
+(cd "$out/dsh-prefix/lib" && "$node_bin" "$npm_cli" install --omit=dev \
+  --cache "$cache/npm" --no-fund --no-audit --loglevel=error)
 
 echo "安装 pnpm $pnpm_version 到 tools"
 "$node_bin" "$npm_cli" install -g --prefix "$out/tools" \
@@ -114,6 +140,13 @@ tools_bin="$out/tools/bin"
 node_dir=$(cd "$(dirname "$node_bin")" && pwd)
 PATH="$node_dir:$PATH" PNPM_STORE_DIR="$store_dir" sh "$here/make-profile-template.sh" \
   "$out/profile-template" "$dshmarket_version" "$tools_bin"
+
+echo "裁剪运行时不可达载荷（类型/源码/pdb/外平台 prebuild/node 头文件/pnpm 重复）"
+prune_platform=$node_os
+if [ "$prune_platform" = win ]; then
+  prune_platform=win32
+fi
+"$python" "$here/prune-runtime.py" "$out" --platform "$prune_platform" --arch "$node_arch"
 
 if command -v xattr >/dev/null 2>&1; then
   xattr -cr "$out" 2>/dev/null || true
