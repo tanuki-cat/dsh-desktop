@@ -117,6 +117,48 @@ impl Choice {
     }
 }
 
+/// Where the application bundle lives, given the running executable.
+///
+/// Finder draws the icon of the .app directory, not of the binary inside it, so that directory is
+/// the only path worth changing. A development build (target/debug/dsh-desktop) has no bundle:
+/// there is nothing for Finder to redraw, and the caller skips the sync instead of inventing a
+/// path.
+pub fn bundle_path(exe: &Path) -> Option<&Path> {
+    exe.ancestors().find(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().ends_with(".app"))
+            .unwrap_or(false)
+    })
+}
+
+/// What the bundle's Finder icon should do for one choice.
+///
+/// Separate from the AppKit call so the policy is testable on every platform: choosing 默认 is a
+/// request to clear a custom icon, while merely starting with 默认 must leave whatever the user
+/// set in Finder alone — rewriting the bundle on every launch would otherwise erase it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinderSync {
+    /// Leave the bundle's icon as it is.
+    Skip,
+    /// Draw the chosen artwork on the bundle, replacing whatever is there.
+    Set,
+    /// Draw it only when the bundle has no custom icon yet: a relaunch must not rewrite it on
+    /// every start, and an icon the user set in Finder by hand stays theirs.
+    SetIfMissing,
+    /// Remove the custom icon so Finder shows the bundle's own artwork.
+    Clear,
+}
+
+/// The Finder action for a choice; explicit is whether the user just picked it.
+pub fn finder_sync(choice: Choice, explicit: bool) -> FinderSync {
+    match choice {
+        Choice::Default if explicit => FinderSync::Clear,
+        Choice::Default => FinderSync::Skip,
+        _ if explicit => FinderSync::Set,
+        _ => FinderSync::SetIfMissing,
+    }
+}
+
 /// The choice the running process is wearing.
 ///
 /// A process-wide cell rather than a read of `appearance.json` at the point of use: the menu is
@@ -457,6 +499,13 @@ pub fn bytes_for(data_dir: &Path, choice: Choice) -> Result<Vec<u8>, String> {
 /// Best effort by design: a window that refuses an icon, or a platform with no such surface, must
 /// not stop the shell from starting. What went wrong is logged and the previous icon stays.
 pub fn apply(app: &tauri::AppHandle, data_dir: &Path, choice: Choice) {
+    // A launch re-draws the runtime icon. The Finder copy is only touched when the choice is not
+    // the default, so an icon the user set in Finder by hand survives an ordinary start.
+    apply_with(app, data_dir, choice, finder_sync(choice, false));
+}
+
+/// Draw a choice on the runtime surfaces and, on macOS, keep the bundle's Finder icon in step.
+fn apply_with(app: &tauri::AppHandle, data_dir: &Path, choice: Choice, finder: FinderSync) {
     let bytes = match bytes_for(data_dir, choice) {
         Ok(bytes) => bytes,
         Err(reason) => {
@@ -475,18 +524,25 @@ pub fn apply(app: &tauri::AppHandle, data_dir: &Path, choice: Choice) {
     #[cfg(target_os = "macos")]
     {
         // AppKit may only be called from the main thread, and the startup path reaches this from
-        // a worker: the work is posted to the event loop rather than performed here.
+        // a worker: the work is posted to the event loop rather than performed here. The bundle
+        // path is resolved here because current_exe is cheap and the closure only needs the
+        // answer, not another thread-local read.
+        let bundle = std::env::current_exe()
+            .ok()
+            .as_deref()
+            .and_then(bundle_path)
+            .map(Path::to_path_buf);
         let pixels = rgba.pixels.clone();
         let side = rgba.width;
         match app.run_on_main_thread(move || {
-            if let Err(reason) = set_dock_icon(&pixels, side) {
-                harness::app_log(&format!("设置 Dock 图标失败: {reason}"));
-            }
+            apply_macos_icons(&pixels, side, bundle.as_deref(), finder);
         }) {
             Ok(()) => {}
             Err(error) => harness::app_log(&format!("无法把图标设置投递到主线程: {error}")),
         }
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = finder;
 
     // Windows and Linux draw the icon from the window itself. macOS ignores this call (its
     // windows carry no icon), so it is made on every platform for the ones that use it. The
@@ -520,20 +576,22 @@ pub fn premultiply_rgba(pixels: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Replace the Dock icon with `rgba` (row-major, `side` x `side`). Main thread only.
+/// Build the AppKit image an icon is drawn from. Main thread only (it creates AppKit objects).
 #[cfg(target_os = "macos")]
-pub fn set_dock_icon(rgba: &[u8], side: u32) -> Result<(), String> {
+fn icon_image(
+    rgba: &[u8],
+    side: u32,
+) -> Result<objc2::rc::Retained<objc2_app_kit::NSImage>, String> {
     use objc2::rc::Retained;
-    use objc2::{AnyThread, MainThreadMarker};
-    use objc2_app_kit::{NSApplication, NSBitmapImageRep, NSCalibratedRGBColorSpace, NSImage};
+    use objc2::AnyThread;
+    use objc2_app_kit::{NSBitmapImageRep, NSCalibratedRGBColorSpace, NSImage};
     use objc2_foundation::NSSize;
 
     if side == 0 || rgba.len() != (side as usize) * (side as usize) * 4 {
         return Err("图标像素数据与尺寸不一致".to_string());
     }
-    let mtm = MainThreadMarker::new().ok_or("设置应用图标必须在主线程进行")?;
     // The bitmap is allocated with no plane pointer, so its buffer lives inside the object and
-    // is filled through `bitmapData` afterwards: the initialiser below is only asked for an
+    // is filled through bitmapData afterwards: the initialiser below is only asked for an
     // 8-bit RGBA storage of the right shape.
     let rep: Retained<NSBitmapImageRep> = unsafe {
         NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
@@ -562,9 +620,92 @@ pub fn set_dock_icon(rgba: &[u8], side: u32) -> Result<(), String> {
     let image = NSImage::initWithSize(NSImage::alloc(), NSSize::new(side as f64, side as f64));
     image.addRepresentation(&rep);
     image.setSize(NSSize::new(side as f64, side as f64));
-    let application = NSApplication::sharedApplication(mtm);
-    unsafe { application.setApplicationIconImage(Some(&image)) };
+    Ok(image)
+}
+
+/// Replace the Dock icon. Main thread only.
+#[cfg(target_os = "macos")]
+fn set_application_icon(image: &objc2_app_kit::NSImage) -> Result<(), String> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    let mtm = MainThreadMarker::new().ok_or("设置应用图标必须在主线程进行")?;
+    unsafe {
+        NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(image));
+    }
     Ok(())
+}
+
+/// Point Finder at the image for the bundle, or remove the custom icon when it is None.
+///
+/// NSWorkspace writes the custom-icon resource Finder itself uses (an Icon file plus the
+/// FinderInfo flag), so the bundle's .icns is never rewritten and the code signature of the
+/// shipped resources is untouched. Main thread only in practice: it is Finder's own UI state,
+/// and every caller already runs there for the Dock icon.
+#[cfg(target_os = "macos")]
+fn set_finder_icon(image: Option<&objc2_app_kit::NSImage>, bundle: &Path) -> Result<(), String> {
+    use objc2_app_kit::{NSWorkspace, NSWorkspaceIconCreationOptions};
+    use objc2_foundation::NSString;
+
+    let workspace = NSWorkspace::sharedWorkspace();
+    let path = NSString::from_str(&bundle.to_string_lossy());
+    if workspace.setIcon_forFile_options(image, &path, NSWorkspaceIconCreationOptions::empty()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Finder 没有接受 {}（目录只读或不可写）",
+            bundle.display()
+        ))
+    }
+}
+
+/// Whether the bundle already carries a Finder custom icon.
+///
+/// `NSWorkspace` writes an `Icon\r` file at the bundle root; its presence is the same fact
+/// Finder uses to prefer the custom artwork, and checking it is how a relaunch avoids rewriting
+/// the bundle (and avoids clobbering an icon the user set by hand).
+#[cfg(target_os = "macos")]
+fn has_custom_icon(bundle: &Path) -> bool {
+    bundle.join("Icon\r").is_file()
+}
+
+/// Apply both macOS surfaces from one decoded icon.
+///
+/// The Dock goes first: it is the surface the user is looking at, and a bundle that refuses the
+/// Finder icon (read-only /Applications, a DMG mount) must not take the Dock icon down with it.
+#[cfg(target_os = "macos")]
+fn apply_macos_icons(rgba: &[u8], side: u32, bundle: Option<&Path>, finder: FinderSync) {
+    let image = match icon_image(rgba, side) {
+        Ok(image) => image,
+        Err(reason) => {
+            harness::app_log(&format!("设置 Dock 图标失败: {reason}"));
+            return;
+        }
+    };
+    if let Err(reason) = set_application_icon(&image) {
+        harness::app_log(&format!("设置 Dock 图标失败: {reason}"));
+    }
+    if finder == FinderSync::Skip {
+        return;
+    }
+    let Some(bundle) = bundle else {
+        // cargo run / tauri dev: there is no .app for Finder to redraw. Only an explicit pick
+        // says so; a startup pass would repeat it on every window creation.
+        if finder == FinderSync::Set {
+            harness::app_log("当前不是 .app 包，跳过 Finder 图标同步");
+        }
+        return;
+    };
+    let icon = match finder {
+        FinderSync::Set => Some(&*image),
+        FinderSync::Clear => None,
+        FinderSync::SetIfMissing if !has_custom_icon(bundle) => Some(&*image),
+        FinderSync::SetIfMissing | FinderSync::Skip => return,
+    };
+    if let Err(reason) = set_finder_icon(icon, bundle) {
+        harness::app_log(&format!(
+            "同步 Finder 图标失败（Dock 图标已更新）: {reason}"
+        ));
+    }
 }
 
 /// Switch to `choice`, persist it, and draw it.
@@ -573,7 +714,8 @@ pub fn select(app: &tauri::AppHandle, data_dir: &Path, choice: Choice) -> Result
     appearance.icon = choice;
     save(data_dir, &appearance)?;
     remember(choice);
-    apply(app, data_dir, choice);
+    // An explicit choice is also the only time 默认 clears a Finder custom icon.
+    apply_with(app, data_dir, choice, finder_sync(choice, true));
     harness::app_log(&format!("应用图标切换为 {}", choice.key()));
     Ok(())
 }
@@ -582,7 +724,15 @@ pub fn select(app: &tauri::AppHandle, data_dir: &Path, choice: Choice) -> Result
 pub fn restore(app: &tauri::AppHandle, data_dir: &Path) {
     let appearance = load(data_dir);
     remember(appearance.icon);
-    apply(app, data_dir, appearance.icon);
+    // A relaunch after an app update has a fresh bundle with no custom icon: a non-default choice
+    // fills that gap here. 默认 leaves the bundle alone, and an existing custom icon is not
+    // rewritten on every start (see finder_sync).
+    apply_with(
+        app,
+        data_dir,
+        appearance.icon,
+        finder_sync(appearance.icon, false),
+    );
     if appearance.icon != Choice::Default {
         harness::app_log(&format!("已应用保存的图标: {}", appearance.icon.key()));
     }

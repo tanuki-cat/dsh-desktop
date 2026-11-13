@@ -41,7 +41,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 # `NSOpenPanel` picks the custom icon file; `NSImage` + `NSBitmapImageRep` +
 # `NSApplication.setApplicationIconImage` are the only way to change the Dock icon of a running
 # app. `NSBitmapImageRep` builds the image from the RGBA the PNG decoder produced, so the icon
-# path and the file picker share one decoder.
+# path and the file picker share one decoder. `NSWorkspace.setIcon:forFile:options:` is the one
+# supported way to give the .app bundle a Finder icon without rewriting the signed `.icns`.
 objc2-app-kit = { version = "0.3", default-features = false, features = [
   "std",
   "NSApplication",
@@ -53,4 +54,5 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSPanel",
   "NSResponder",
   "NSWindow",
+  "NSWorkspace",
 ] }

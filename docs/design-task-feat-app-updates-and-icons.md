@@ -167,10 +167,20 @@ macOS 不走这条回落：`NSOpenPanel` 一定可用，失败就是真的失败
 | 平台 | 手段 | 覆盖范围 |
 |---|---|---|
 | macOS | `NSApplication.setApplicationIconImage`（主线程） | Dock / ⌘Tab / 强制退出窗口 |
+| macOS | `NSWorkspace.setIcon:forFile:options:`（主线程） | Finder 里 `.app` 的图标（写自定义图标资源，不改 `.icns`） |
 | Windows / Linux | `WebviewWindow::set_icon` | 现有窗口的任务栏图标；下次启动时对新窗口同样生效 |
 
 macOS 的 `setApplicationIconImage` 在运行期生效且不落盘；重启后由启动流程按持久化的选择重新应用。
-这也意味着改名后的"重启生效"不需要动 `.app` 包里的 `icns`（那需要重新签名，本仓库未签名，不做）。
+Finder 的图标由 `NSWorkspace` 写在 `.app` 目录本身上（`Icon` 文件 + FinderInfo 自定义图标位），
+因此不需要重写包里的 `.icns`，也不触碰签名封存的资源：
+
+- 选择预置图标或自定义图片后，Finder 立即显示同一张图；不需要重启 Finder；
+- 选「默认」时清除自定义图标，Finder 回到包自带图标；
+- **启动时不重写已有的自定义图标**：持久化选择是「默认」就完全不动 Finder（否则每次启动都会抹掉
+  用户手动设置的图标）；非默认选择只在 `.app` 还没有自定义图标时补写——应用自更新替换后正好补上，
+  平时启动则既不改写 bundle，也不覆盖用户手动设置的图标；
+- `.app` 只读（DMG 挂载、受管 `/Applications`、App Translocation）时写入失败只记日志，
+  Dock 图标仍然生效；「当前不是 .app 包」（`cargo run` / `tauri dev`）时跳过同步。
 
 ### 3.4 持久化
 
@@ -263,8 +273,9 @@ macOS 的 `setApplicationIconImage` 在运行期生效且不落盘；重启后�
 
 - 就地安装只有 macOS 有。Linux 的 `.deb` 需要 root，Windows 无法覆盖正在运行的 exe，
   这两处只做到"已验证的包落盘 + 告诉用户怎么装"。
-- 图标改的是运行期图标，没有改包里的 `.icns`/`.ico`。Finder 里看到的仍然是原始图标；
-  改 bundle 内资源会破坏签名（本仓库未签名，但也不该让用户的安装变成半签名状态）。
+- 图标改的是运行期图标，加上 macOS 的 Finder 自定义图标（`Icon` + FinderInfo），没有改包里的
+  `.icns`/`.ico`；改封存资源会破坏签名（本仓库未签名，但也不该让用户的安装变成半签名状态）。
+  Windows/Linux 的 Explorer/桌面图标仍来自 exe 与 desktop 文件，不随选择变化。
 - 自定义图标是**中心裁切**，没有让用户选裁切位置：需要精确构图时请自己先裁好再选。
 - `app-update/backup/` 只保留**刚替换下来的那一份**（更早的备份会被清掉）：再往前已经没有
   任何决策能用到它，而一份自带运行时的备份与一次完整安装相当。
@@ -299,3 +310,16 @@ macOS 的 `setApplicationIconImage` 在运行期生效且不落盘；重启后�
 实际位置、`ready/` 的清理时机、证据里引用的日志原文，都改成了与实现一致的说法。
 
 
+
+### 6.4 第三轮：Finder 图标同步
+
+需求：换图标后，Finder 里看到的也应该是同一张图。
+
+| 问题 | 处理 |
+|---|---|
+| 第一版只改运行期图标（Dock / 窗口），Finder 一直显示包内 `.icns` | macOS 增加 `NSWorkspace.setIcon:forFile:options:`，在同一个主线程闭包里、Dock 图标之后同步 `.app` 的自定义图标 |
+| 每次启动都写 bundle 会抹掉用户手动设置的 Finder 图标 | 拆出 `finder_sync(choice, explicit)`：显式选「默认」才清除；启动时「默认」跳过，非默认选择只在 bundle 还没有自定义图标时补写（应用更新替换 `.app` 后能恢复，也不覆盖手动图标） |
+| AppKit 调用不好进单测 | 路径推导（`bundle_path`）与策略（`finder_sync`）是纯函数，三个平台都跑；AppKit 本身留一条 `#[ignore]` 的 `finder_icon_round_trip`，在 macOS 上手动跑 |
+
+验证：`cargo test --lib icon::` 20 passed / 1 ignored；`cargo test --lib finder_icon_round_trip -- --ignored`
+实测通过（临时 `.app` 目录上 `NSWorkspace` 返回 true 并生成 `Icon` 文件）。

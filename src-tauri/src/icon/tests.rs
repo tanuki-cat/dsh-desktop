@@ -427,3 +427,63 @@ fn encode_base64(bytes: &[u8]) -> String {
     }
     out
 }
+
+/// Finder draws the bundle directory, not the binary inside it.
+#[test]
+fn the_finder_target_is_the_enclosing_app_bundle() {
+    assert_eq!(
+        bundle_path(Path::new(
+            "/Applications/DSH Desktop.app/Contents/MacOS/dsh-desktop"
+        )),
+        Some(Path::new("/Applications/DSH Desktop.app"))
+    );
+    assert_eq!(
+        bundle_path(Path::new("./DSH Desktop.app/Contents/Helpers/dsh-desktop")),
+        Some(Path::new("./DSH Desktop.app"))
+    );
+    // A development build has no bundle to redraw. Inventing one would write an Icon file next to
+    // whatever directory happened to contain the binary.
+    assert_eq!(
+        bundle_path(Path::new("/tmp/target/debug/dsh-desktop")),
+        None
+    );
+    assert_eq!(bundle_path(Path::new("dsh-desktop")), None);
+}
+
+/// Choosing 默认 clears a custom Finder icon; merely starting with 默认 must not, or an icon the
+/// user set in Finder by hand would be erased on every launch.
+#[test]
+fn the_finder_icon_policy_separates_choosing_from_starting() {
+    assert_eq!(finder_sync(Choice::Default, true), FinderSync::Clear);
+    assert_eq!(finder_sync(Choice::Default, false), FinderSync::Skip);
+    for choice in [Choice::Deep, Choice::Night, Choice::Dawn, Choice::Custom] {
+        // Picking it replaces whatever Finder shows; starting with it only fills a missing icon,
+        // so a launch does not rewrite the bundle (or a user's hand-made Finder icon) every time.
+        assert_eq!(finder_sync(choice, true), FinderSync::Set);
+        assert_eq!(finder_sync(choice, false), FinderSync::SetIfMissing);
+    }
+}
+
+/// The AppKit call itself, against a throwaway .app directory.
+///
+/// Ignored by default: it writes a real Finder custom icon and a test run should not leave one
+/// behind on the machine. CI runners are also not guaranteed a writable Finder state. Run it
+/// manually after touching the AppKit path:
+///
+///   cargo test --manifest-path src-tauri/Cargo.toml finder_icon_round_trip -- --ignored
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "writes a Finder custom icon; run manually on macOS"]
+fn finder_icon_round_trip() {
+    let root = test_dir("dsh-finder-probe");
+    let app = root.join("DSH Desktop.app");
+    std::fs::create_dir_all(&app).unwrap();
+    let image = icon_image(&[255u8, 0, 0, 255].repeat(64 * 64), 64).unwrap();
+    set_finder_icon(Some(&image), &app).unwrap();
+    assert!(
+        app.join("Icon\r").is_file(),
+        "NSWorkspace must leave the custom icon in the bundle"
+    );
+    let _ = set_finder_icon(None, &app);
+    let _ = std::fs::remove_dir_all(&root);
+}
