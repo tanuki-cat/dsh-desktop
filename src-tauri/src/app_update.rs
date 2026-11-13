@@ -1083,11 +1083,26 @@ pub fn report(app: &AppHandle, data_dir: &Path, config: &Config, bundled: bool, 
                     // restart installs anything, because nothing on the startup path does.
                     window::announce_app_update_ready(app, &to);
                     if force {
-                        window::show_message(
-                            app,
-                            &format!("桌面应用 v{to} 已下载并通过校验"),
-                            &manual_install_hint(&package),
-                        );
+                        // The page that just reported the download is where the click belongs:
+                        // the user is looking at it, and naming a menu item would send them a
+                        // step away from the thing that finished. Only macOS installs in place,
+                        // so the other platforms keep the "where the package is" text.
+                        if install_supported() {
+                            window::show_update_ready(
+                                app,
+                                &format!("桌面应用 v{to} 已下载并通过校验"),
+                                &format!(
+                                    "点击下面的按钮替换当前版本并重启。\n\n已校验的更新包：\n{}",
+                                    package.display()
+                                ),
+                            );
+                        } else {
+                            window::show_message(
+                                app,
+                                &format!("桌面应用 v{to} 已下载并通过校验"),
+                                &manual_install_hint(&package),
+                            );
+                        }
                     }
                 }
                 Err(reason) => {

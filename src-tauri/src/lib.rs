@@ -747,6 +747,13 @@ pub fn run() {
             app.listen(window::CHOICE_EVENT, |event| {
                 window::record_choice(event.payload());
             });
+            // The install button on the download page spends the package that page has just
+            // reported. Same handler as the menu item: one decision, and the page is the
+            // surface that told the user the download finished.
+            let install_handle = app.handle().clone();
+            app.listen(window::INSTALL_APP_UPDATE_EVENT, move |_event| {
+                install_ready_update(&install_handle);
+            });
 
             // A custom icon chosen in the status page arrives as a data URL. The bytes are
             // decoded and validated here, then copied into app data, so the persisted choice never

@@ -1277,6 +1277,45 @@ fn the_status_page_reports_the_restart_event_the_shell_listens_for() {
     );
 }
 
+/// The download page carries the one click that installs what it just reported. The button is
+/// hidden until the shell says the package is ready, and its click must carry the event the
+/// shell listens for: a rename on either side would leave a live-looking button that does
+/// nothing.
+#[test]
+fn the_status_page_installs_the_package_it_reports() {
+    let page = include_str!("../../../src/index.html");
+    assert!(
+        page.contains(INSTALL_APP_UPDATE_EVENT),
+        "按钮必须发壳监听的那个事件名"
+    );
+    // The shell calls this entry point by name through `eval`, so both sides have to spell it
+    // the same way: the page's definition here, the call site in `window.rs`.
+    assert!(
+        page.contains("window.__setUpdateReady = function"),
+        "{page}"
+    );
+    assert!(
+        include_str!("../window.rs").contains("__setUpdateReady"),
+        "壳要调到页面定义的这个入口"
+    );
+    // Hidden until Rust sets the flag: offering it on every status would put an install button
+    // under a download that has not happened yet.
+    assert!(page.contains(r#"<button id="install" hidden>"#), "{page}");
+    // The initial value plus the two entry points that clear the offer; only the finished
+    // download sets it. Keying the button off anything else would leave it standing under
+    // messages it cannot act on.
+    assert_eq!(
+        page.matches("window.__pendingUpdate = false").count(),
+        3,
+        "{page}"
+    );
+    assert_eq!(
+        page.matches("window.__pendingUpdate = true").count(),
+        1,
+        "{page}"
+    );
+}
+
 /// The takeover question is a second event on the same bridge, and the answer is matched
 /// on the question id: a click that crossed a retry must not be read as the current answer.
 #[test]
@@ -2447,9 +2486,11 @@ fn the_message_page_does_not_close_the_harness_window() {
     // Line endings follow the checkout: `core.autocrlf` on Windows gives CRLF, and a scan for a
     // line that is only `}` would then find nothing.
     let source = include_str!("../window.rs").replace("\r\n", "\n");
+    // Every face of the message page — including the download page with its install button —
+    // goes through `show_message_with`, so that is the body the rules have to hold for.
     let start = source
-        .find("pub fn show_message(")
-        .expect("show_message exists");
+        .find("fn show_message_with(")
+        .expect("show_message_with exists");
     // The body runs to the next top-level item: the closing brace of the function.
     let body = &source[start..];
     let end = body.find("\n}\n").expect("the function ends");
@@ -2467,5 +2508,15 @@ fn the_message_page_does_not_close_the_harness_window() {
     assert!(
         body.contains("FAILURE_SHOWN.load"),
         "a terminal page outranks an informational one: {body}"
+    );
+    // The faces themselves stay two-line routers: a body of their own would be the place a
+    // rule above could be skipped from.
+    let face = &source[source
+        .find("pub fn show_message(")
+        .expect("show_message exists")..];
+    let face = &face[..face.find("\n}\n").expect("the function ends")];
+    assert!(
+        face.contains("show_message_with("),
+        "show_message must paint through the shared rules: {face}"
     );
 }

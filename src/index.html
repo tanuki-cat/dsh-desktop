@@ -39,12 +39,15 @@
       */
       body.asking #detail { max-height: 240px; opacity: .85; }
       body.asking .spinner { display: none; }
+      /* The download just finished. The shell is waiting for a person to click, so a spinner
+         would say "working" while nothing is. */
+      body.ready .spinner { display: none; }
       /* An empty detail is the normal state while starting: an empty grey bar reads as a
          rendering glitch. `:empty` matches only truly empty, so a detail of "" from Rust is
          hidden too, which is what a caller passing no detail means. */
       #detail:empty { display: none; }
       /* The buttons and the hint are the answer; they never shrink to make room for text. */
-      #choice, #retry { flex: 0 0 auto; }
+      #choice, #retry, #install { flex: 0 0 auto; }
       .spinner {
         width: 18px; height: 18px; border-radius: 50%;
         border: 2px solid color-mix(in srgb, CanvasText 25%, transparent);
@@ -52,13 +55,13 @@
       }
       @keyframes spin { to { transform: rotate(360deg); } }
       .error .spinner { display: none; }
-      #retry {
+      #retry, #install {
         font: inherit; padding: 6px 14px; border-radius: 6px; cursor: pointer;
         color: CanvasText; background: color-mix(in srgb, CanvasText 8%, transparent);
         border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
       }
-      #retry:disabled { opacity: .6; cursor: default; }
-      #retry[hidden] { display: none; }
+      #retry:disabled, #install:disabled { opacity: .6; cursor: default; }
+      #retry[hidden], #install[hidden] { display: none; }
       #choice { display: flex; flex-direction: column; gap: 8px; width: 100%; }
       #choice[hidden] { display: none; }
       #choice button {
@@ -96,12 +99,25 @@
       // The third element marks the terminal page: that is the one offering to start the
       // Harness again, and the only one that should show the button.
       window.__pendingStatus = null;
+      // Whether the 「安装已下载的更新」 button belongs under the current status. Only
+      // `__setUpdateReady` sets it: the button acts on the package that message is about, so
+      // every other entry point — progress, failure — has to clear it.
+      window.__pendingUpdate = false;
       window.__setStatus = function (status, detail) {
+        window.__pendingUpdate = false;
         window.__pendingStatus = [status, detail, false];
         if (window.__applyStatus) window.__applyStatus();
       };
       window.__setFailure = function (status, detail) {
+        window.__pendingUpdate = false;
         window.__pendingStatus = [status, detail, true];
+        if (window.__applyStatus) window.__applyStatus();
+      };
+      // The download that just finished: report it and offer the click that installs it, so the
+      // user does not have to be told which menu item to walk to.
+      window.__setUpdateReady = function (status, detail) {
+        window.__pendingUpdate = true;
+        window.__pendingStatus = [status, detail, false];
         if (window.__applyStatus) window.__applyStatus();
       };
       //
@@ -122,6 +138,8 @@
       <div id="status">正在启动…</div>
       <div id="detail"></div>
       <button id="retry" hidden>重新启动 Harness</button>
+      <!-- Only the page that reports a finished download shows this; Rust decides when. -->
+      <button id="install" hidden>安装已下载的更新</button>
       <!--
         The takeover question. Rust writes the labels (they carry the pid, the command line and
         the port), the page only draws them and reports which one was clicked: the buttons are
@@ -149,6 +167,15 @@
           retry.disabled = false;
           retry.textContent = "重新启动 Harness";
         }
+        // The install offer travels with the status it was set for: a progress message or a
+        // failure clears it, so the button can never act on a package nobody just reported.
+        var install = document.getElementById("install");
+        install.hidden = !window.__pendingUpdate;
+        if (!install.hidden) {
+          install.disabled = false;
+          install.textContent = "安装已下载的更新";
+        }
+        document.body.classList.toggle("ready", !install.hidden);
       };
 
       // Draw the takeover question, and report the click back to Rust.
@@ -168,6 +195,8 @@
         // The question replaces the restart button: two live buttons on one page would let a
         // click race the answer the shell is already waiting for.
         document.getElementById("retry").hidden = true;
+        document.getElementById("install").hidden = true;
+        document.body.classList.toggle("ready", false);
         while (box.firstChild) box.removeChild(box.firstChild);
         if (!options.length) {
           box.hidden = true;
@@ -226,6 +255,28 @@
         try {
           window.__TAURI_INTERNALS__
             .invoke("plugin:event|emit", { event: "dsh-desktop:restart-harness", payload: {} })
+            .catch(restore);
+        } catch (error) {
+          restore();
+        }
+      });
+
+      // Install the package the page has just reported. Same bridge as the restart button: this
+      // window's core capability is the whole API the page has.
+      document.getElementById("install").addEventListener("click", function () {
+        var button = this;
+        var restore = function () {
+          button.disabled = false;
+          button.textContent = "安装已下载的更新";
+        };
+        button.disabled = true;
+        button.textContent = "正在安装…";
+        try {
+          window.__TAURI_INTERNALS__
+            .invoke("plugin:event|emit", {
+              event: "dsh-desktop:install-app-update",
+              payload: {}
+            })
             .catch(restore);
         } catch (error) {
           restore();

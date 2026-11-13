@@ -197,7 +197,9 @@ WebView 兼容层：[`docs/design-task-feat-legacy-webkit-compat-layer.md`](docs
 - **自更新**：`app_update` 默认 `download`。检查在 Harness 窗口出现后才跑，不占启动路径；
   新版提示落在窗口标题（与 dsh 核心的提示分两个槽位，应用那条优先且不会抹掉另一条）。
   菜单两项：「检查桌面应用更新…」无视缓存当场查；「安装已下载的更新…」消费 `app-update/ready/`
-  里那份已经校验过的包。下载走 `curl`（Windows 用 PowerShell），校验走 Release 的 `SHA256SUMS`；
+  里那份已经校验过的包。手动检查触发的下载会在状态页上报告，下载完成后同一页直接给出
+  「安装已下载的更新」按钮（macOS 就地装好并重启），不必再回菜单。
+  下载走 `curl`（Windows 用 PowerShell），校验走 Release 的 `SHA256SUMS`；
   `ready/` 里哈希仍匹配的包直接复用，不重复下载。
   `install` 只对 macOS 就地完成（`ditto` 解包 → 校验 bundle id/版本 → 备份旧 `.app` → 换入 → 清 quarantine →
   先销毁单实例 socket 再 `open -n` 重启），Linux/Windows 停在「已校验的包在这里」，因为 `.deb` 要 root、

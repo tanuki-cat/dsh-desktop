@@ -125,6 +125,32 @@ fn the_reload_menu_item_is_the_one_the_handler_watches_for() {
     assert!(!window::RELOAD_MENU_ID.is_empty());
     assert!(window::RELOAD_MENU_ID.starts_with("reload"));
 }
+
+/// The install button on the download page and the menu item make the same decision, so both
+/// have to end in `install_ready_update`: a second implementation would drift from the one the
+/// menu path tests cover.
+#[test]
+fn the_install_button_and_the_menu_item_share_one_handler() {
+    let source = include_str!("lib.rs");
+    assert!(
+        source.contains("id == window::INSTALL_APP_UPDATE_MENU_ID"),
+        "菜单项仍在处理安装请求：{source}"
+    );
+    assert!(
+        source.contains("install_ready_update(app);"),
+        "菜单项要消费 ready/ 里的包：{source}"
+    );
+    // The status page's click arrives as an event; it must reach the same handler rather than
+    // a second way of installing.
+    assert!(
+        source.contains("app.listen(window::INSTALL_APP_UPDATE_EVENT"),
+        "状态页按钮要发壳监听的那个事件：{source}"
+    );
+    assert!(
+        source.contains("install_ready_update(&install_handle);"),
+        "状态页按钮要和菜单项走同一个处理函数：{source}"
+    );
+}
 #[test]
 fn self_heal_keeps_a_record_it_can_reuse_and_clears_a_stale_one() {
     let state = |pid: u32, port: u16| process::HarnessState {

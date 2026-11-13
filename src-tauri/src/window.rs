@@ -3313,6 +3313,12 @@ fn shell_execute(url: &Url) {
 pub const CHECK_APP_UPDATE_MENU_ID: &str = "check-app-update";
 pub const INSTALL_APP_UPDATE_MENU_ID: &str = "install-app-update";
 
+/// The status page reports a click on its 「安装已下载的更新」 button through this event.
+///
+/// The page names it as a string literal, so a test binds the two: renaming one side alone would
+/// silently drop every click, and the button would look broken rather than unbound.
+pub const INSTALL_APP_UPDATE_EVENT: &str = "dsh-desktop:install-app-update";
+
 /// Prefix of the 「外观」 menu items, one per preset choice: the suffix is `icon::Choice::key`.
 pub const ICON_MENU_PREFIX: &str = "icon-choice-";
 
@@ -3455,6 +3461,22 @@ pub fn picker_script() -> &'static str {
 /// later page may overwrite. This one is a reply, so it replaces whatever was on screen and is
 /// replaced by whatever comes next. It yields to a terminal page that is already up — see below.
 pub fn show_message(app: &AppHandle, status: &str, detail: &str) {
+    show_message_with(app, "__setStatus", status, detail);
+}
+
+/// The same page with the 「安装已下载的更新」 button under the text.
+///
+/// Used once a download the user watched has finished: the package and the click that installs
+/// it belong on one page, instead of the page telling them which menu item to walk to. Every
+/// other status clears the button (`__setStatus` in `src/index.html`), because it acts on the
+/// package this message is about and on nothing else.
+pub fn show_update_ready(app: &AppHandle, status: &str, detail: &str) {
+    show_message_with(app, "__setUpdateReady", status, detail);
+}
+
+/// Paint one reply on the status page. `function` picks the face it gets, not whether it is
+/// shown: the rules below apply to every reply alike.
+fn show_message_with(app: &AppHandle, function: &str, status: &str, detail: &str) {
     // Deliberately not `present_status_page`: that one destroys the Harness window, which is
     // right for a terminal failure and wrong for an answer the user asked for — their session is
     // still running, and closing the window over it would end the very thing they were using.
@@ -3473,7 +3495,7 @@ pub fn show_message(app: &AppHandle, status: &str, detail: &str) {
         return;
     }
     RETRY_OFFERED.store(false, Ordering::SeqCst);
-    eval_status(app, "__setStatus", status, detail);
+    eval_status(app, function, status, detail);
 }
 
 /// Ask the status page to open its file input.
