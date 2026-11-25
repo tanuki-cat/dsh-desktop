@@ -102,7 +102,7 @@ make check           # 类型检查（全部 targets，与 CI 口径一致）
 make test            # 离线单测 + 脚本自检 + 真实 JS 引擎里的兼容层测试（需 PATH 上有 node）
 make dev             # 运行 debug 版
 make bundle          # 精简版安装包（macOS 出 .app，Linux 出 .deb）
-make bundle-bundled  # 自带运行时版：先 staging Node/dsh（约 590 MB），再打包
+make bundle-bundled  # 自带运行时版：先 staging Node/dsh（约 593 MB），再打包
 ```
 
 ## 功能
@@ -226,7 +226,7 @@ make bundle-bundled  # 自带运行时版：先 staging Node/dsh（约 590 MB）
 - **未签名、未公证**：macOS 首次打开需右键或 `xattr`；自更新只比对 `SHA256SUMS`，不验证代码签名。
 - **平台验证不均**：Linux（x64 / arm64）的包由 CI 构建、尚未在真机跑过；Windows 只有免安装包。
   macOS arm64 与 Windows 免安装包做过实机验证。
-- **自带运行时版体积仍不小**：解压后约 590 MB（文件本身 537 MB）/ 1.9 万个文件（P1+P2 裁剪后），且 macOS 最低要求被 Node 24 抬到 13.5。
+- **自带运行时版体积仍不小**：解压后约 593 MB（文件本身 592 MB）/ 1.9 万个文件（P1+P2 裁剪后），且 macOS 最低要求被 Node 24 抬到 13.5。
 
 ### 更新与版本
 

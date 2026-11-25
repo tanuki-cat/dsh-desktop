@@ -17,9 +17,9 @@ set -eu
 
 out=${1:?用法: stage-runtime.sh <runtime 目录>}
 node_version=${NODE_VERSION:-24.22.2}
-dsh_version=${DSH_VERSION:-0.2.2-rc.3}
+dsh_version=${DSH_VERSION:-0.2.2-rc.5}
 pnpm_version=${PNPM_VERSION:-12.3.4}
-dshmarket_version=${DSHMARKET_VERSION:-1.73.19}
+dshmarket_version=${DSHMARKET_VERSION:-1.84.1}
 # 67 个 @deepseek-ai/* 包精确 pin zod 4.6.6，而 npm 全局安装没有 overrides，会为每个包
 # 各装一份（实测 68 份 / 393 MB）；项目布局安装 + 这个 override 才能收敛成一份。
 zod_override=${DSH_ZOD_OVERRIDE:-4.6.6}

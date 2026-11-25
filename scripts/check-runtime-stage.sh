@@ -35,6 +35,9 @@ set -eu
 #               Linux 必须保留 LibreOffice wasm（没有原生包），预计多约 145 MB，所以
 #               Linux 的体积上限单独放宽到 800 MB；P3（office/语音/inspector 按需）未实施，
 #               实施后按新实测值继续收紧。
+#   0.2.2-rc.5  2026-11-25 同口径复测（macOS arm64）：19,033 文件 / 592 MB（文件字节）/
+#               593 MB（du 块占用）；dshmarket 1.73.19 → 1.84.1 与 dsh rc.3 → rc.5 共同
+#               推高约 152 文件 / 55 MB，最长路径仍 224 字符，闸门（12,000–40,000 / 700 MB）不变。
 # 上限的意义是"拦住混进来的东西"，不是"描述上游多大"：多一棵树（dsh-prefix 就一万多文件）
 # 或多出一个平台的 payload 仍会明显偏出。换 dsh 大版本后按实测值重新收紧。
 min_files=${DSH_RUNTIME_MIN_FILES:-12000}
