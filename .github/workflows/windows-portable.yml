@@ -19,7 +19,7 @@ on:
         description: 随包附带的 dsh 版本
         required: false
         type: string
-        default: 0.2.2-rc.2
+        default: 0.2.2-rc.3
       node_version:
         description: 随包附带的 Node 版本
         required: false
@@ -47,7 +47,7 @@ on:
         description: 随包附带的 dsh 版本
         required: false
         type: string
-        default: 0.2.2-rc.2
+        default: 0.2.2-rc.3
       node_version:
         description: 随包附带的 Node 版本
         required: false
@@ -192,7 +192,7 @@ jobs:
           4) 需要 WebView2 运行时：Windows 11 自带；Windows 10 可装
              https://developer.microsoft.com/microsoft-edge/webview2/
 
-          【解压注意】包里是完整的 Node 依赖树，最深约 223 个字符。Windows 资源管理器
+          【解压注意】包里是完整的 Node 依赖树，最深约 224 个字符。Windows 资源管理器
           的“全部解压”会再套一层 <下载目录>\<压缩包名>\，很容易超过 260 字符的 MAX_PATH
           限制并报错 0x80010135（路径太长）。任选一种方式：
 

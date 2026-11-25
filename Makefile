@@ -192,13 +192,13 @@ distclean: clean
 # 目标：在没有 node / dsh 的机器上双击即用。
 #   make runtime-fetch    下载官方 Node 并校验 SHASUMS256.txt
 #   make runtime-stage    组装 src-tauri/runtime/{node,dsh-prefix,tools,profile-template,THIRD-PARTY-NOTICES.md}
-#   make bundle-bundled   runtime-stage + 打包（.app 会带上整套运行时，约 550 MB）
+#   make bundle-bundled   runtime-stage + 打包（.app 会带上整套运行时，约 590 MB）
 #   make runtime-clean    回收 staging 与下载缓存
 # staging 必须按平台各自执行：dsh 树里有平台相关的原生模块。
 # 安装后按 docs/design-task-fix-bundled-runtime-size.md 的 P1+P2 裁剪：
 # 项目布局安装让 overrides 收敛 zod，prune-runtime.py 再删运行时不可达的载荷。
 NODE_VERSION      ?= 24.22.2
-DSH_VERSION       ?= 0.2.2-rc.2
+DSH_VERSION       ?= 0.2.2-rc.3
 PNPM_VERSION      ?= 12.3.4
 DSHMARKET_VERSION ?= 1.73.19
 # 67 个 @deepseek-ai/* 精确 pin zod 4.6.6；保留覆盖变量，便于上游统一后快速对齐。
@@ -242,7 +242,7 @@ NODE_BASE_URL     := https://nodejs.org/dist/v$(NODE_VERSION)
 NODE_BIN          := $(abspath $(RUNTIME_DIR))/node/bin
 RUNTIME_LOCK      := $(TAURI_DIR)/runtime.lock
 
-# 自带运行时版才声明 resources：普通 `make bundle`（精简版）不该把整份 staging（约 550 MB）打进包 ——
+# 自带运行时版才声明 resources：普通 `make bundle`（精简版）不该把整份 staging（约 590 MB）打进包 ——
 # 这正是桌面壳审查 §10 记过的陷阱（bundle.resources 常开 + 残留 payload = 静默变胖）。
 ifeq ($(PLATFORM),macos)
 # macOS 上还要声明 13.5：随包的 node 24.22.2 是 minos 13.5（node 22 时代是 11.0），

@@ -226,7 +226,7 @@ jobs:
           mkdir -p dist
           # 精简版：只有壳，目标机器需自备 node/dsh
           ditto -c -k --sequesterRsrc --keepParent "thin/DSH Desktop.app" "dist/dsh-desktop_${VERSION}_${SUFFIX}.app.zip"
-          # 自带运行时版：运行时约 1.4 GB，解压拖进「应用程序」即可，无需预装
+          # 自带运行时版：运行时约 590 MB，解压拖进「应用程序」即可，无需预装
           ditto -c -k --sequesterRsrc --keepParent "$app" "dist/dsh-desktop_${VERSION}_${SUFFIX}-bundled.app.zip"
           (cd dist && shasum -a 256 ./*.zip | sed "s|\./||" > "SHA256SUMS-${SUFFIX}")
 
@@ -244,7 +244,7 @@ jobs:
           for deb in thin/*.deb; do
             cp "$deb" "dist/dsh-desktop_${VERSION}_${SUFFIX}.deb"
           done
-          # 自带运行时版：运行时约 1.4 GB（deb 里是整棵 Node 依赖树）
+          # 自带运行时版：运行时约 590 MB（deb 里是整棵 Node 依赖树）
           bundled=(src-tauri/target/${TARGET:+$TARGET/}release/bundle/deb/*.deb)
           [ ${#bundled[@]} -gt 0 ] || { echo "::error::没有产出自带运行时版的 .deb"; exit 1; }
           for deb in "${bundled[@]}"; do
@@ -312,19 +312,18 @@ jobs:
 
           ### 本版更新
 
-          - **随包运行时升级**：dsh `0.2.2-rc.1` → **`0.2.2-rc.2`**，插件市场 dshmarket `1.73.17` → **`1.73.19`**（新机器首启播种该版本）；Node 仍是 `24.22.2`（dsh 0.2.2 线声明 `engines.node >= 24.9.0`）。按壳依赖的契约逐项复核 rc.2：`--profile web` / `--patch` / `--no-open` / `--port` 的参数顺序、stdout 启动行、无 token 的 401 围栏、token → 303 → cookie → 200 的流程、overlay 的 `web-runtime` 行，以及 WebView 兼容层依赖的 DOM hook 全部未变；用 rc.2 真实启动过一次，页面正常绘制。装好之后的 dsh 核心与插件市场照旧跟随 npm registry 自动更新。
-          - **staging 删掉 dsh 树里的 source map**：rc.2 起上游把 `src/` 与 `*.map` 一并发布，运行时用不到。原样 stage 是 **100,410 个文件 / 1,626 MB**，会被闸门拦下；在安装 dsh 之后删掉 `dsh-prefix` 下的 `*.map`，实测落到 **90,492 个文件 / 1480 MB**（上一版 75,799 / 1153 MB），体积闸门随之从 1500 MB 提到 1600 MB，文件数上限仍是 100,000。
-          - **没有走「删 `src/`」那条更省的路**：`node-fetch` 的 `main` 指向 `./src/index.js`、OpenTelemetry 的入口在 `build/src/`，按目录删会弄坏运行时包；只删纯调试用的 source map。自带运行时版的最低系统版本仍是 macOS 13.5（随包 Node 24 的 `minos`），精简版仍是 10.15。
+          - **随包运行时升级**：dsh `0.2.2-rc.2` → **`0.2.2-rc.3`**，插件市场 dshmarket 仍是 **`1.73.19`**（npm 上最新，新机器首启播种该版本）；Node 仍是 `24.22.2`（dsh 0.2.2 线声明 `engines.node >= 24.9.0`）。按壳依赖的契约逐项复核 rc.3：`dsh/lib/bin.js`、`dsh-web-app` 的 `lib/index.js` / `lib/startup.js` / `cordis.patch.yml`、`dsh-client-connection`、`dsh-cmdline`、`dsh-host-webserver`、`dsh-host-frontend-static` 与 rc.2 逐字节相同，`--profile web` / `--patch` / `--no-open` / `--port` 的参数顺序、stdout 启动行、无 token 的 401 围栏与 token → 303 → cookie → 200 的流程均未变；用 rc.3 真实启动过一次，市场 `/dsh-market/status` 自报 `1.73.19`。装好之后的 dsh 核心与插件市场照旧跟随 npm registry 自动更新。
+          - **staging 规模不变**：rc.3 新增 `dsh-deepseek-chat-import`，客户端 bundle 解压后由 5.7 MB 涨到 21 MB，但 P1+P2 裁剪后相互抵消 —— macOS arm64 实测 **18,881 个文件 / 537 MB 文件字节 / 590 MB du 块占用**（rc.2 是 18,859 / 537 MB / 590 MB），闸门（12,000–40,000 文件 / 700 MB）与最长路径 224 字符都没变。自带运行时版的最低系统版本仍是 macOS 13.5（随包 Node 24 的 `minos`），精简版仍是 10.15。
 
           ### 验证与范围
 
-          离线门禁全绿：`make fmt-check` / `make clippy --all-targets -D warnings` / `make test`（**304 passed**，含 `tests/webkit_compat_shim.rs` 的 5 条在真实 node 引擎里跑兼容层与状态页脚本），`make test-scripts` 通过。
+          离线门禁全绿：`make test`（**319 passed / 1 ignored**，含 `tests/webkit_compat_shim.rs` 的 5 条在真实 node 引擎里跑兼容层与状态页脚本），`make test-scripts` 通过。
 
-          staging（macOS arm64）：**90,492 个文件 / 1480 MB** 通过闸门，内置 `dsh --version` 为 `0.2.2-rc.2`、市场模板为 `dshmarket@1.73.19`；用该树起 `dsh web`，401 围栏、token 跳转与 41,384 字节的页面均正常。三处版本默认值（`Makefile` / `scripts/stage-runtime.sh` / `windows-portable.yml`）由 release preflight 校验一致。
+          staging（macOS arm64）：**18,881 个文件 / 590 MB** 通过闸门（`make runtime-stage` 与 `sh scripts/stage-runtime.sh` 两条路径各跑一次，结果一致；1 文件差是 `make runtime-stage` 保留的 `src-tauri/runtime/README.md` marker），内置 `dsh --version` 为 `0.2.2-rc.3`、市场模板为 `dshmarket@1.73.19`；用该树播种一份全新 DSH_HOME 起 `dsh web`，401 围栏、token → 303 → cookie → 200 与 41,384 字节的页面、`/dsh-market/status` 自报 1.73.19 全部正常，日志无 error。三处版本默认值（`Makefile` / `scripts/stage-runtime.sh` / `windows-portable.yml`）由 release preflight 校验一致。
 
-          实机（macOS arm64）：用本机已安装的 `0.4.15` 壳（core 契约与 `0.5.1` 相同）以 system rc.2 启动，WebView 兼容层注入正常、页面恢复绘制、壳层无报错。
+          兼容层：rc.3 的客户端 bundle 没有引入兼容层之外的 API（`Error.isError` / `RegExp.escape` 等只出现在 inspector 的 DevTools 载荷与 source map 里），滚动锚定依赖的 DOM hook 也未变。
 
-          完整审查记录（逐项证据、风险与复现要点）见 [兼容性审查](https://github.com/tanuki-cat/dsh-desktop/blob/v__VERSION__/docs/dsh-desktop-dsh-0.2.2-rc.2-compatibility-review.md)。
+          完整审查记录（逐项证据、风险与复现要点）见 [兼容性审查](https://github.com/tanuki-cat/dsh-desktop/blob/v__VERSION__/docs/dsh-desktop-dsh-0.2.2-rc.3-compatibility-review.md)。
 
           **仍需单独验证**：正式版 dsh `0.2.2` 仍在测试区间之外（`update.rs` 上界 `< 0.2.2`），发布后需重新审查并抬高上界；macOS 13.3 / Safari 16.4 的老 WebKit、Linux 与 Windows 未做本轮实机 GUI 验证。
 
@@ -337,7 +336,7 @@ jobs:
           macOS / Linux 每个平台都有两种产物，Windows 只有一种（它本身就是免安装的）：
 
           - **自带运行时版**（文件名带 `-bundled`）：随包附带 Node 24 与 dsh 核心，**目标机器无需
-            安装任何东西**，解压 / 安装后双击即用；分发包较大（随包的 Node 与完整 dsh 插件树合计约 1.4 GB，压缩后仍有数百 MB）。
+            安装任何东西**，解压 / 安装后双击即用；分发包较大（随包的 Node 与完整 dsh 插件树合计约 590 MB / 1.9 万个文件，压缩后仍有约 200 MB）。
           - **精简版**（文件名不带后缀）：只有桌面壳，**目标机器需自备 node 与 dsh**，体积小。
 
           | 平台 | 自带运行时版（推荐） | 精简版（需自备 node/dsh） |
@@ -366,7 +365,7 @@ jobs:
           安装：macOS 解压后把 DSH Desktop.app 拖进「应用程序」；
           Linux sudo apt install ./dsh-desktop___VERSION___linux-x64-bundled.deb；
           Windows 解压到短路径（如 D:\dsh）后双击 DSH Desktop\dsh-desktop.exe —— 包内依赖树最深
-          约 223 字符，路径太长时资源管理器会报 0x80010135，可改用同名的 .exe 自解压包或 tar -xf。
+          约 224 字符，路径太长时资源管理器会报 0x80010135，可改用同名的 .exe 自解压包或 tar -xf。
           MD
           sed -i.bak "s|__VERSION__|${VERSION}|g" notes.md && rm -f notes.md.bak   # GNU/BSD sed 都可用
           head -5 notes.md
