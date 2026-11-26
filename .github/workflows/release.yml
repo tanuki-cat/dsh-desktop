@@ -312,12 +312,15 @@ jobs:
 
           ### 本版更新
 
+          - **补发 v0.5.3 的内容**：`v0.5.3` 的 release 流水线失败，本版功能与随包运行时和它完全一致，只修掉两处失败原因。① **Windows 构建**：离线门禁在 `src-tauri/src/update.rs` 的 `is_executable` 上报 `clippy::needless_bool` —— `if !metadata.is_file() { return false; }` 后接 `true`，在 `#[cfg(unix)]` 块被裁掉的 Windows 上正好是这个形状，rustc 1.100.0 的新判定加上 `-D warnings` 直接编译失败（v0.5.2 用的 1.99.1 不报，属工具链升级触发，与代码改动无关）；改法是先查 exec 位、再以 `metadata.is_file()` 收尾，两个平台展开后都不再出现该形状。② **macOS x64 构建**：该 job 排队 15 分钟未分配到 runner 后被系统取消，是 GitHub `macos-15`（arm64）容量问题，与仓库代码无关。
           - **随包运行时升级**：dsh `0.2.2-rc.3` → **`0.2.2-rc.5`**，插件市场 dshmarket `1.73.19` → **`1.84.1`**（npm 上最新，跨 11 个 minor，新机器首启播种该版本）；Node 仍是 `24.22.2`（dsh 0.2.2 线声明 `engines.node >= 24.9.0`）。用 rc.5 真实起 `dsh web` 复核：`--profile web` / `--no-open` / `--port` 参数顺序、stdout 启动行、无 token 的 401 围栏与 token → 303 → cookie → 200 的流程均未变；市场 `/dsh-market/status` 自报 `1.84.1`，`/dsh-market/api/v1/capabilities` 的 check / update / rollback / restart 全部可用。1.84.1 新增的 peer 依赖（`cordis ^4.0.1` / `schemastery ^3.18.1` / `dsh-settings`）由随包树内的 `cordis ~4.1.0` / `schemastery ~3.19.0` / `dsh-settings@0.2.2-rc.5` 满足。装好之后的 dsh 核心与插件市场照旧跟随 npm registry 自动更新。
           - **staging 因市场大版本升级而增大**：dshmarket `1.73.19 → 1.84.1` 与 dsh `rc.3 → rc.5` 共同把 macOS arm64 实测推到 **19,033 个文件 / 592 MB 文件字节 / 593 MB du 块占用**（rc.3 是 18,881 / 537 MB / 590 MB，即 +152 文件 / +55 MB），闸门（12,000–40,000 文件 / 700 MB）与最长路径 224 字符都没变，余量充足。自带运行时版的最低系统版本仍是 macOS 13.5（随包 Node 24 的 `minos`），精简版仍是 10.15。
 
           ### 验证与范围
 
-          离线门禁全绿：`make test`（**319 passed / 1 ignored**，含 `tests/webkit_compat_shim.rs` 的 5 条在真实 node 引擎里跑兼容层与状态页脚本），`make test-scripts` 通过。
+          离线门禁全绿：`make fmt-check` / `make clippy` / `make test`（**319 passed / 1 ignored**，含 `tests/webkit_compat_shim.rs` 的 5 条在真实 node 引擎里跑兼容层与状态页脚本），`make test-scripts` 通过。
+
+          `needless_bool` 的修法在 Windows 展开下单独验证过：把 `#[cfg(unix)]` 换成 `#[cfg(any())`（等价于 Windows 上该块被裁掉）后，旧写法用 clippy 1.100.0 仍报同样错误，新写法干净通过。
 
           staging（macOS arm64）：**19,033 个文件 / 593 MB** 通过闸门（`make runtime-stage` 与 `sh scripts/stage-runtime.sh` 两条路径各跑一次，结果一致；1 文件差是 `make runtime-stage` 保留的 `src-tauri/runtime/README.md` marker），内置 `dsh --version` 为 `0.2.2-rc.5`、市场模板为 `dshmarket@1.84.1`；用该树播种一份全新 DSH_HOME（profile 置于 `profiles/web`）起 `dsh web`，401 围栏、token → 303 → cookie → 200 与 41,120 字节的页面、`/dsh-market/status` 自报 1.84.1 全部正常，日志无 error。三处版本默认值（`Makefile` / `scripts/stage-runtime.sh` / `windows-portable.yml`）由 release preflight 校验一致。
 
