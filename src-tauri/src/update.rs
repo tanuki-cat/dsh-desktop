@@ -476,9 +476,9 @@ fn is_executable(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
-    if !metadata.is_file() {
-        return false;
-    }
+    // The exec-bit block goes first and the file check stays last on purpose: where the block
+    // below compiles away (Windows), `if !x { return false; } true` is `clippy::needless_bool`,
+    // which `-D warnings` turns into a build failure on that target only.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -486,7 +486,7 @@ fn is_executable(path: &Path) -> bool {
             return false;
         }
     }
-    true
+    metadata.is_file()
 }
 
 /// The registry an automatic install is allowed to name.
